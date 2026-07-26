@@ -1,0 +1,913 @@
+// URPPT 纯软件路径追踪计算着色器
+// 单 kernel PathTrace：每像素多弹射路径追踪
+// BSDF: 简化金属度-粗糙度 GGX（diffuse + GGX specular, metallic workflow）
+// 直接光照: NEE 遍历所有光源 + 阴影早退遍历
+// 间接弹射: 按分支重要性采样（余弦半球/GGX NDF）+ 俄罗斯轮盘
+//
+// 关键约定（已核对 tiny_bvh_wrapper.cpp 第339-385行）:
+//   - 全局 BLAS 节点的 leftFirst 已被 AssembleGlobals 预重定位:
+//       内部节点 leftFirst += blasNodeBase（已是全局节点索引）
+//       叶子节点   leftFirst += primIdxBase  （已是全局 primIdx 起始）
+//     故 shader 侧 BLAS 遍历不再加 blasNodeBase/primIdxBase，根节点 = blasNodeBase。
+//   - 全局 BLAS primIdx 值为 BLAS 内局部三角形索引，shader 侧加 triBase。
+//   - 顶点索引为 BLAS 内局部索引，shader 侧加 vertBase。
+//   - 实例矩阵为行主序，故用 row_major float4x4。
+//   - 局部方向不归一化，使 t 参数 = 世界距离（线性变换下 t 不变）。
+
+#pragma kernel PathTrace
+#pragma kernel TemporalAccumulate
+#pragma kernel SpatialFilter
+
+#define PI 3.14159265359
+#define MISS_INDEX 0xFFFFFFFFu
+#define EPS_OFFSET 1e-3
+
+// ── 与 C# 严格对齐的结构体 ──────────────────────────
+
+// 32B，Wald 布局，直接对应 C# BVHNode32（Pack=1, 32B）
+struct BVHNode
+{
+    float3 aabbMin;   // 0-11
+    uint   leftFirst; // 12-15  内部=左子节点索引；叶子=primIdx 起始
+    float3 aabbMax;   // 16-27
+    uint   triCount;  // 28-31  内部=0；叶子>0
+};
+
+// 16B，对应 BLASDescriptor
+struct BLASDesc
+{
+    uint blasNodeBase;
+    uint primIdxBase;
+    uint triBase;
+    uint vertBase;
+};
+
+// 16B，PathTriangle 重打包（12B->16B）
+struct Tri
+{
+    uint v0;
+    uint v1;
+    uint v2;
+    uint _pad;
+};
+
+// 80B，PathVertex 重打包（64B->80B，HLSL 友好的 16B 对齐布局）
+struct Vertex
+{
+    float3 pos;     float  _pad0;   // 16
+    float3 normal;  float  _pad1;   // 32
+    float4 tangent;               // 48
+    float2 uv;      float2 _pad2;  // 64
+    float4 color;               // 80
+};
+
+// 32B，材质（albedo + metallic + roughness）
+struct PathMaterial
+{
+    float4 albedo;     // 16B (rgb baseColor + alpha)
+    float  metallic;   // 4B
+    float  roughness;  // 4B
+    float2 _pad;       // 8B
+};
+
+// 32B，光源
+struct PathLight
+{
+    float3 positionOrDir; // point=世界坐标; directional=指向光源方向
+    float  range;          // point=衰减范围; directional=1e34f
+    float3 color;          // rgb（intensity 已乘入）
+    uint   type;           // 0=point, 1=directional
+};
+
+// 144B，InstanceRecord 重打包（136B->144B）
+// header.x = materialID, header.y = blasID
+struct InstanceGpu
+{
+    uint4  header;
+    row_major float4x4 transform;     // object->world
+    row_major float4x4 invTransform;  // world->object
+};
+
+// 32B，光线
+struct Ray
+{
+    float3 origin;
+    float  _pad0;
+    float3 direction;
+    float  _pad1;
+};
+
+// 32B，命中结果
+struct RayHit
+{
+    float t;
+    float u;
+    float v;
+    uint  _pad0;
+    uint  triIndex;  // BLAS 内局部三角形索引
+    uint  instIndex; // 实例 ID（0xFFFFFFFF = 未命中）
+    uint  _pad1;
+    uint  _pad2;
+};
+
+// ── 输入缓冲（9 大数组 + 光源数组，由 RenderBufferManager 绑定） ──
+StructuredBuffer<BVHNode>      TlasNodes;
+StructuredBuffer<uint>         TlasPrimIdx;
+StructuredBuffer<BVHNode>      GlobalBlasNodes;
+StructuredBuffer<uint>         GlobalBlasPrimIdx;
+StructuredBuffer<BLASDesc>     BlasDescriptors;
+StructuredBuffer<InstanceGpu>  InstanceTable;
+StructuredBuffer<Tri>          GlobalTriangles;
+StructuredBuffer<Vertex>       GlobalVertices;
+StructuredBuffer<PathMaterial> Materials;
+StructuredBuffer<PathLight>   Lights;
+
+// ── 运行时缓冲（由渲染器绑定） ──
+RWTexture2D<float4> Output;
+
+// ── G-buffer（主光线首次命中，方案A/B共享） ──
+// GBuffer0: worldPos.xyz + depth(hit.t)；miss 时 rgb=0,a=0
+RWTexture2D<float4> GBufferPosDepth;
+// GBuffer1: worldNormal.xyz + roughness；miss 时为 0
+RWTexture2D<float4> GBufferNormalRough;
+
+// ── 常量缓冲（由渲染器注入） ──
+cbuffer PathTraceCB
+{
+    float4x4 CamToWorld;     // view->world
+    float4x4 InvProjection; // clip->view
+    uint     Width;
+    uint     Height;
+    float    FarPlane;
+    uint     _cbPad0;
+    uint     LightCount;
+    uint     FrameCount;
+    uint     MaxDepth;
+    uint     _cbPad1;
+    float3   AmbientColor;
+    float    _cbPad2;
+};
+
+// ── 时域/空域降噪常量（由渲染器注入） ──
+cbuffer TemporalCB
+{
+    float4x4 PrevViewProj;  // 上一帧 viewProj = prevProjection * prevView
+    uint     AccumFrame;    // 静态累积帧数（相机移动时重置为0）
+    uint     EnableTemporal;// 时域累积开关（0=直接用新样本）
+    uint     SpatialPasses; // 空域滤波 pass 数（0=禁用）
+    uint     _tcbPad0;
+};
+
+// ══════════════════════════════════════════════════════
+//  求交核心（复用原 3-kernel 实现）
+// ══════════════════════════════════════════════════════
+
+// ── AABB slab 求交 ──
+bool IntersectAABB(BVHNode n, float3 origin, float3 invDir, float tMax, out float tNear)
+{
+    float3 t1 = (n.aabbMin - origin) * invDir;
+    float3 t2 = (n.aabbMax - origin) * invDir;
+    float3 tmin = min(t1, t2);
+    float3 tmax = max(t1, t2);
+    tNear = max(max(tmin.x, tmin.y), tmin.z);
+    float tExit = min(min(tmax.x, tmax.y), tmax.z);
+    return tExit >= tNear && tNear <= tMax && tExit >= 0.0 && !isnan(tNear) && !isnan(tExit);
+}
+
+// ── Moller-Trumbore 三角形求交（最近命中） ──
+void IntersectTri(float3 origin, float3 dir, BLASDesc d, uint localTri, inout RayHit hit)
+{
+    Tri t = GlobalTriangles[d.triBase + localTri];
+    float3 p0 = GlobalVertices[d.vertBase + t.v0].pos;
+    float3 p1 = GlobalVertices[d.vertBase + t.v1].pos;
+    float3 p2 = GlobalVertices[d.vertBase + t.v2].pos;
+    float3 e1 = p1 - p0;
+    float3 e2 = p2 - p0;
+    float3 rd = cross(dir, e2);
+    float  det = dot(e1, rd);
+    if (abs(det) < 1e-7) return;
+    float inv = 1.0 / det;
+    float3 s = origin - p0;
+    float u = dot(s, rd) * inv;
+    if (u < 0.0 || u > 1.0) return;
+    float3 q = cross(s, e1);
+    float v = dot(dir, q) * inv;
+    if (v < 0.0 || (u + v) > 1.0) return;
+    float tt = dot(e2, q) * inv;
+    if (tt > 0.0 && tt < hit.t)
+    {
+        hit.t        = tt;
+        hit.u        = u;
+        hit.v        = v;
+        hit.triIndex = localTri;
+    }
+}
+
+// ── 三角形遮挡测试（any-hit，早退） ──
+bool OccludedTri(float3 origin, float3 dir, BLASDesc d, uint localTri, float maxT)
+{
+    Tri t = GlobalTriangles[d.triBase + localTri];
+    float3 p0 = GlobalVertices[d.vertBase + t.v0].pos;
+    float3 p1 = GlobalVertices[d.vertBase + t.v1].pos;
+    float3 p2 = GlobalVertices[d.vertBase + t.v2].pos;
+    float3 e1 = p1 - p0;
+    float3 e2 = p2 - p0;
+    float3 rd = cross(dir, e2);
+    float  det = dot(e1, rd);
+    if (abs(det) < 1e-7) return false;
+    float inv = 1.0 / det;
+    float3 s = origin - p0;
+    float u = dot(s, rd) * inv;
+    if (u < 0.0 || u > 1.0) return false;
+    float3 q = cross(s, e1);
+    float v = dot(dir, q) * inv;
+    if (v < 0.0 || (u + v) > 1.0) return false;
+    float tt = dot(e2, q) * inv;
+    return tt > EPS_OFFSET && tt < maxT;
+}
+
+// ── BLAS 栈式遍历（Wald BVH2，最近命中） ──
+void CastRayBLAS(float3 origin, float3 dir, BLASDesc d, inout RayHit hit)
+{
+    float3 invDir = 1.0 / dir;
+    uint stack[32];
+    uint sp = 0;
+    uint nodeIdx = d.blasNodeBase;
+    [loop]
+    while (true)
+    {
+        BVHNode n = GlobalBlasNodes[nodeIdx];
+        float tNear;
+        if (!IntersectAABB(n, origin, invDir, hit.t, tNear))
+        {
+            if (sp == 0) break;
+            nodeIdx = stack[--sp];
+            continue;
+        }
+        if (n.triCount > 0)
+        {
+            [loop]
+            for (uint k = 0; k < n.triCount; k++)
+            {
+                uint localTri = GlobalBlasPrimIdx[n.leftFirst + k];
+                IntersectTri(origin, dir, d, localTri, hit);
+            }
+            if (sp == 0) break;
+            nodeIdx = stack[--sp];
+            continue;
+        }
+        uint left = n.leftFirst;
+        nodeIdx = left;
+        stack[sp++] = left + 1;
+    }
+}
+
+// ── BLAS 遮挡遍历（早退，any-hit 即返回 true） ──
+bool OccludedBLAS(float3 origin, float3 dir, BLASDesc d, float maxT)
+{
+    float3 invDir = 1.0 / dir;
+    uint stack[32];
+    uint sp = 0;
+    uint nodeIdx = d.blasNodeBase;
+    [loop]
+    while (true)
+    {
+        BVHNode n = GlobalBlasNodes[nodeIdx];
+        float tNear;
+        if (!IntersectAABB(n, origin, invDir, maxT, tNear))
+        {
+            if (sp == 0) break;
+            nodeIdx = stack[--sp];
+            continue;
+        }
+        if (n.triCount > 0)
+        {
+            [loop]
+            for (uint k = 0; k < n.triCount; k++)
+            {
+                uint localTri = GlobalBlasPrimIdx[n.leftFirst + k];
+                if (OccludedTri(origin, dir, d, localTri, maxT)) return true;
+            }
+            if (sp == 0) break;
+            nodeIdx = stack[--sp];
+            continue;
+        }
+        uint left = n.leftFirst;
+        nodeIdx = left;
+        stack[sp++] = left + 1;
+    }
+    return false;
+}
+
+// ── 实例相交（最近命中） ──
+void IntersectInstance(Ray ray, uint instID, inout RayHit hit)
+{
+    InstanceGpu inst = InstanceTable[instID];
+    float3 localOrigin = mul(inst.invTransform, float4(ray.origin, 1.0)).xyz;
+    float3 localDir    = mul(inst.invTransform, float4(ray.direction, 0.0)).xyz;
+
+    uint blasID = inst.header.y;
+    BLASDesc d = BlasDescriptors[blasID];
+
+    RayHit bh = hit;
+    bh.triIndex = MISS_INDEX;
+    bh.instIndex = MISS_INDEX;
+    CastRayBLAS(localOrigin, localDir, d, bh);
+
+    if (bh.t < hit.t)
+    {
+        hit = bh;
+        hit.instIndex = instID;
+    }
+}
+
+// ── 实例遮挡（早退） ──
+bool OccludedInstance(Ray ray, uint instID, float maxT)
+{
+    InstanceGpu inst = InstanceTable[instID];
+    float3 localOrigin = mul(inst.invTransform, float4(ray.origin, 1.0)).xyz;
+    float3 localDir    = mul(inst.invTransform, float4(ray.direction, 0.0)).xyz;
+
+    uint blasID = inst.header.y;
+    BLASDesc d = BlasDescriptors[blasID];
+    return OccludedBLAS(localOrigin, localDir, d, maxT);
+}
+
+// ── TLAS 栈式遍历（最近命中） ──
+void CastRayTLAS(Ray ray, inout RayHit hit)
+{
+    float3 invDir = 1.0 / ray.direction;
+    uint stack[32];
+    uint sp = 0;
+    uint nodeIdx = 0;
+    [loop]
+    while (true)
+    {
+        BVHNode n = TlasNodes[nodeIdx];
+        float tNear;
+        if (!IntersectAABB(n, ray.origin, invDir, hit.t, tNear))
+        {
+            if (sp == 0) break;
+            nodeIdx = stack[--sp];
+            continue;
+        }
+        if (n.triCount > 0)
+        {
+            [loop]
+            for (uint k = 0; k < n.triCount; k++)
+            {
+                uint instID = TlasPrimIdx[n.leftFirst + k];
+                IntersectInstance(ray, instID, hit);
+            }
+            if (sp == 0) break;
+            nodeIdx = stack[--sp];
+            continue;
+        }
+        uint left = n.leftFirst;
+        nodeIdx = left;
+        stack[sp++] = left + 1;
+    }
+}
+
+// ── TLAS 遮挡遍历（早退） ──
+bool OccludedTLAS(Ray ray, float maxT)
+{
+    float3 invDir = 1.0 / ray.direction;
+    uint stack[32];
+    uint sp = 0;
+    uint nodeIdx = 0;
+    [loop]
+    while (true)
+    {
+        BVHNode n = TlasNodes[nodeIdx];
+        float tNear;
+        if (!IntersectAABB(n, ray.origin, invDir, maxT, tNear))
+        {
+            if (sp == 0) break;
+            nodeIdx = stack[--sp];
+            continue;
+        }
+        if (n.triCount > 0)
+        {
+            [loop]
+            for (uint k = 0; k < n.triCount; k++)
+            {
+                uint instID = TlasPrimIdx[n.leftFirst + k];
+                if (OccludedInstance(ray, instID, maxT)) return true;
+            }
+            if (sp == 0) break;
+            nodeIdx = stack[--sp];
+            continue;
+        }
+        uint left = n.leftFirst;
+        nodeIdx = left;
+        stack[sp++] = left + 1;
+    }
+    return false;
+}
+
+// ══════════════════════════════════════════════════════
+//  辅助函数：PRNG / 几何 / BSDF / 光照
+// ══════════════════════════════════════════════════════
+
+// ── xxhash32 PRNG ──
+uint xxhash32(uint3 p)
+{
+    const uint P1 = 0x9E3779B1u, P2 = 0x85EBCA77u, P3 = 0xC2B2AE3Du, P5 = 0x165667B1u;
+    uint h = P5 + (p.x + p.y) * P1;
+    h ^= p.z; h *= P2; h ^= h >> 13; h *= P3; h ^= h >> 16;
+    h ^= p.x; h *= P2; h ^= h >> 13; h *= P3; h ^= h >> 16;
+    h ^= p.y; h *= P2; h ^= h >> 13; h *= P3; h ^= h >> 16;
+    return h;
+}
+
+float rand(inout uint seed)
+{
+    seed = seed * 1664525u + 1013904223u;
+    return float(seed >> 8) * (1.0 / 16777216.0);
+}
+
+// ── 命中点世界法线（取三顶点法线重心插值 + 实例变换） ──
+float3 getHitWorldNormal(RayHit hit)
+{
+    InstanceGpu inst = InstanceTable[hit.instIndex];
+    uint blasID = inst.header.y;
+    BLASDesc d = BlasDescriptors[blasID];
+    Tri t = GlobalTriangles[d.triBase + hit.triIndex];
+    float3 n0 = GlobalVertices[d.vertBase + t.v0].normal;
+    float3 n1 = GlobalVertices[d.vertBase + t.v1].normal;
+    float3 n2 = GlobalVertices[d.vertBase + t.v2].normal;
+    float3 n = n0 * (1.0 - hit.u - hit.v) + n1 * hit.u + n2 * hit.v;
+    // object -> world（行主序 mul(M, v)；非均匀缩放下有偏差，留 TODO）
+    float3 wn = mul(inst.transform, float4(n, 0.0)).xyz;
+    return normalize(wn);
+}
+
+// ── 命中点材质 ──
+PathMaterial getHitMaterial(RayHit hit)
+{
+    InstanceGpu inst = InstanceTable[hit.instIndex];
+    uint matID = inst.header.x;
+    return Materials[matID];
+}
+
+// ── 构造正交基 ──
+void createONB(float3 N, out float3 T, out float3 B)
+{
+    float3 up = abs(N.y) < 0.999 ? float3(0, 1, 0) : float3(1, 0, 0);
+    T = normalize(cross(up, N));
+    B = cross(N, T);
+}
+
+// ── 余弦加权半球采样（diffuse 用） ──
+float3 cosineSampleHemisphere(float2 u, float3 T, float3 B, float3 N)
+{
+    float phi = 2.0 * PI * u.x;
+    float r = sqrt(u.y);
+    float x = r * cos(phi);
+    float y = r * sin(phi);
+    float z = sqrt(max(0.0, 1.0 - u.y));
+    return normalize(x * T + y * B + z * N);
+}
+
+// ── GGX 微表面工具 ──
+float D_GGX(float NdotH, float a2)
+{
+    float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
+}
+
+// separable Smith-GGX，返回真正的 G2（不含 1/(4·NdotV·NdotL)）。
+// a2 = roughness^4（Disney 约定）。
+float G_SmithGGX(float NdotV, float NdotL, float a2)
+{
+    float g1v = 2.0 * NdotV / (NdotV + sqrt(a2 + (1.0 - a2) * NdotV * NdotV));
+    float g1l = 2.0 * NdotL / (NdotL + sqrt(a2 + (1.0 - a2) * NdotL * NdotL));
+    return g1v * g1l;
+}
+
+float3 F_Schlick(float3 F0, float cosTheta)
+{
+    return F0 + (1.0 - F0) * pow(1.0 - max(cosTheta, 0.0), 5.0);
+}
+
+float3 specularF0(float3 albedo, float metallic)
+{
+    return lerp(float3(0.04, 0.04, 0.04), albedo, metallic);
+}
+
+// ── 评估 BSDF（用于 NEE 直接光照，返回 BSDF 值，不含 NdotL） ──
+float3 evaluateBSDF(PathMaterial mat, float3 N, float3 L, float3 V, float NdotL, float NdotV)
+{
+    float3 albedo = mat.albedo.rgb;
+    float metallic = mat.metallic;
+    float roughness = mat.roughness;
+    float3 F0 = specularF0(albedo, metallic);
+
+    // diffuse
+    float3 diffuse = (1.0 - metallic) * albedo / PI;
+
+    // specular (GGX)
+    float3 H = normalize(L + V);
+    float NdotH = max(dot(N, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float D = D_GGX(NdotH, a2);
+    float G = G_SmithGGX(NdotV, NdotL, a2);
+    float3 F = F_Schlick(F0, VdotH);
+    float3 specular = D * G * F / (4.0 * NdotV * NdotL + 1e-6);
+
+    return diffuse + specular;
+}
+
+// ── 采样 BSDF（间接弹射，返回 BSDF 值与 pdf） ──
+// 按 (1-metallic) 概率在 diffuse(余弦半球) 与 specular(GGX NDF) 间选择采样方向，
+// 但 BSDF 与 pdf 统一为完整混合形式（两分支相同），保证能量守恒。
+float3 sampleBSDF(PathMaterial mat, float3 N, float3 V,
+                  inout uint seed, out float3 wi, out float pdf)
+{
+    float3 albedo = mat.albedo.rgb;
+    float metallic = mat.metallic;
+    float roughness = mat.roughness;
+    float3 F0 = specularF0(albedo, metallic);
+    float a = roughness * roughness;
+    float a2 = a * a;
+
+    float pd = 1.0 - metallic;       // diffuse 分支概率
+    float r = rand(seed);
+
+    float3 T, B;
+    createONB(N, T, B);
+
+    float NdotV = max(dot(N, V), 0.0);
+
+    // ── 选择采样方向 ──
+    if (r < pd)
+    {
+        // diffuse: 余弦半球采样
+        wi = cosineSampleHemisphere(float2(rand(seed), rand(seed)), T, B, N);
+    }
+    else
+    {
+        // specular: GGX NDF 重要性采样半向量 H
+        float r1 = rand(seed), r2 = rand(seed);
+        float phi = 2.0 * PI * r1;
+        float cosTheta = sqrt(max(0.0, (1.0 - r2) / (1.0 + (a2 - 1.0) * r2)));
+        float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+        float3 H = normalize(sinTheta * cos(phi) * T
+                          + sinTheta * sin(phi) * B
+                          + cosTheta * N);
+        wi = reflect(-V, H);
+    }
+
+    float NdotL = max(dot(N, wi), 0.0);
+    if (NdotL <= 0.0) { pdf = 0.0; return float3(0, 0, 0); }
+
+    // ── 完整 BSDF（diffuse + specular） ──
+    float3 H = normalize(wi + V);
+    float NdotH = max(dot(N, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+    float D = D_GGX(NdotH, a2);
+    float G = G_SmithGGX(NdotV, NdotL, a2);
+    float3 F = F_Schlick(F0, VdotH);
+    float3 specular = D * G * F / (4.0 * NdotV * NdotL + 1e-6);
+    float3 diffuse = (1.0 - metallic) * albedo / PI;
+    float3 bsdf = diffuse + specular;
+
+    // ── 完整混合 pdf（两分支一致）：pd·pdfDiffuse + (1-pd)·pdfSpecular ──
+    float pdf_diffuse = NdotL / PI;
+    float pdf_specular = (VdotH > 0.0) ? (D * NdotH / (4.0 * VdotH)) : 0.0;
+    pdf = pd * pdf_diffuse + (1.0 - pd) * pdf_specular;
+
+    return bsdf;
+}
+
+// ── 光源贡献（方向 / 距离 / 颜色） ──
+void sampleLightContribution(PathLight L, float3 P,
+                             out float3 toL, out float dist, out float3 Lcolor)
+{
+    if (L.type == 1) // directional
+    {
+        toL = L.positionOrDir; // 指向光源方向
+        dist = 1e34f;
+        Lcolor = L.color;
+    }
+    else // point
+    {
+        float3 d = L.positionOrDir - P;
+        float dist2 = dot(d, d);
+        dist = sqrt(dist2);
+        toL = d / max(dist, 1e-6);
+        // range 软衰减 + 平方反比
+        float atten = 1.0;
+        if (L.range < 1e33f)
+        {
+            float rr = dist / L.range;
+            atten = max(0.0, 1.0 - rr * rr);
+        }
+        Lcolor = L.color * atten / max(dist2, 1e-6);
+    }
+}
+
+// ══════════════════════════════════════════════════════
+//  Kernel: PathTrace（单 kernel 多弹射路径追踪）
+// ══════════════════════════════════════════════════════
+[numthreads(8, 8, 1)]
+void PathTrace(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    // ── 1. 生成主光线（像素中心 -> NDC -> view -> world） ──
+    float2 uv = (float2(id.x, id.y) + 0.5) / float2(Width, Height);
+    float2 screen = uv * 2.0 - 1.0;
+    float4 pView = mul(InvProjection, float4(screen, 1.0, 1.0));
+    pView.xyz /= pView.w;
+    float3 dirView = normalize(pView.xyz);
+    float3 origin = mul(CamToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+    float3 dir = normalize(mul(CamToWorld, float4(dirView, 0.0)).xyz);
+
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = dir;
+    ray._pad0 = 0.0;
+    ray._pad1 = 0.0;
+
+    uint seed = xxhash32(uint3(id.xy, FrameCount));
+    float3 radiance = float3(0.0, 0.0, 0.0);
+    float3 throughput = float3(1.0, 1.0, 1.0);
+
+    // ── 2. 多弹射循环 ──
+    [loop]
+    for (int depth = 0; depth < (int)MaxDepth; depth++)
+    {
+        RayHit hit;
+        hit.t = FarPlane;
+        hit.u = 0.0;
+        hit.v = 0.0;
+        hit._pad0 = 0;
+        hit.triIndex = MISS_INDEX;
+        hit.instIndex = MISS_INDEX;
+        hit._pad1 = 0;
+        hit._pad2 = 0;
+
+        CastRayTLAS(ray, hit);
+
+        // miss：加环境光后终止
+        if (hit.instIndex == MISS_INDEX)
+        {
+            // 主光线 miss：写空 G-buffer（天空）
+            if (depth == 0)
+            {
+                GBufferPosDepth[id.xy]   = float4(0.0, 0.0, 0.0, 0.0);
+                GBufferNormalRough[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+            }
+            radiance += throughput * AmbientColor;
+            break;
+        }
+
+        // ── 命中点几何与材质 ──
+        float3 N = getHitWorldNormal(hit);
+        float3 P = ray.origin + ray.direction * hit.t;
+        PathMaterial mat = getHitMaterial(hit);
+
+        // 面朝向修正（先修正再写 G-buffer，保证法线一致性）
+        bool frontFace = dot(ray.direction, N) < 0.0;
+        if (!frontFace) N = -N;
+
+        // 主光线首次命中：写 G-buffer（方案A/B共享，使用面朝相机法线）
+        if (depth == 0)
+        {
+            GBufferPosDepth[id.xy]   = float4(P, hit.t);
+            GBufferNormalRough[id.xy] = float4(N, mat.roughness);
+        }
+
+        float3 V = -ray.direction;
+        float NdotV = max(dot(N, V), 0.0);
+
+        // ── 3. NEE 直接光照：遍历所有光源 ──
+        [loop]
+        for (uint li = 0; li < LightCount; li++)
+        {
+            PathLight L = Lights[li];
+            float3 toL; float dist; float3 Lcolor;
+            sampleLightContribution(L, P, toL, dist, Lcolor);
+            float NdotL = dot(N, toL);
+            if (NdotL <= 0.0) continue;
+
+            // 阴影测试
+            Ray shadowRay;
+            shadowRay.origin = P + N * EPS_OFFSET;
+            shadowRay.direction = toL;
+            shadowRay._pad0 = 0.0;
+            shadowRay._pad1 = 0.0;
+            if (OccludedTLAS(shadowRay, dist)) continue;
+
+            float3 bsdf = evaluateBSDF(mat, N, toL, V, NdotL, NdotV);
+            radiance += throughput * bsdf * NdotL * Lcolor;
+        }
+
+        // ── 4. BSDF 采样（间接弹射） ──
+        float3 newDir; float pdf;
+        float3 bsdf = sampleBSDF(mat, N, V, seed, newDir, pdf);
+        float NdotL_new = max(dot(N, newDir), 0.0);
+        if (pdf <= 0.0 || NdotL_new <= 0.0) break;
+        throughput *= bsdf * NdotL_new / pdf;
+
+        ray.origin = P + N * EPS_OFFSET;
+        ray.direction = newDir;
+
+        // ── 5. 俄罗斯轮盘（depth>3 后） ──
+        if (depth > 3)
+        {
+            float pcont = min(max(max(throughput.x, throughput.y), throughput.z) + 0.001, 0.95);
+            if (rand(seed) >= pcont) break;
+            throughput /= pcont;
+        }
+    }
+
+    Output[id.xy] = float4(radiance, 1.0);
+}
+
+// ══════════════════════════════════════════════════════
+//  Kernel: TemporalAccumulate（方案A 时域累积）
+//  静态相机时 EMA 累积历史帧；相机移动时 C# 侧重置 AccumFrame=0
+//  此处读 GBufferPosDepth 做重投影（静态时为恒等映射）
+// ══════════════════════════════════════════════════════
+
+// 只读资源（SRV）
+Texture2D<float4> History;    // 上一帧累积结果
+Texture2D<float4> CurSample;  // 本帧 PathTrace 输出（= OutputRT）
+// GBufferPosDepth / GBufferNormalRough 复用顶部 RWTexture2D 声明，[] 读取
+
+// 可读写资源（UAV）
+RWTexture2D<float4> Accum;   // 本帧累积输出
+
+[numthreads(8, 8, 1)]
+void TemporalAccumulate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    float4 cur = CurSample[id.xy];
+
+    // 关闭时域 或 首帧（含相机移动重置）：直接用新样本
+    if (EnableTemporal == 0u || AccumFrame == 0u)
+    {
+        Accum[id.xy] = cur;
+        return;
+    }
+
+    float4 gpd = GBufferPosDepth[id.xy];
+    float  depth = gpd.a;
+    float3 worldPos = gpd.rgb;
+
+    // 天空像素（miss）：不累积，直接用新样本
+    if (depth <= 0.0)
+    {
+        Accum[id.xy] = cur;
+        return;
+    }
+
+    // 重投影：worldPos -> 上一帧屏幕坐标
+    // 静态相机时 PrevViewProj == 当前 viewProj，映射为恒等（prevPos == id）
+    float4 prevClip = mul(PrevViewProj, float4(worldPos, 1.0));
+    if (prevClip.w <= 0.0)
+    {
+        Accum[id.xy] = cur;
+        return;
+    }
+    float2 prevNdc = prevClip.xy / prevClip.w;
+    float2 prevUV = prevNdc * 0.5 + 0.5;
+    if (any(prevUV < 0.0) || any(prevUV > 1.0))
+    {
+        Accum[id.xy] = cur;
+        return;
+    }
+
+    int2 prevPos = int2(prevUV * float2(Width, Height));
+    prevPos = clamp(prevPos, int2(0, 0), int2((int)Width - 1, (int)Height - 1));
+    float4 hist = History.Load(int3(prevPos, 0));
+
+    // Neighborhood clamp：改用 History 邻域（多帧累积，方差已降低）定义裁剪范围
+    //
+    // 原方案用 CurSample（1-spp 原始噪声）的 3×3 邻域定义 min/max 范围，
+    // 在阴影区等高方差场景下 9 个样本可能碰巧全暗/全亮，导致正确的历史
+    // 累积值被截断 → 累积反复重置 → 阴影噪声永远无法收敛。
+    //
+    // 修正：用 History（已累积多帧，噪声已大幅降低）的 3×3 邻域定义范围，
+    // 并改为裁剪当前帧噪声样本（而非历史值），防止极端离群值注入累积。
+    float3 hMin = hist.rgb;
+    float3 hMax = hist.rgb;
+    [unroll]
+    for (int ny = -1; ny <= 1; ny++)
+    {
+        [unroll]
+        for (int nx = -1; nx <= 1; nx++)
+        {
+            if (nx == 0 && ny == 0) continue;
+            int2 hp = clamp(prevPos + int2(nx, ny), int2(0, 0), int2((int)Width - 1, (int)Height - 1));
+            float3 hc = History.Load(int3(hp, 0)).rgb;
+            hMin = min(hMin, hc);
+            hMax = max(hMax, hc);
+        }
+    }
+
+    // 扩展裁剪范围：History 邻域可能尚未反映真实色彩分布（早期帧），
+    // 给予 50% 相对扩展 + 0.02 绝对下限，允许当前帧样本渐进收敛
+    float3 hRange = hMax - hMin;
+    hMin -= hRange * 0.5 + 0.02;
+    hMax += hRange * 0.5 + 0.02;
+
+    // 裁剪当前帧噪声样本（而非历史值），防止极端离群值注入累积
+    float3 curClamped = clamp(cur.rgb, hMin, hMax);
+
+    // EMA：alpha 随帧数递减，clamp 下限保证响应性
+    float alpha = clamp(1.0 / (float(AccumFrame) + 1.0), 0.02, 1.0);
+    Accum[id.xy] = float4(lerp(hist.rgb, curClamped, alpha), cur.a);
+}
+
+// ══════════════════════════════════════════════════════
+//  Kernel: SpatialFilter（方案B G-buffer 引导空域滤波）
+//  à-trous 3x3 方形核（9 tap），步长 = 1<<PassIndex，各向同性
+//  边缘权重：法线^32 × 深度衰减 × 粗糙度衰减 × 亮度衰减 × 高斯空间衰减
+// ══════════════════════════════════════════════════════
+
+// 全局 uniform（由 SetComputeIntParam 设置，仅 SpatialFilter 使用）
+uint PassIndex;
+
+// 只读输入与可写输出
+Texture2D<float4>    FilterInput;
+RWTexture2D<float4> FilterOutput;
+
+// 单 tap 累加（邻域 q 相对中心 cC/cD/cN/cR），含高斯空间权重 + 亮度权重
+void filterTap(int2 q, float3 cC, float cD, float3 cN, float cR, float ws,
+               inout float3 sum, inout float wsum)
+{
+    int2 qc = clamp(q, int2(0, 0), int2((int)Width - 1, (int)Height - 1));
+    float4 qColor = FilterInput.Load(int3(qc, 0));
+    float  qD = GBufferPosDepth[qc].a;
+    float4 qGnr = GBufferNormalRough[qc];
+    float3 qN = qGnr.rgb;
+    float  qR = qGnr.a;
+
+    float wn = pow(max(dot(cN, qN), 0.0), 32.0);          // 法线权重
+    float wd = exp(-abs(cD - qD) / (cD * 0.05 + 1e-3));    // 深度权重
+    float wr = exp(-abs(cR - qR) / 0.2);                   // 粗糙度权重
+
+    // 亮度权重（自适应）：保护镜面高光等高频亮斑不被糊掉
+    // 分母 = 相对项（HDR 亮度自适应）+ 绝对项（低亮度下限）
+    // 原方案相对系数 0.1 + 绝对下限 0.02 在阴影区（低亮度）过于激进：
+    //   阴影区 cL=0.05/qL=0.15 时分母仅 0.035 → 权重 0.057 → 几乎不滤波
+    // 降低相对系数至 0.05、提高绝对下限至 0.08，使低亮度区域获得充分滤波：
+    //   同场景分母 0.0875 → 权重 0.32（提升 5.6×），阴影边界仍保边（0.002）
+    float3 lumW = float3(0.299, 0.587, 0.114);
+    float cL = dot(cC, lumW);
+    float qL = dot(qColor.rgb, lumW);
+    float wc = exp(-abs(cL - qL) / (max(cL, qL) * 0.05 + 0.08));
+
+    float w = wn * wd * wr * wc * ws;
+    sum += w * qColor.rgb;
+    wsum += w;
+}
+
+[numthreads(8, 8, 1)]
+void SpatialFilter(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    int2 p = id.xy;
+    float4 cColor = FilterInput.Load(int3(p, 0));
+    float  cD = GBufferPosDepth[p].a;
+
+    // 天空像素（miss）：直接透传，不滤波
+    if (cD <= 0.0)
+    {
+        FilterOutput[p] = cColor;
+        return;
+    }
+
+    float4 cGnr = GBufferNormalRough[p];
+    float3 cN = cGnr.rgb;
+    float  cR = cGnr.a;
+    float3 cC = cColor.rgb;
+
+    int step = 1 << (int)PassIndex;
+    float3 sum = float3(0.0, 0.0, 0.0);
+    float wsum = 0.0;
+
+    // 3x3 方形核（9 tap），各向同性 → 消除菱形伪影
+    // 高斯空间权重：中心权重最高，角落衰减
+    [unroll]
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        [unroll]
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            float dist2 = (float)(dx * dx + dy * dy);
+            float ws = exp(-dist2 * 0.5); // 中心=1, 边=0.607, 角=0.368
+            filterTap(p + int2(dx * step, dy * step), cC, cD, cN, cR, ws, sum, wsum);
+        }
+    }
+
+    FilterOutput[p] = float4(sum / max(wsum, 1e-6), cColor.a);
+}

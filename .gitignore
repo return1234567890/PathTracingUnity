@@ -1,0 +1,55 @@
+# ====================
+# Unity 生成文件
+# ====================
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+
+# ====================
+# IDE 生成文件
+# ====================
+# Visual Studio
+/.vs/
+*.csproj
+*.sln
+*.suo
+*.user
+*.userprefs
+.vsconfig
+
+# Qoder IDE
+/.qoder/
+
+# VS Code (如需要可取消注释保留 settings.json)
+#.vscode/*
+#!.vscode/settings.json
+
+# ====================
+# Unity 构建产物
+# ====================
+*.exe
+*.dll
+*.apk
+*.aab
+*.ipa
+
+# ====================
+# 操作系统文件
+# ====================
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ====================
+# dep/tinybvh 构建产物
+# （该目录是独立 git 仓库，建议作为子模块管理）
+# ====================
+dep/tinybvh/build-win64/
+dep/tinybvh/cache/
+dep/tinybvh/external/
+dep/tinybvh/*.bin
+dep/tinybvh/*.bvh
