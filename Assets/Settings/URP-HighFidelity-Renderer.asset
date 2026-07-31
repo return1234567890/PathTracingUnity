@@ -123,5 +123,5 @@ MonoBehaviour:
   ambientColor: {r: 0.02, g: 0.02, b: 0.02, a: 1}
   denoisingEnabled: 1
   temporalEnabled: 1
-  spatialEnabled: 1
+  spatialEnabled: 0
   spatialPasses: 3

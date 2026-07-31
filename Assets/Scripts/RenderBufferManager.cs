@@ -16,7 +16,7 @@ using UnityEngine.Rendering;
 ///  3. dirty/版本管理：仅在 ModelManager 数组引用变化时刷新；
 ///  4. Bind(...)：一次性 SetBuffer 全部 9 个输入缓冲。
 ///
-/// 其余天然 16B 对齐的结构（BVHNode32=32B、BLASDescriptor=16B、PathMaterial=16B）
+/// 其余天然对齐的结构（BVHNode32=32B、BLASDescriptor=16B、PathMaterial=80B）
 /// 与 uint primIdx(4B) 直接 SetData，无需重打包。
 /// </summary>
 public class RenderBufferManager : IDisposable
@@ -74,7 +74,7 @@ public class RenderBufferManager : IDisposable
     public const int StrideInstance   = 144;
     public const int StrideTri        = 16;
     public const int StrideVertex     = 80;
-    public const int StrideMaterial   = 32;   // PathMaterial: albedo(16)+metallic(4)+roughness(4)+pad(8)
+    public const int StrideMaterial   = 80;   // PathMaterial: albedo(16)+metallic(4)+roughness(4)+bumpScale(4)+flags(4)+emissionColor(16)+4xTexID(16)+uvScaleOffset(16)
     public const int StrideLight     = 32;   // PathLight: positionOrDir(12)+range(4)+color(12)+type(4)
 
     // ── 9 个 ComputeBuffer ──
@@ -88,6 +88,12 @@ public class RenderBufferManager : IDisposable
     public ComputeBuffer GlobalVerticesBuf  { get; private set; }
     public ComputeBuffer MaterialsBuf       { get; private set; }
     public ComputeBuffer LightsBuf           { get; private set; }
+
+    // ── 4 个 Texture2DArray 引用（不创建，由 TextureArrayManager 提供）──
+    private Texture2DArray _baseColorArray;
+    private Texture2DArray _metallicSmoothArray;
+    private Texture2DArray _normalArray;
+    private Texture2DArray _emissiveArray;
 
     // ── 缓存上次同步的数组引用，用于 dirty 检测 ──
     private BVHNode32[]                _lastTlasNodes;
@@ -134,11 +140,20 @@ public class RenderBufferManager : IDisposable
         // 光源数组（独立于 ModelManager，来自 LightManager 单例）
         if (LightManager.Instance != null)
             SyncLights(LightManager.Instance.Lights);
+
+        // ── 纹理数组同步（由 TextureArrayManager 提供）──
+        if (mm.TextureArrays != null)
+        {
+            _baseColorArray     = mm.TextureArrays.BaseColorArray;
+            _metallicSmoothArray = mm.TextureArrays.MetallicSmoothArray;
+            _normalArray       = mm.TextureArrays.NormalArray;
+            _emissiveArray     = mm.TextureArrays.EmissiveArray;
+        }
     }
 
     // ── 绑定 ───────────────────────────────────────────
 
-    /// <summary>把全部 9 个输入缓冲一次性 SetBuffer 到指定 kernel（立即绑定）。</summary>
+    /// <summary>把全部 9 个输入缓冲 + 4 个纹理数组一次性绑定到指定 kernel（立即绑定）。</summary>
     public void Bind(ComputeShader cs, int kernel)
     {
         if (cs == null) return;
@@ -152,9 +167,14 @@ public class RenderBufferManager : IDisposable
         if (GlobalVerticesBuf != null) cs.SetBuffer(kernel, "GlobalVertices", GlobalVerticesBuf);
         if (MaterialsBuf != null)    cs.SetBuffer(kernel, "Materials", MaterialsBuf);
         if (LightsBuf != null)      cs.SetBuffer(kernel, "Lights", LightsBuf);
+        // 纹理数组绑定
+        if (_baseColorArray != null)      cs.SetTexture(kernel, "BaseColorArray", _baseColorArray);
+        if (_metallicSmoothArray != null) cs.SetTexture(kernel, "MetallicSmoothArray", _metallicSmoothArray);
+        if (_normalArray != null)         cs.SetTexture(kernel, "NormalArray", _normalArray);
+        if (_emissiveArray != null)       cs.SetTexture(kernel, "EmissiveArray", _emissiveArray);
     }
 
-    /// <summary>把全部 9 个输入缓冲以 cmd 作用域 SetComputeBufferParam 绑定（URP Pass 推荐）。</summary>
+    /// <summary>把全部 9 个输入缓冲 + 4 个纹理数组以 cmd 作用域绑定（URP Pass 推荐）。</summary>
     public void Bind(CommandBuffer cmd, ComputeShader cs, int kernel)
     {
         if (cs == null) return;
@@ -168,6 +188,11 @@ public class RenderBufferManager : IDisposable
         if (GlobalVerticesBuf != null) cmd.SetComputeBufferParam(cs, kernel, "GlobalVertices", GlobalVerticesBuf);
         if (MaterialsBuf != null)    cmd.SetComputeBufferParam(cs, kernel, "Materials", MaterialsBuf);
         if (LightsBuf != null)      cmd.SetComputeBufferParam(cs, kernel, "Lights", LightsBuf);
+        // 纹理数组绑定
+        if (_baseColorArray != null)      cmd.SetComputeTextureParam(cs, kernel, "BaseColorArray", _baseColorArray);
+        if (_metallicSmoothArray != null) cmd.SetComputeTextureParam(cs, kernel, "MetallicSmoothArray", _metallicSmoothArray);
+        if (_normalArray != null)         cmd.SetComputeTextureParam(cs, kernel, "NormalArray", _normalArray);
+        if (_emissiveArray != null)       cmd.SetComputeTextureParam(cs, kernel, "EmissiveArray", _emissiveArray);
     }
 
     // ── 直传同步工具 ───────────────────────────────────
@@ -368,6 +393,12 @@ public class RenderBufferManager : IDisposable
         _lastVerts = null;
         _lastMats = null;
         _lastLights = null;
+
+        // 清空纹理数组引用（由 TextureArrayManager 管理生命周期）
+        _baseColorArray = null;
+        _metallicSmoothArray = null;
+        _normalArray = null;
+        _emissiveArray = null;
     }
 
     ~RenderBufferManager() { Dispose(); }

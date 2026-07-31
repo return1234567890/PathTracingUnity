@@ -27,18 +27,40 @@ public struct PathTriangle
     public uint v0, v1, v2; // 12B
 }
 
-/// <summary>材质数组元素（按 materialID 索引，32B）。</summary>
+/// <summary>材质数组元素（按 materialID 索引，80B）。</summary>
 /// <remarks>
 /// 金属度工作流：metallic 线性插值 F0；roughness = 1 - URP _Smoothness，钳制 [0.02,1]。
+/// 扩展字段：emissionColor / 4个纹理slice索引 / flags / uvScaleOffset。
+/// 纹理索引 0xFFFFFFFF = 无纹理（使用 uniform 值）。
 /// </remarks>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct PathMaterial
 {
-    public Vector4 albedo;     // 16B (rgb baseColor + alpha)
-    public float   metallic;   // 4B
-    public float   roughness;  // 4B
-    public Vector2 pad;        // 8B
-                             // 合计 32B
+    public Vector4 albedo;          // 16B - base color tint (rgb + alpha)
+    public float   metallic;        // 4B
+    public float   roughness;       // 4B
+    public float   bumpScale;       // 4B - normal map strength (_BumpScale)
+    public uint    flags;           // 4B - bit0:hasBaseMap, bit1:hasMetalRough, bit2:hasNormal, bit3:hasEmissive
+    // -- 32B --
+    public Vector4 emissionColor;   // 16B - emissive tint (_EmissionColor rgb + intensity)
+    public uint    baseTexID;       // 4B - BaseColorArray slice (0xFFFFFFFF=none)
+    public uint    metalRoughTexID; // 4B - MetallicSmoothnessArray slice
+    public uint    normalTexID;     // 4B - NormalArray slice
+    public uint    emissiveTexID;   // 4B - EmissiveArray slice
+    // -- 32B --
+    public Vector4 uvScaleOffset;   // 16B - xy=scale, zw=offset
+    // -- 16B --
+    // 合计 80B
+}
+
+/// <summary>PathMaterial flags 位掩码（与 HLSL 一致）。</summary>
+public static class MaterialFlags
+{
+    public const uint MAT_HAS_BASE   = 1u;
+    public const uint MAT_HAS_MR     = 2u;
+    public const uint MAT_HAS_NORMAL = 4u;
+    public const uint MAT_HAS_EMISS = 8u;
+    public const uint TEX_NONE      = 0xFFFFFFFFu;
 }
 
 /// <summary>
@@ -105,8 +127,11 @@ public class ModelManager : MonoBehaviour
     public PathTriangle[] GlobalTriangles { get; private set; }
     /// <summary>8. 全局顶点数组（按 vertBase 偏移拼接，object-space）</summary>
     public PathVertex[]   GlobalVertices  { get; private set; }
-    /// <summary>9. 材质颜色数组（按 materialID 索引，仅 albedo）</summary>
+    /// <summary>9. 材质数组（按 materialID 索引，含纹理索引与UV变换）</summary>
     public PathMaterial[]  Materials       { get; private set; }
+
+    /// <summary>纹理数组管理器（4个 Texture2DArray），供 RenderBufferManager 访问。</summary>
+    public TextureArrayManager TextureArrays { get; private set; }
 
     private void Awake()
     {
@@ -130,6 +155,8 @@ public class ModelManager : MonoBehaviour
             Instance = null;
         Scene?.Dispose();
         Scene = null;
+        TextureArrays?.Dispose();
+        TextureArrays = null;
     }
 
     // ── 构建主流程 ──────────────────────────────────────
@@ -142,6 +169,10 @@ public class ModelManager : MonoBehaviour
     {
         Scene?.Dispose();
         Scene = new TinyScene();
+
+        // 释放旧纹理数组
+        TextureArrays?.Dispose();
+        TextureArrays = new TextureArrayManager();
 
         // 临时容器
         var globalVerts  = new List<PathVertex>();
@@ -230,7 +261,7 @@ public class ModelManager : MonoBehaviour
             {
                 materialId = materials.Count;
                 matToId[mat] = materialId;
-                materials.Add(GetMaterial(mat));
+                materials.Add(GetMaterial(mat, TextureArrays));
             }
 
             // —— 1c. 添加实例（object→world 变换由 TinyScene 处理）——
@@ -255,6 +286,9 @@ public class ModelManager : MonoBehaviour
         GlobalTriangles = globalTris.ToArray();
         Materials       = materials.ToArray();
 
+        // 4b. 构建纹理数组（所有材质纹理注册完毕后打包）
+        TextureArrays.Build(2048);
+
         // 5. 统计
         if (logBuildStats)
         {
@@ -270,20 +304,29 @@ public class ModelManager : MonoBehaviour
     // ── 材质参数提取（albedo + metallic + roughness） ──────
 
     /// <summary>
-    /// 从材质提取 PBR 参数。优先 URP Lit 的 _BaseColor/_Metallic/_Smoothness，
+    /// 从材质提取 PBR 参数与纹理引用。优先 URP Lit 的 _BaseColor/_Metallic/_Smoothness，
     /// 其次 _Color/_Glossiness（旧版/内置），最后 fallback。
     /// roughness 钳制到 [0.02, 1] 防止镜面退化导致除零。
+    /// 纹理提取：通过 texMgr 注册 Texture2D 获得 slice 索引，写入 PathMaterial。
     /// </summary>
-    private static PathMaterial GetMaterial(Material mat)
+    private static PathMaterial GetMaterial(Material mat, TextureArrayManager texMgr)
     {
         PathMaterial pm;
         pm.albedo = Vector4.one;
         pm.metallic = 0f;
         pm.roughness = 0.5f;
-        pm.pad = Vector2.zero;
+        pm.bumpScale = 1.0f;
+        pm.flags = 0u;
+        pm.emissionColor = Vector4.zero;
+        pm.baseTexID = MaterialFlags.TEX_NONE;
+        pm.metalRoughTexID = MaterialFlags.TEX_NONE;
+        pm.normalTexID = MaterialFlags.TEX_NONE;
+        pm.emissiveTexID = MaterialFlags.TEX_NONE;
+        pm.uvScaleOffset = new Vector4(1f, 1f, 0f, 0f);
 
         if (mat == null) return pm;
 
+        // ── uniform 标量（保持原有逻辑）──
         // albedo
         if (mat.HasProperty("_BaseColor"))
             pm.albedo = mat.GetVector("_BaseColor");
@@ -307,6 +350,76 @@ public class ModelManager : MonoBehaviour
         // 钳制到 [0.02, 1] 防止 GGX 除零与镜面退化
         pm.roughness = Mathf.Clamp(pm.roughness, 0.02f, 1f);
         pm.metallic = Mathf.Clamp01(pm.metallic);
+
+        // ── 新增：纹理提取 ──
+        uint flags = 0u;
+
+        // BaseColor / Main texture
+        Texture2D baseTex = null;
+        if (mat.HasProperty("_BaseMap"))
+            baseTex = mat.GetTexture("_BaseMap") as Texture2D;
+        if (baseTex == null && mat.HasProperty("_MainTex"))
+            baseTex = mat.GetTexture("_MainTex") as Texture2D;
+        if (baseTex != null)
+        {
+            pm.baseTexID = texMgr.RegisterBaseColor(baseTex);
+            flags |= MaterialFlags.MAT_HAS_BASE;
+        }
+
+        // Metallic-Gloss map
+        Texture2D metalGlossTex = null;
+        if (mat.HasProperty("_MetallicGlossMap"))
+            metalGlossTex = mat.GetTexture("_MetallicGlossMap") as Texture2D;
+        if (metalGlossTex != null)
+        {
+            pm.metalRoughTexID = texMgr.RegisterMetallicSmoothness(metalGlossTex);
+            flags |= MaterialFlags.MAT_HAS_MR;
+        }
+
+        // Normal / Bump map
+        Texture2D bumpTex = null;
+        if (mat.HasProperty("_BumpMap"))
+            bumpTex = mat.GetTexture("_BumpMap") as Texture2D;
+        if (bumpTex != null)
+        {
+            pm.normalTexID = texMgr.RegisterNormal(bumpTex);
+            flags |= MaterialFlags.MAT_HAS_NORMAL;
+        }
+
+        // Emission map
+        Texture2D emissionTex = null;
+        if (mat.HasProperty("_EmissionMap"))
+            emissionTex = mat.GetTexture("_EmissionMap") as Texture2D;
+        if (emissionTex != null)
+        {
+            pm.emissiveTexID = texMgr.RegisterEmissive(emissionTex);
+            flags |= MaterialFlags.MAT_HAS_EMISS;
+        }
+        pm.flags = flags;
+
+        // ── 新增：emissive color ──
+        if (mat.HasProperty("_EmissionColor"))
+            pm.emissionColor = mat.GetColor("_EmissionColor");
+
+        // ── 新增：bump scale ──
+        if (mat.HasProperty("_BumpScale"))
+            pm.bumpScale = mat.GetFloat("_BumpScale");
+        else
+            pm.bumpScale = 1.0f;
+
+        // ── 新增：UV 变换（取 _BaseMap 的 tiling/offset，回退 _MainTex）──
+        string uvProp = mat.HasProperty("_BaseMap") ? "_BaseMap" : (mat.HasProperty("_MainTex") ? "_MainTex" : null);
+        if (uvProp != null)
+        {
+            pm.uvScaleOffset = new Vector4(
+                mat.GetTextureScale(uvProp).x,
+                mat.GetTextureScale(uvProp).y,
+                mat.GetTextureOffset(uvProp).x,
+                mat.GetTextureOffset(uvProp).y
+            );
+        }
+        else
+            pm.uvScaleOffset = new Vector4(1f, 1f, 0f, 0f);
 
         return pm;
     }

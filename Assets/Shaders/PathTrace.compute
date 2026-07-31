@@ -20,7 +20,11 @@
 
 #define PI 3.14159265359
 #define MISS_INDEX 0xFFFFFFFFu
-#define EPS_OFFSET 1e-3
+#define DET_EPSILON 1e-7   // Möller-Trumbore 行列式退化剔除阈值（绝对值）
+#define EPS_OFFSET 5e-3
+
+// 调试开关：=1 时画面只输出阴影可见性可视化（白=无阴影，黑=完全阴影）
+#define DEBUG_SHADOW 0
 
 // ── 与 C# 严格对齐的结构体 ──────────────────────────
 
@@ -61,14 +65,27 @@ struct Vertex
     float4 color;               // 80
 };
 
-// 32B，材质（albedo + metallic + roughness）
+// 80B，材质（albedo + metallic + roughness + 纹理索引 + UV变换）
 struct PathMaterial
 {
-    float4 albedo;     // 16B (rgb baseColor + alpha)
-    float  metallic;   // 4B
-    float  roughness;  // 4B
-    float2 _pad;       // 8B
+    float4 albedo;          // 16  - base color tint (rgb + alpha)
+    float  metallic;        // 4
+    float  roughness;       // 4
+    float  bumpScale;       // 4   - normal map strength
+    uint   flags;           // 4   - bit0:hasBase, bit1:hasMR, bit2:hasNormal, bit3:hasEmiss
+    float4 emissionColor;   // 16  - emissive tint
+    uint   baseTexID;       // 4   - BaseColorArray slice (0xFFFFFFFF=none)
+    uint   metalRoughTexID; // 4   - MetallicSmoothnessArray slice
+    uint   normalTexID;     // 4   - NormalArray slice
+    uint   emissiveTexID;   // 4   - EmissiveArray slice
+    float4 uvScaleOffset;   // 16  - xy=scale, zw=offset
 };
+
+#define MAT_HAS_BASE   1u
+#define MAT_HAS_MR     2u
+#define MAT_HAS_NORMAL 4u
+#define MAT_HAS_EMISS  8u
+#define TEX_NONE       0xFFFFFFFFu
 
 // 32B，光源
 struct PathLight
@@ -121,6 +138,18 @@ StructuredBuffer<Tri>          GlobalTriangles;
 StructuredBuffer<Vertex>       GlobalVertices;
 StructuredBuffer<PathMaterial> Materials;
 StructuredBuffer<PathLight>   Lights;
+
+// ── 全局纹理数组（由 RenderBufferManager 绑定） ──
+Texture2DArray<float4> BaseColorArray;
+Texture2DArray<float4> MetallicSmoothArray;
+Texture2DArray<float4> NormalArray;
+Texture2DArray<float4> EmissiveArray;
+
+// 纹理采样器（与纹理同名配对）
+SamplerState sampler_BaseColorArray;
+SamplerState sampler_MetallicSmoothArray;
+SamplerState sampler_NormalArray;
+SamplerState sampler_EmissiveArray;
 
 // ── 运行时缓冲（由渲染器绑定） ──
 RWTexture2D<float4> Output;
@@ -185,7 +214,7 @@ void IntersectTri(float3 origin, float3 dir, BLASDesc d, uint localTri, inout Ra
     float3 e2 = p2 - p0;
     float3 rd = cross(dir, e2);
     float  det = dot(e1, rd);
-    if (abs(det) < 1e-7) return;
+    if (abs(det) < DET_EPSILON) return;
     float inv = 1.0 / det;
     float3 s = origin - p0;
     float u = dot(s, rd) * inv;
@@ -214,7 +243,7 @@ bool OccludedTri(float3 origin, float3 dir, BLASDesc d, uint localTri, float max
     float3 e2 = p2 - p0;
     float3 rd = cross(dir, e2);
     float  det = dot(e1, rd);
-    if (abs(det) < 1e-7) return false;
+    if (abs(det) < DET_EPSILON) return false;
     float inv = 1.0 / det;
     float3 s = origin - p0;
     float u = dot(s, rd) * inv;
@@ -443,12 +472,95 @@ float3 getHitWorldNormal(RayHit hit)
     return normalize(wn);
 }
 
+// ── 命中点几何面法线（三角形面法线，用于射线偏移） ──
+float3 getHitGeoNormal(RayHit hit)
+{
+    InstanceGpu inst = InstanceTable[hit.instIndex];
+    uint blasID = inst.header.y;
+    BLASDesc d = BlasDescriptors[blasID];
+    Tri t = GlobalTriangles[d.triBase + hit.triIndex];
+    float3 p0 = GlobalVertices[d.vertBase + t.v0].pos;
+    float3 p1 = GlobalVertices[d.vertBase + t.v1].pos;
+    float3 p2 = GlobalVertices[d.vertBase + t.v2].pos;
+    float3 n = normalize(cross(p1 - p0, p2 - p0));
+    // object -> world
+    float3 wn = mul(inst.transform, float4(n, 0.0)).xyz;
+    return normalize(wn);
+}
+
 // ── 命中点材质 ──
 PathMaterial getHitMaterial(RayHit hit)
 {
     InstanceGpu inst = InstanceTable[hit.instIndex];
     uint matID = inst.header.x;
     return Materials[matID];
+}
+
+// ── 命中点 UV（重心插值） ──
+float2 getHitUV(RayHit hit)
+{
+    InstanceGpu inst = InstanceTable[hit.instIndex];
+    uint blasID = inst.header.y;
+    BLASDesc d = BlasDescriptors[blasID];
+    Tri t = GlobalTriangles[d.triBase + hit.triIndex];
+    float2 uv0 = GlobalVertices[d.vertBase + t.v0].uv;
+    float2 uv1 = GlobalVertices[d.vertBase + t.v1].uv;
+    float2 uv2 = GlobalVertices[d.vertBase + t.v2].uv;
+    return uv0 * (1.0 - hit.u - hit.v) + uv1 * hit.u + uv2 * hit.v;
+}
+
+// ── 命中点切线（重心插值，object-space） ──
+float4 getHitTangent(RayHit hit)
+{
+    InstanceGpu inst = InstanceTable[hit.instIndex];
+    uint blasID = inst.header.y;
+    BLASDesc d = BlasDescriptors[blasID];
+    Tri t = GlobalTriangles[d.triBase + hit.triIndex];
+    float4 t0 = GlobalVertices[d.vertBase + t.v0].tangent;
+    float4 t1 = GlobalVertices[d.vertBase + t.v1].tangent;
+    float4 t2 = GlobalVertices[d.vertBase + t.v2].tangent;
+    return t0 * (1.0 - hit.u - hit.v) + t1 * hit.u + t2 * hit.v;
+}
+
+// ── 材质纹理采样：覆盖 PathMaterial 的 uniform 值 ──
+void applyMaterialTextures(inout PathMaterial mat, float2 uv)
+{
+    float2 uvT = uv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
+
+    // BaseColor
+    if ((mat.flags & MAT_HAS_BASE) != 0u && mat.baseTexID != TEX_NONE)
+    {
+        float4 tex = BaseColorArray.SampleLevel(sampler_BaseColorArray,
+            float3(uvT, float(mat.baseTexID)), 0.0);
+        mat.albedo *= tex; // tint * texture
+    }
+
+    // Metallic-Smoothness: R=metallic, A=smoothness -> roughness=1-A
+    if ((mat.flags & MAT_HAS_MR) != 0u && mat.metalRoughTexID != TEX_NONE)
+    {
+        float4 tex = MetallicSmoothArray.SampleLevel(sampler_MetallicSmoothArray,
+            float3(uvT, float(mat.metalRoughTexID)), 0.0);
+        mat.metallic = tex.r;
+        mat.roughness = clamp(1.0 - tex.a, 0.02, 1.0);
+    }
+}
+
+// ── 法线贴图扰动：采样法线贴图，用 TBN 变换到世界空间 ──
+float3 getNormalFromMap(PathMaterial mat, float2 uv, float3 N, float3 tangent, float bitangentSign)
+{
+    if ((mat.flags & MAT_HAS_NORMAL) == 0u || mat.normalTexID == TEX_NONE)
+        return N;
+
+    float2 uvT = uv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
+    float3 t = NormalArray.SampleLevel(sampler_NormalArray,
+        float3(uvT, float(mat.normalTexID)), 0.0).xyz;
+
+    t = t * 2.0 - 1.0;
+    
+    // 构造 TBN（与 Unity URP Lit.shader 一致：不做 Gram-Schmidt 正交化）
+    float3 B = normalize(cross(N, tangent) * bitangentSign);
+    float3 mappedN = normalize(tangent * t.x + B * t.y + N * t.z);
+    return normalize(lerp(N, mappedN, mat.bumpScale));
 }
 
 // ── 构造正交基 ──
@@ -668,18 +780,76 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
 
         // ── 命中点几何与材质 ──
         float3 N = getHitWorldNormal(hit);
+        float3 Ngeo = getHitGeoNormal(hit);  // 几何面法线，用于射线偏移
         float3 P = ray.origin + ray.direction * hit.t;
         PathMaterial mat = getHitMaterial(hit);
+        float2 uv = getHitUV(hit);  // 命中点 UV
 
         // 面朝向修正（先修正再写 G-buffer，保证法线一致性）
         bool frontFace = dot(ray.direction, N) < 0.0;
-        if (!frontFace) N = -N;
+        if (!frontFace)
+        {
+            N = -N;
+            Ngeo = -Ngeo;
+        }
+
+        // ── 法线贴图扰动 ──
+        // 切线从 object-space 变换到 world-space
+        InstanceGpu inst = InstanceTable[hit.instIndex];
+        float4 tang = getHitTangent(hit);
+        // 切线是方向向量，变换用 w=0.0（与法线一致）
+        float3 T = normalize(mul(inst.transform, float4(tang.xyz, 0.0)).xyz);
+        float bitangentSign = tang.w >= 0.0 ? 1.0 : -1.0;
+        float3 N_flat = N;  // 保存未扰动插值法线，用于可见性判断
+        N = getNormalFromMap(mat, uv, N, T, bitangentSign);
+
+        // ── 纹理采样覆盖 uniform 值 ──
+        applyMaterialTextures(mat, uv);
 
         // 主光线首次命中：写 G-buffer（方案A/B共享，使用面朝相机法线）
         if (depth == 0)
         {
             GBufferPosDepth[id.xy]   = float4(P, hit.t);
             GBufferNormalRough[id.xy] = float4(N, mat.roughness);
+        }
+
+        // ── 调试：只输出阴影可视化（白=无阴影，黑=完全阴影） ──
+        // 对每个光源做阴影测试，按 NdotL 加权计算可见性比例
+#if DEBUG_SHADOW
+        {
+            float shadowVis = 0.0;
+            float totalW = 0.0;
+            [loop]
+            for (uint sli = 0; sli < LightCount; sli++)
+            {
+                PathLight sL = Lights[sli];
+                float3 toL; float sdist; float3 sLcolor;
+                sampleLightContribution(sL, P, toL, sdist, sLcolor);
+                float sNdotL = max(dot(N_flat, toL), 0.0);
+                if (sNdotL <= 0.0) continue;
+                totalW += sNdotL;
+                Ray sRay;
+                sRay.origin = P + Ngeo * EPS_OFFSET;
+                sRay.direction = toL;
+                sRay._pad0 = 0.0;
+                sRay._pad1 = 0.0;
+                if (!OccludedTLAS(sRay, sdist))
+                    shadowVis += sNdotL;
+            }
+            float vis = totalW > 0.0 ? shadowVis / totalW : 0.0;
+            // 纯灰度可视化；如需突出阴影区可改 lerp(float3(1,0,0), float3(1,1,1), vis)
+            Output[id.xy] = float4(vis, vis, vis, 1.0);
+            return;
+        }
+#endif
+
+        // ── 自发光直接贡献 ──
+        if ((mat.flags & MAT_HAS_EMISS) != 0u)
+        {
+            float2 uvT = uv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
+            float3 emTex = EmissiveArray.SampleLevel(sampler_EmissiveArray,
+                float3(uvT, float(mat.emissiveTexID)), 0.0).rgb;
+            radiance += throughput * mat.emissionColor.rgb * emTex;
         }
 
         float3 V = -ray.direction;
@@ -692,12 +862,15 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
             PathLight L = Lights[li];
             float3 toL; float dist; float3 Lcolor;
             sampleLightContribution(L, P, toL, dist, Lcolor);
+            // 用未扰动插值法线做可见性判断（平滑，无锯齿）
+            float NdotL_smooth = dot(N_flat, toL);
+            if (NdotL_smooth <= 0.0) continue;
             float NdotL = dot(N, toL);
             if (NdotL <= 0.0) continue;
 
-            // 阴影测试
+            // 阴影测试（偏移用几何面法线）
             Ray shadowRay;
-            shadowRay.origin = P + N * EPS_OFFSET;
+            shadowRay.origin = P + Ngeo * EPS_OFFSET;
             shadowRay.direction = toL;
             shadowRay._pad0 = 0.0;
             shadowRay._pad1 = 0.0;
@@ -711,10 +884,13 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
         float3 newDir; float pdf;
         float3 bsdf = sampleBSDF(mat, N, V, seed, newDir, pdf);
         float NdotL_new = max(dot(N, newDir), 0.0);
-        if (pdf <= 0.0 || NdotL_new <= 0.0) break;
+        // 同样用未扰动插值法线做可见性判断
+        float NdotL_new_smooth = dot(N_flat, newDir);
+        if (pdf <= 0.0 || NdotL_new <= 0.0 || NdotL_new_smooth <= 0.0) break;
         throughput *= bsdf * NdotL_new / pdf;
 
-        ray.origin = P + N * EPS_OFFSET;
+        // 间接弹射射线偏移同样用几何面法线
+        ray.origin = P + Ngeo * EPS_OFFSET;
         ray.direction = newDir;
 
         // ── 5. 俄罗斯轮盘（depth>3 后） ──
