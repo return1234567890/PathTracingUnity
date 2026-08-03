@@ -65,26 +65,32 @@ struct Vertex
     float4 color;               // 80
 };
 
-// 80B，材质（albedo + metallic + roughness + 纹理索引 + UV变换）
+// 96B，材质（albedo + metallic + roughness + 纹理索引 + UV变换 + 透射参数）
 struct PathMaterial
 {
     float4 albedo;          // 16  - base color tint (rgb + alpha)
     float  metallic;        // 4
     float  roughness;       // 4
     float  bumpScale;       // 4   - normal map strength
-    uint   flags;           // 4   - bit0:hasBase, bit1:hasMR, bit2:hasNormal, bit3:hasEmiss
+    uint   flags;           // 4   - bit0:hasBase, bit1:hasMR, bit2:hasNormal, bit3:hasEmiss, bit4:isTransparent
     float4 emissionColor;   // 16  - emissive tint
     uint   baseTexID;       // 4   - BaseColorArray slice (0xFFFFFFFF=none)
     uint   metalRoughTexID; // 4   - MetallicSmoothnessArray slice
     uint   normalTexID;     // 4   - NormalArray slice
     uint   emissiveTexID;   // 4   - EmissiveArray slice
     float4 uvScaleOffset;   // 16  - xy=scale, zw=offset
+    // ── 新增 16B 透射参数 ──
+    float  transmission;           // 4  镜面透射因子 [0,1]，0=不透明
+    float  ior;                    // 4  折射率（默认1.5玻璃，1.0空气）
+    float  diffuseTransmission;    // 4  漫透射因子 [0,1]（纸张/布料等）
+    uint   thinWalled;             // 4  1=薄壁（无体积衰减），0=实体
 };
 
-#define MAT_HAS_BASE   1u
-#define MAT_HAS_MR     2u
-#define MAT_HAS_NORMAL 4u
-#define MAT_HAS_EMISS  8u
+#define MAT_HAS_BASE       1u
+#define MAT_HAS_MR         2u
+#define MAT_HAS_NORMAL     4u
+#define MAT_HAS_EMISS      8u
+#define MAT_IS_TRANSPARENT 16u  // bit4: 材质启用透射
 #define TEX_NONE       0xFFFFFFFFu
 
 // 32B，光源
@@ -616,8 +622,9 @@ float3 evaluateBSDF(PathMaterial mat, float3 N, float3 L, float3 V, float NdotL,
     float roughness = mat.roughness;
     float3 F0 = specularF0(albedo, metallic);
 
-    // diffuse
+    // diffuse — 透射材质需按 (1-transmission) 扣减反射能量
     float3 diffuse = (1.0 - metallic) * albedo / PI;
+    diffuse *= (1.0 - mat.transmission);
 
     // specular (GGX)
     float3 H = normalize(L + V);
@@ -723,6 +730,297 @@ void sampleLightContribution(PathLight L, float3 P,
 }
 
 // ══════════════════════════════════════════════════════
+//  半透明 BSDF：Lobe 权重 / BTDF / 半透明阴影
+// ══════════════════════════════════════════════════════
+
+#define LOBE_DIFFUSE_REFLECTION    0
+#define LOBE_SPECULAR_REFLECTION   1
+#define LOBE_SPECULAR_TRANSMISSION 2
+#define LOBE_DIFFUSE_TRANSMISSION  3
+#define LOBE_COUNT                 4
+
+#define MIN_TRANSMISSION 0.01
+#define MAX_SHADOW_LAYERS 16
+
+// Schlick Fresnel（标量版，用于 lobe 权重分配）
+float schlickFresnelScalar(float ior, float cosTheta)
+{
+    float r0 = (1.0 - ior) / (1.0 + ior);
+    r0 = r0 * r0;
+    return r0 + (1.0 - r0) * pow(1.0 - max(cosTheta, 0.0), 5.0);
+}
+
+// 计算 4-lobe 权重（参考 computeLobeWeights 简化版）
+// 返回 float4: x=diffuse_refl, y=spec_refl, z=spec_trans, w=diff_trans
+float4 computeLobeWeights(PathMaterial mat, float VdotN)
+{
+    float fr = schlickFresnelScalar(mat.ior, abs(VdotN));
+
+    float weightBase = 1.0;
+    float4 w = float4(0,0,0,0);
+
+    // Layer 1: 金属反射
+    w.y = weightBase * mat.metallic;
+    weightBase *= (1.0 - mat.metallic);
+
+    // Layer 2: 介电镜面反射（Fresnel）
+    w.y += weightBase * fr;
+    weightBase *= (1.0 - fr);
+
+    // Layer 3: 镜面透射
+    w.z = weightBase * mat.transmission;
+
+    // Layer 4: 剩余在 diffuse refl 与 diffuse trans 间分配
+    float remain = weightBase * (1.0 - mat.transmission);
+    w.w = remain * mat.diffuseTransmission;
+    w.x = remain * (1.0 - mat.diffuseTransmission);
+
+    return w;
+}
+
+// 随机选择 lobe（参考 findLobe）
+int findLobe(PathMaterial mat, float VdotN, float rndVal)
+{
+    float4 w = computeLobeWeights(mat, VdotN);
+    float weight = 0.0;
+    [unroll]
+    for (int i = LOBE_COUNT - 1; i > 0; i--)
+    {
+        weight += w[i];
+        if (rndVal < weight) return i;
+    }
+    return LOBE_DIFFUSE_REFLECTION;
+}
+
+// Snell 折射：返回折射方向，TIR 时返回 float3(0,0,0)
+float3 refractDir(float3 I, float3 N, float eta, float cosI, out bool tir)
+{
+    tir = false;
+    float k = 1.0 - eta * eta * (1.0 - cosI * cosI);
+    if (k < 0.0) { tir = true; return float3(0,0,0); }
+    return eta * I + (eta * cosI - sqrt(k)) * N;
+}
+
+// ── BTDF 采样（镜面透射）──
+// 输出 raw BSDF（与 sampleBSDF 一致），kernel 统一除以 pdf
+void btdfSample(PathMaterial mat, float3 N, float3 T, float3 B,
+                float3 k1, inout uint seed,
+                out float3 k2, out float pdf, out float3 bsdf)
+{
+    bsdf = float3(0,0,0);
+    pdf = 0.0;
+    k2 = float3(0,0,0);
+
+    bool thinWalled = (mat.thinWalled != 0u);
+    float ior1 = 1.0;
+    float ior2 = mat.ior;
+    float VdotN = dot(k1, N);
+    bool entering = (VdotN > 0.0);
+    float eta = entering ? (ior1 / ior2) : (ior2 / ior1);
+
+    float nk1 = abs(VdotN);
+
+    // VNDF 采样半向量 H
+    float a = mat.roughness * mat.roughness;
+    float a2 = a * a;
+    float r1 = rand(seed), r2 = rand(seed);
+    float phi = 2.0 * PI * r1;
+    float cosThetaH = sqrt(max(0.0, (1.0 - r2) / (1.0 + (a2 - 1.0) * r2)));
+    float sinThetaH = sqrt(max(0.0, 1.0 - cosThetaH * cosThetaH));
+    float3 h0 = normalize(float3(sinThetaH * cos(phi), sinThetaH * sin(phi), cosThetaH));
+    float3 H = h0.x * T + h0.y * B + h0.z * N;
+
+    float k1h = dot(k1, H);
+    if (k1h <= 0.0) return;
+
+    bool tir = false;
+    if (thinWalled)
+    {
+        // 薄壁伪 BTDF：反射后翻转到背面
+        k2 = reflect(-k1, H);
+        k2 = normalize(k2 - 2.0 * N * dot(k2, N));
+    }
+    else
+    {
+        // 实体折射
+        float3 refN = entering ? H : -H;
+        k2 = refractDir(-k1, refN, eta, k1h, tir);
+    }
+
+    if (tir)
+    {
+        k2 = reflect(-k1, H);  // TIR → 作为镜面反射处理
+    }
+
+    float nk2 = abs(dot(k2, N));
+    if (nk2 <= 1e-6 || isnan(k2.x)) return;
+
+    float fresnel = schlickFresnelScalar(mat.ior, k1h);
+    float transProb = 1.0 - fresnel;
+
+    float G = G_SmithGGX(nk1, nk2, a2);
+    float D = D_GGX(max(dot(N, H), 0.0), a2);
+
+    if (!thinWalled && !tir)
+    {
+        // 折射 PDF
+        float k2h = abs(dot(k2, H));
+        float tmp = k1h * ior1 - k2h * ior2;
+        if (abs(tmp) > 1e-6)
+            pdf = D * max(dot(N,H),0.0) * G * k1h * k2h / (nk1 * max(dot(N,H),1e-6) * tmp * tmp);
+    }
+    else
+    {
+        // 反射 PDF（薄壁或 TIR）
+        pdf = D * max(dot(N,H),0.0) * G * 0.25 / (nk1 * max(dot(N,H),1e-6));
+    }
+
+    if (pdf <= 1e-6) return;
+
+    // 输出 raw BSDF = (bsdf_over_pdf) × pdf，kernel 统一 throughput *= bsdf * NdotL / pdf
+    if (thinWalled || tir)
+        bsdf = mat.albedo.rgb * G * pdf;
+    else
+        bsdf = mat.albedo.rgb * G * transProb * pdf;
+}
+
+// ── BTDF 评估（用于 NEE）──
+float3 btdfEval(PathMaterial mat, float3 N, float3 T, float3 B,
+                float3 k1, float3 k2, float NdotV, float NdotL)
+{
+    bool thinWalled = (mat.thinWalled != 0u);
+    float ior1 = 1.0, ior2 = mat.ior;
+
+    bool backside = (dot(k2, N) < 0.0);
+    if (!backside) return float3(0,0,0);
+
+    float3 H = normalize(k1 + k2);
+    if (thinWalled) H = normalize(k1 - k2);
+
+    float NdotH = max(dot(N, H), 0.0);
+    float k1h = max(dot(k1, H), 0.0);
+    float k2h = abs(dot(k2, H));
+    if (NdotH <= 0.0 || k1h <= 0.0) return float3(0,0,0);
+
+    float a = mat.roughness * mat.roughness;
+    float a2 = a * a;
+    float D = D_GGX(NdotH, a2);
+    float G = G_SmithGGX(NdotV, NdotL, a2);
+    float fresnel = schlickFresnelScalar(mat.ior, k1h);
+
+    if (!thinWalled)
+    {
+        float tmp = k1h * ior1 - k2h * ior2;
+        if (abs(tmp) < 1e-6) return float3(0,0,0);
+        float bsdf = (1.0 - fresnel) * G * D * k1h * k2h / (NdotV * NdotH * tmp * tmp);
+        return mat.albedo.rgb * bsdf;
+    }
+    else
+    {
+        float bsdf = (1.0 - fresnel) * G * D * 0.25 / (NdotV * NdotH);
+        return mat.albedo.rgb * bsdf;
+    }
+}
+
+// ── 透射式阴影遍历：穿过所有半透明表面，累积透射率 ──
+// 返回 rgb 透射率: (1,1,1)=完全透过, (0,0,0)=完全遮挡
+float3 traceShadowTransmission(Ray ray, float maxT)
+{
+    float3 totalTransmission = float3(1.0, 1.0, 1.0);
+    float3 origin = ray.origin;
+    float3 dir = ray.direction;
+    bool isInside = false;
+
+    [loop]
+    for (int iter = 0; iter < MAX_SHADOW_LAYERS; iter++)
+    {
+        // ── 1. 投射最近命中射线 ──
+        RayHit hit;
+        hit.t = maxT;
+        hit.u = 0.0; hit.v = 0.0;
+        hit._pad0 = 0;
+        hit.triIndex = MISS_INDEX;
+        hit.instIndex = MISS_INDEX;
+        hit._pad1 = 0; hit._pad2 = 0;
+
+        Ray currentRay;
+        currentRay.origin = origin;
+        currentRay.direction = dir;
+        currentRay._pad0 = 0.0;
+        currentRay._pad1 = 0.0;
+
+        CastRayTLAS(currentRay, hit);
+
+        // ── 2. miss：光线到达光源，返回累积透射率 ──
+        if (hit.instIndex == MISS_INDEX)
+        {
+            return totalTransmission;
+        }
+
+        // ── 3. 获取命中点材质与几何 ──
+        float3 Ngeo = getHitGeoNormal(hit);
+        PathMaterial mat = getHitMaterial(hit);
+        float3 P = origin + dir * hit.t;
+
+        // ── 4. 不透明材质：完全遮挡，终止 ──
+        if ((mat.flags & MAT_IS_TRANSPARENT) == 0u || mat.transmission <= MIN_TRANSMISSION)
+        {
+            return float3(0.0, 0.0, 0.0);
+        }
+
+        // ── 5. 计算本层透射率（5 因素）──
+
+        // 因素 A: 基础透射因子
+        float3 layerT = mat.transmission;
+
+        // 因素 B: Fresnel 反射损失
+        float cosTheta = abs(dot(dir, Ngeo));
+        float fresnel = schlickFresnelScalar(mat.ior, cosTheta);
+        layerT *= (1.0 - fresnel);
+
+        // 因素 C: 颜色染色
+        layerT *= mat.albedo.rgb;
+
+        // 因素 D: 体积吸收（Beer 定律）—— 仅在物体内部传播时
+        if (mat.thinWalled == 0u && isInside)
+        {
+            float3 absorbColor = max(mat.albedo.rgb, float3(0.001, 0.001, 0.001));
+            float3 absCoeff = -log(absorbColor) / max(mat.ior * 2.0, 0.1);
+            layerT *= exp(-hit.t * absCoeff);
+            isInside = !isInside;
+        }
+        else if (mat.thinWalled == 0u)
+        {
+            isInside = !isInside;
+        }
+
+        // 因素 E: 粗糙度/金属度衰减
+        layerT *= (1.0 - mat.metallic);
+        float roughnessEffect = 1.0 - (mat.roughness * mat.roughness);
+        layerT *= lerp(0.65, 1.0, roughnessEffect);
+
+        // ── 6. 累积透射率 ──
+        totalTransmission *= layerT;
+
+        // ── 7. 透射率过低 → 提前终止 ──
+        float maxComp = max(max(totalTransmission.r, totalTransmission.g), totalTransmission.b);
+        if (maxComp <= MIN_TRANSMISSION)
+        {
+            return float3(0.0, 0.0, 0.0);
+        }
+
+        // ── 8. 从命中点继续向前投射 ──
+        float facing = dot(dir, Ngeo);
+        origin = P + Ngeo * sign(facing) * EPS_OFFSET;
+        maxT -= hit.t;
+
+        if (maxT <= EPS_OFFSET) break;
+    }
+
+    return totalTransmission;
+}
+
+// ══════════════════════════════════════════════════════
 //  Kernel: PathTrace（单 kernel 多弹射路径追踪）
 // ══════════════════════════════════════════════════════
 [numthreads(8, 8, 1)]
@@ -748,6 +1046,7 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
     uint seed = xxhash32(uint3(id.xy, FrameCount));
     float3 radiance = float3(0.0, 0.0, 0.0);
     float3 throughput = float3(1.0, 1.0, 1.0);
+    bool  isInside = false;  // ★ 内部状态追踪（Beer 定律体积衰减）
 
     // ── 2. 多弹射循环 ──
     [loop]
@@ -785,8 +1084,17 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
         PathMaterial mat = getHitMaterial(hit);
         float2 uv = getHitUV(hit);  // 命中点 UV
 
-        // 面朝向修正（先修正再写 G-buffer，保证法线一致性）
         bool frontFace = dot(ray.direction, N) < 0.0;
+
+        // ★ 体积衰减（Beer 定律）——在翻转法线之前应用
+        if (isInside && mat.thinWalled == 0u && mat.transmission > 0.0)
+        {
+            float3 absorbColor = max(mat.albedo.rgb, float3(0.001, 0.001, 0.001));
+            float3 absCoeff = -log(absorbColor) / max(mat.ior * 2.0, 0.1);
+            throughput *= exp(-hit.t * absCoeff);
+        }
+
+        // 面朝向修正（先修正再写 G-buffer，保证法线一致性）
         if (!frontFace)
         {
             N = -N;
@@ -803,8 +1111,16 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
         float3 N_flat = N;  // 保存未扰动插值法线，用于可见性判断
         N = getNormalFromMap(mat, uv, N, T, bitangentSign);
 
+        // ★ 为 BTDF 准备正交基（与 sampleBSDF 内部一致）
+        float3 B;
+        createONB(N, T, B);
+
         // ── 纹理采样覆盖 uniform 值 ──
         applyMaterialTextures(mat, uv);
+
+        // ★ 透射因子用最终 base color alpha 覆盖（含纹理 alpha 调制）
+        if ((mat.flags & MAT_IS_TRANSPARENT) != 0u)
+            mat.transmission = 1.0 - mat.albedo.a;
 
         // 主光线首次命中：写 G-buffer（方案A/B共享，使用面朝相机法线）
         if (depth == 0)
@@ -854,6 +1170,7 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
 
         float3 V = -ray.direction;
         float NdotV = max(dot(N, V), 0.0);
+        bool isTransparent = ((mat.flags & MAT_IS_TRANSPARENT) != 0u);
 
         // ── 3. NEE 直接光照：遍历所有光源 ──
         [loop]
@@ -862,35 +1179,89 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
             PathLight L = Lights[li];
             float3 toL; float dist; float3 Lcolor;
             sampleLightContribution(L, P, toL, dist, Lcolor);
-            // 用未扰动插值法线做可见性判断（平滑，无锯齿）
-            float NdotL_smooth = dot(N_flat, toL);
-            if (NdotL_smooth <= 0.0) continue;
             float NdotL = dot(N, toL);
-            if (NdotL <= 0.0) continue;
+            float NdotL_smooth = dot(N_flat, toL);
 
-            // 阴影测试（偏移用几何面法线）
+            // ★ 透射材质允许背面光照
+            bool lightValid = false;
+            float3 bsdf = float3(0,0,0);
+
+            if (isTransparent && NdotL <= 0.0)
+            {
+                float absNdotL = abs(NdotL);
+                bsdf = btdfEval(mat, N, T, B, V, toL, NdotV, absNdotL);
+                lightValid = (dot(N_flat, toL) < 0.0 || NdotL_smooth > 0.0);
+                NdotL = absNdotL;
+            }
+            else if (NdotL > 0.0)
+            {
+                bsdf = evaluateBSDF(mat, N, toL, V, NdotL, NdotV);
+                lightValid = (NdotL_smooth > 0.0);
+            }
+
+            if (!lightValid) continue;
+
             Ray shadowRay;
             shadowRay.origin = P + Ngeo * EPS_OFFSET;
             shadowRay.direction = toL;
             shadowRay._pad0 = 0.0;
             shadowRay._pad1 = 0.0;
-            if (OccludedTLAS(shadowRay, dist)) continue;
 
-            float3 bsdf = evaluateBSDF(mat, N, toL, V, NdotL, NdotV);
-            radiance += throughput * bsdf * NdotL * Lcolor;
+            // ★ 性能瓶颈点：统一用半透明阴影遍历，透明物体不遮挡后方光照
+            // traceShadowTransmission 对不透明物体返回 (0,0,0)，对透明物体累积透射率，未命中返回 (1,1,1)
+            // 性能注意：每个光源每条路径都做 closest-hit + 最多 16 层循环，
+            // 比二值遮挡 OccludedTLAS(any-hit 早退出) 慢得多。
+            // 优化方向：C# 侧设 HasTransparentMaterials 开关，无透明物体时回退 OccludedTLAS。
+            float3 shadowTrans = traceShadowTransmission(shadowRay, dist);
+            radiance += throughput * bsdf * NdotL * Lcolor * shadowTrans;
         }
 
         // ── 4. BSDF 采样（间接弹射） ──
         float3 newDir; float pdf;
-        float3 bsdf = sampleBSDF(mat, N, V, seed, newDir, pdf);
+        float3 bsdf;
+
+        if (isTransparent)
+        {
+            int lobe = findLobe(mat, dot(N, V), rand(seed));
+            if (lobe == LOBE_SPECULAR_TRANSMISSION || lobe == LOBE_DIFFUSE_TRANSMISSION)
+            {
+                if (lobe == LOBE_SPECULAR_TRANSMISSION)
+                    btdfSample(mat, N, T, B, V, seed, newDir, pdf, bsdf);
+                else
+                {
+                    // 漫透射：余弦半球采样到背面
+                    newDir = cosineSampleHemisphere(float2(rand(seed),rand(seed)), T, B, -N);
+                    pdf = abs(dot(newDir, N)) / PI;
+                    bsdf = mat.albedo.rgb * mat.diffuseTransmission;
+                }
+                // ★ 切换 isInside 状态
+                if (mat.thinWalled == 0u)
+                    isInside = !isInside;
+            }
+            else
+            {
+                bsdf = sampleBSDF(mat, N, V, seed, newDir, pdf);
+            }
+        }
+        else
+        {
+            bsdf = sampleBSDF(mat, N, V, seed, newDir, pdf);
+        }
+
         float NdotL_new = max(dot(N, newDir), 0.0);
-        // 同样用未扰动插值法线做可见性判断
+        if (isTransparent) NdotL_new = abs(dot(N, newDir));
+        // 同样用未扰动插值法线做可见性判断（透射时不限制）
         float NdotL_new_smooth = dot(N_flat, newDir);
-        if (pdf <= 0.0 || NdotL_new <= 0.0 || NdotL_new_smooth <= 0.0) break;
+        if (pdf <= 0.0 || NdotL_new <= 0.0) break;
+        if (!isTransparent && NdotL_new_smooth <= 0.0) break;
         throughput *= bsdf * NdotL_new / pdf;
 
-        // 间接弹射射线偏移同样用几何面法线
-        ray.origin = P + Ngeo * EPS_OFFSET;
+        // ★ 射线偏移：透射时沿光线方向偏移，反射时沿法线偏移
+        bool isTransmission = (dot(newDir, Ngeo) < 0.0);
+        if (isTransmission)
+            ray.origin = P - Ngeo * EPS_OFFSET;
+        else
+            ray.origin = P + Ngeo * EPS_OFFSET;
         ray.direction = newDir;
 
         // ── 5. 俄罗斯轮盘（depth>3 后） ──

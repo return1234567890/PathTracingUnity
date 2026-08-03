@@ -16,7 +16,7 @@ using UnityEngine.Rendering;
 ///  3. dirty/版本管理：仅在 ModelManager 数组引用变化时刷新；
 ///  4. Bind(...)：一次性 SetBuffer 全部 9 个输入缓冲。
 ///
-/// 其余天然对齐的结构（BVHNode32=32B、BLASDescriptor=16B、PathMaterial=80B）
+/// 其余天然对齐的结构（BVHNode32=32B、BLASDescriptor=16B、PathMaterial=96B）
 /// 与 uint primIdx(4B) 直接 SetData，无需重打包。
 /// </summary>
 public class RenderBufferManager : IDisposable
@@ -74,7 +74,7 @@ public class RenderBufferManager : IDisposable
     public const int StrideInstance   = 144;
     public const int StrideTri        = 16;
     public const int StrideVertex     = 80;
-    public const int StrideMaterial   = 80;   // PathMaterial: albedo(16)+metallic(4)+roughness(4)+bumpScale(4)+flags(4)+emissionColor(16)+4xTexID(16)+uvScaleOffset(16)
+    public const int StrideMaterial   = 96;   // PathMaterial: albedo(16)+metallic(4)+roughness(4)+bumpScale(4)+flags(4)+emissionColor(16)+4xTexID(16)+uvScaleOffset(16)+transmission(4)+ior(4)+diffuseTransmission(4)+thinWalled(4)
     public const int StrideLight     = 32;   // PathLight: positionOrDir(12)+range(4)+color(12)+type(4)
 
     // ── 9 个 ComputeBuffer ──

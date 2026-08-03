@@ -50,17 +50,24 @@ public struct PathMaterial
     // -- 32B --
     public Vector4 uvScaleOffset;   // 16B - xy=scale, zw=offset
     // -- 16B --
-    // 合计 80B
+    // ── 新增 16B 透射参数 ──
+    public float   transmission;        // 4B - 镜面透射因子 [0,1]，0=不透明
+    public float   ior;                 // 4B - 折射率（默认1.5玻璃，1.0空气）
+    public float   diffuseTransmission; // 4B - 漫透射因子 [0,1]（纸张/布料等）
+    public uint    thinWalled;          // 4B - 1=薄壁（无体积衰减），0=实体
+    // -- 16B --
+    // 合计 96B
 }
 
 /// <summary>PathMaterial flags 位掩码（与 HLSL 一致）。</summary>
 public static class MaterialFlags
 {
-    public const uint MAT_HAS_BASE   = 1u;
-    public const uint MAT_HAS_MR     = 2u;
-    public const uint MAT_HAS_NORMAL = 4u;
-    public const uint MAT_HAS_EMISS = 8u;
-    public const uint TEX_NONE      = 0xFFFFFFFFu;
+    public const uint MAT_HAS_BASE       = 1u;
+    public const uint MAT_HAS_MR         = 2u;
+    public const uint MAT_HAS_NORMAL     = 4u;
+    public const uint MAT_HAS_EMISS      = 8u;
+    public const uint MAT_IS_TRANSPARENT = 16u;  // bit4: 材质启用透射
+    public const uint TEX_NONE          = 0xFFFFFFFFu;
 }
 
 /// <summary>
@@ -323,6 +330,11 @@ public class ModelManager : MonoBehaviour
         pm.normalTexID = MaterialFlags.TEX_NONE;
         pm.emissiveTexID = MaterialFlags.TEX_NONE;
         pm.uvScaleOffset = new Vector4(1f, 1f, 0f, 0f);
+        // ── 透射参数初始化 ──
+        pm.transmission = 0f;
+        pm.ior = 1.5f;
+        pm.diffuseTransmission = 0f;
+        pm.thinWalled = 0u;
 
         if (mat == null) return pm;
 
@@ -420,6 +432,20 @@ public class ModelManager : MonoBehaviour
         }
         else
             pm.uvScaleOffset = new Vector4(1f, 1f, 0f, 0f);
+
+        // ── 透射参数：基于 URP Surface Type + albedo alpha ──
+        // Surface Type = Transparent 时启用半透明 BSDF
+        if (mat.HasProperty("_Surface") && mat.GetFloat("_Surface") > 0.5f)
+        {
+            flags |= MaterialFlags.MAT_IS_TRANSPARENT;
+            pm.thinWalled = 1u; // 薄壁模式（默认，无体积吸收）
+        }
+        // transmission = 1 - albedo.a（HLSL 侧 applyMaterialTextures 后用最终 alpha 覆盖）
+        pm.transmission = 1.0f - pm.albedo.w;
+        pm.ior = 1.5f;    // 玻璃默认折射率
+        pm.diffuseTransmission = 0f;
+
+        pm.flags = flags;
 
         return pm;
     }
