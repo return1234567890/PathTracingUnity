@@ -294,7 +294,7 @@ public class ModelManager : MonoBehaviour
         Materials       = materials.ToArray();
 
         // 4b. 构建纹理数组（所有材质纹理注册完毕后打包）
-        TextureArrays.Build(2048);
+        TextureArrays.Build(1024);
 
         // 5. 统计
         if (logBuildStats)

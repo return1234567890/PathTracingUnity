@@ -17,6 +17,14 @@
 #pragma kernel PathTrace
 #pragma kernel TemporalAccumulate
 #pragma kernel SpatialFilter
+#pragma kernel AntiFirefly
+
+// ── ReSTIR GI 5-kernel 管线 ──
+#pragma kernel ReSTIR_PrimaryRay
+#pragma kernel ReSTIR_InitReservoir
+#pragma kernel ReSTIR_TemporalResample
+#pragma kernel ReSTIR_SpatialResample
+#pragma kernel ReSTIR_FinalShading
 
 #define PI 3.14159265359
 #define MISS_INDEX 0xFFFFFFFFu
@@ -178,7 +186,7 @@ cbuffer PathTraceCB
     uint     LightCount;
     uint     FrameCount;
     uint     MaxDepth;
-    uint     _cbPad1;
+    uint     SamplesPerPixel;  // 每像素每帧采样数（>1 时同帧多路径降噪）
     float3   AmbientColor;
     float    _cbPad2;
 };
@@ -192,6 +200,108 @@ cbuffer TemporalCB
     uint     SpatialPasses; // 空域滤波 pass 数（0=禁用）
     uint     _tcbPad0;
 };
+
+// ══════════════════════════════════════════════════════
+//  NRD 移植参数（全局 uniform，由 C# SetComputeXxxParam 注入）
+//  与 PassIndex 同级声明，各 kernel 按需读取
+// ══════════════════════════════════════════════════════
+
+// ── TemporalAccumulate 参数 ──
+float  DisocclusionThreshold;   // 遮挡检测基础阈值（默认0.02）
+
+// ── SpatialFilter 参数 ──
+float  NormalWeightParam;       // 法线角度权重参数（默认 lerp(8,64,roughness) 基准）
+float  DepthThreshold;         // 平面距离深度阈值（默认0.02）
+uint   PoissonTapCount;        // Poisson 采样点数（8 或 16）
+float  BlurRadius;             // 模糊半径（像素单位，默认1.0）
+float  PhiLuminance;           // 亮度权重系数（默认1.0）
+float  MaxLuminanceRelativeDiff;// 亮度相对差异上限（默认0.1）
+uint   EnableAntiFirefly;     // anti-firefly 开关（0=关闭，1=开启）
+
+// ── History 纹理采样器（C# 侧 filterMode=Bilinear 时生效） ──
+SamplerState sampler_History;
+
+// ══════════════════════════════════════════════════════════════
+//  ReSTIR GI 蓄水池纹理声明与常量
+//  4 张全屏 UAV 存储当前帧蓄水池，4 张 SRV 存储上一帧
+//  D3D11 pitfall: RWTexture2D 全局声明必须绑定到每个引用 kernel
+// ══════════════════════════════════════════════════════════════
+
+// UAV: 当前帧蓄水池
+RWTexture2D<float4> ReservoirRT0;  // .rgb=sampleDir(世界空间), .a=dist
+RWTexture2D<float4> ReservoirRT1;  // .rg=hitNormal(八面体编码), .b=hitLuminance, .a=reserved
+RWTexture2D<float4> ReservoirRT2;  // .r=w(W/M), .g=M, .b=targetPdf, .a=sourcePdf
+RWTexture2D<float4> ReservoirRT3;  // .rgb=hitRadiance, .a=hitMaterialID(uint reinterpret)
+RWTexture2D<float4> ReservoirRT4;  // .rgb=bsdf(K2 存储), .a=reserved
+
+// SRV: 上一帧蓄水池（时域重采样读取历史帧）
+Texture2D<float4> PrevReservoirRT0;
+Texture2D<float4> PrevReservoirRT1;
+Texture2D<float4> PrevReservoirRT2;
+Texture2D<float4> PrevReservoirRT3;
+Texture2D<float4> PrevReservoirRT4;
+
+// SRV: 当前阶段输入蓄水池（K3 读 K2 输出，K4 读 K3 输出，K5 读 K4 输出）
+Texture2D<float4> CurReservoirRT0;
+Texture2D<float4> CurReservoirRT1;
+Texture2D<float4> CurReservoirRT2;
+Texture2D<float4> CurReservoirRT3;
+Texture2D<float4> CurReservoirRT4;
+
+// UAV: 直接光照输出（ReSTIR_PrimaryRay 写，ReSTIR_FinalShading 读）
+RWTexture2D<float4> ReSTIR_DirectLighting;
+
+// ReSTIR cbuffer 额外参数
+cbuffer ReSTIRCB
+{
+    uint  SpatialNeighborCount;   // 空域重采样邻居数（4 或 8）
+    float SpecularThreshold;      // 镜面判定阈值，roughness < 此值 → 非 ReSTIR 像素
+    uint  _restirPad0;
+    uint  _restirPad1;
+};
+
+// ══════════════════════════════════════════════════════
+//  NRD Poisson 采样点（移植自 NRD Poisson.hlsli）
+//  .xy = 方向，.z = 归一化半径
+// ══════════════════════════════════════════════════════
+
+static const float3 g_Poisson8[8] =
+{
+    float3( -0.4706069, -0.4427112, +0.6461146 ),
+    float3( -0.9057375, +0.3003471, +0.9542373 ),
+    float3( -0.3487388, +0.4037880, +0.5335386 ),
+    float3( +0.1023042, +0.6439373, +0.6520134 ),
+    float3( +0.5699277, +0.3513750, +0.6695386 ),
+    float3( +0.2939128, -0.1131226, +0.3149309 ),
+    float3( +0.7836658, -0.4208784, +0.8895339 ),
+    float3( +0.1564120, -0.8198990, +0.8346850 )
+};
+
+static const float3 g_Poisson16[16] =
+{
+    float3( -0.0936476, -0.7899283, +0.7954600 ),
+    float3( -0.1209752, -0.2627860, +0.2892948 ),
+    float3( -0.5646901, -0.7059856, +0.9040413 ),
+    float3( -0.8277994, -0.1538168, +0.8419688 ),
+    float3( -0.4620740, +0.1951437, +0.5015910 ),
+    float3( -0.7517998, +0.5998214, +0.9617633 ),
+    float3( -0.0812514, +0.2904110, +0.3015631 ),
+    float3( -0.2397440, +0.7581663, +0.7951688 ),
+    float3( +0.2446934, +0.9202285, +0.9522055 ),
+    float3( +0.4943011, +0.5736654, +0.7572486 ),
+    float3( +0.3415412, +0.1412707, +0.3696049 ),
+    float3( +0.8744238, +0.3246290, +0.9327384 ),
+    float3( +0.7406740, -0.1434729, +0.7544418 ),
+    float3( +0.3658852, -0.3596551, +0.5130534 ),
+    float3( +0.7880974, -0.5802425, +0.9786618 ),
+    float3( +0.3776688, -0.7620423, +0.8504953 )
+};
+
+// ── 高斯权重（基于 Poisson 点半径） ──
+float GetGaussianWeight(float r)
+{
+    return exp(-0.5 * r * r);
+}
 
 // ══════════════════════════════════════════════════════
 //  求交核心（复用原 3-kernel 实现）
@@ -456,6 +566,16 @@ uint xxhash32(uint3 p)
     return h;
 }
 
+// ── 基于像素坐标 + 帧数的哈希旋转矩阵（避免走样） ──
+// 返回 2x2 旋转矩阵（行主序 float2x2）
+float2x2 GetRotator(int2 pixelPos, uint frameIndex)
+{
+    uint h = xxhash32(uint3(pixelPos.x, pixelPos.y, frameIndex));
+    float angle = float(h) * (2.0 * PI / 4294967296.0);
+    float ca = cos(angle), sa = sin(angle);
+    return float2x2(ca, -sa, sa, ca);
+}
+
 float rand(inout uint seed)
 {
     seed = seed * 1664525u + 1013904223u;
@@ -692,6 +812,7 @@ float3 sampleBSDF(PathMaterial mat, float3 N, float3 V,
     float3 F = F_Schlick(F0, VdotH);
     float3 specular = D * G * F / (4.0 * NdotV * NdotL + 1e-6);
     float3 diffuse = (1.0 - metallic) * albedo / PI;
+    diffuse *= (1.0 - mat.transmission);  // 与 evaluateBSDF 一致
     float3 bsdf = diffuse + specular;
 
     // ── 完整混合 pdf（两分支一致）：pd·pdfDiffuse + (1-pd)·pdfSpecular ──
@@ -1021,6 +1142,79 @@ float3 traceShadowTransmission(Ray ray, float maxT)
 }
 
 // ══════════════════════════════════════════════════════
+//  ReSTIR GI 辅助函数
+//  八面体编码/解码、蓄水池 WRS 合并、几何相似度检测
+// ══════════════════════════════════════════════════════
+
+// 亮度计算
+float luminance(float3 c)
+{
+    return dot(c, float3(0.299, 0.587, 0.114));
+}
+
+// ── 八面体编码：法线 float3 → float2 ──
+float2 OctEncode(float3 n)
+{
+    n /= max(abs(n.x) + abs(n.y) + abs(n.z), 1e-6);
+    if (n.z < 0.0)
+    {
+        // 标准八面体折叠：x' = (1 - |y|) * sign(x), y' = (1 - |x|) * sign(y)
+        return float2((1.0 - abs(n.y)) * (n.x >= 0.0 ? 1.0 : -1.0),
+                      (1.0 - abs(n.x)) * (n.y >= 0.0 ? 1.0 : -1.0));
+    }
+    return n.xy;
+}
+
+// ── 八面体解码：float2 → 法线 float3 ──
+float3 OctDecode(float2 e)
+{
+    float3 n = float3(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0)
+    {
+        float x = (1.0 - abs(n.y)) * (n.x >= 0.0 ? 1.0 : -1.0);
+        float y = (1.0 - abs(n.x)) * (n.y >= 0.0 ? 1.0 : -1.0);
+        n.xy = float2(x, y);
+    }
+    return normalize(n);
+}
+
+// ── 通用蓄水池更新（WRS 合并） ──
+// W_sum: 累积权重和, M_sum: 累积样本数
+// w_new: 新样本权重, m_new: 新样本计数
+// 返回是否选中新样本（调用方负责替换蓄水池数据）
+bool ReservoirMerge(inout float W_sum, inout float M_sum,
+                    float w_new, float m_new,
+                    inout float selectedW)
+{
+    M_sum += m_new;
+    W_sum += w_new;
+    if (W_sum <= 0.0) { selectedW = 0.0; return false; }
+    // WRS 选择概率 = w_new / W_sum
+    // 用 xxhash32 作为随机数源由调用方传入，这里简化：
+    // 实际选择在调用方做（需要 per-pixel seed），此函数仅累加
+    selectedW = w_new / max(W_sum, 1e-8);
+    return true;
+}
+
+// ── 几何相似度检测（复用 TemporalAccumulate 逻辑的精简版） ──
+bool GeometricSimilarity(float3 posA, float3 nrmA, float depthA,
+                         float3 posB, float3 nrmB, float depthB,
+                         float threshold)
+{
+    bool bSky = (depthA <= 0.0 || depthB <= 0.0);
+    if (bSky) return false;
+
+    float depthDiff = abs(depthA - depthB);
+    float relDepthDiff = depthDiff / max(abs(depthA) + abs(depthB), 1e-4);
+    bool depthValid = relDepthDiff < threshold;
+
+    float normalDot = dot(nrmA, nrmB);
+    bool normalValid = normalDot > 0.9;
+
+    return depthValid && normalValid;
+}
+
+// ══════════════════════════════════════════════════════
 //  Kernel: PathTrace（单 kernel 多弹射路径追踪）
 // ══════════════════════════════════════════════════════
 [numthreads(8, 8, 1)]
@@ -1037,21 +1231,31 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
     float3 origin = mul(CamToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz;
     float3 dir = normalize(mul(CamToWorld, float4(dirView, 0.0)).xyz);
 
-    Ray ray;
-    ray.origin = origin;
-    ray.direction = dir;
-    ray._pad0 = 0.0;
-    ray._pad1 = 0.0;
+    // ── 每像素采样数：>1 时同帧发射多条独立路径，取平均降噪 ──
+    uint spp = SamplesPerPixel;
+    if (spp < 1u) spp = 1u;
+    float3 finalRadiance = float3(0.0, 0.0, 0.0);
 
-    uint seed = xxhash32(uint3(id.xy, FrameCount));
-    float3 radiance = float3(0.0, 0.0, 0.0);
-    float3 throughput = float3(1.0, 1.0, 1.0);
-    bool  isInside = false;  // ★ 内部状态追踪（Beer 定律体积衰减）
-
-    // ── 2. 多弹射循环 ──
+    // ── 1.5 多采样循环（主光线方向共享，种子逐样本变化） ──
     [loop]
-    for (int depth = 0; depth < (int)MaxDepth; depth++)
+    for (uint s = 0; s < spp; s++)
     {
+        Ray ray;
+        ray.origin = origin;
+        ray.direction = dir;
+        ray._pad0 = 0.0;
+        ray._pad1 = 0.0;
+
+        // 每个样本用不同种子，保证路径独立
+        uint seed = xxhash32(uint3(id.xy, FrameCount * spp + s));
+        float3 radiance = float3(0.0, 0.0, 0.0);
+        float3 throughput = float3(1.0, 1.0, 1.0);
+        bool  isInside = false;  // ★ 内部状态追踪（Beer 定律体积衰减）
+
+        // ── 2. 多弹射循环 ──
+        [loop]
+        for (int depth = 0; depth < (int)MaxDepth; depth++)
+        {
         RayHit hit;
         hit.t = FarPlane;
         hit.u = 0.0;
@@ -1067,8 +1271,8 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
         // miss：加环境光后终止
         if (hit.instIndex == MISS_INDEX)
         {
-            // 主光线 miss：写空 G-buffer（天空）
-            if (depth == 0)
+            // 主光线 miss：写空 G-buffer（天空），仅首样本写一次
+            if (depth == 0 && s == 0)
             {
                 GBufferPosDepth[id.xy]   = float4(0.0, 0.0, 0.0, 0.0);
                 GBufferNormalRough[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
@@ -1122,11 +1326,15 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
         if ((mat.flags & MAT_IS_TRANSPARENT) != 0u)
             mat.transmission = 1.0 - mat.albedo.a;
 
-        // 主光线首次命中：写 G-buffer（方案A/B共享，使用面朝相机法线）
-        if (depth == 0)
+        // 主光线首次命中：写 G-buffer
+        // Ngeo（几何面法线）存入 GBufferNormalRough，供 TemporalAccumulate 遮挡检测
+        // 和 SpatialFilter 边缘权重共用。几何面法线在同一三角形上恒定，
+        // 不受 Jitter/法线贴图干扰，确保跨帧遮挡检测稳定。
+        // G-buffer 仅由首样本写入（主光线方向共享，所有样本命中相同首交点）
+        if (depth == 0 && s == 0)
         {
             GBufferPosDepth[id.xy]   = float4(P, hit.t);
-            GBufferNormalRough[id.xy] = float4(N, mat.roughness);
+            GBufferNormalRough[id.xy] = float4(Ngeo, mat.roughness);
         }
 
         // ── 调试：只输出阴影可视化（白=无阴影，黑=完全阴影） ──
@@ -1257,8 +1465,11 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
         throughput *= bsdf * NdotL_new / pdf;
 
         // ★ 射线偏移：透射时沿光线方向偏移，反射时沿法线偏移
+        // 区分透射光线和反射光线的关键代码！
         bool isTransmission = (dot(newDir, Ngeo) < 0.0);
         if (isTransmission)
+            // P - Ngeo * EPS_OFFSET 把起点推到表面背侧，绕开当前命中三角形，避免自相交。
+            // 新光线会从"物体内部"出发，下一次 CastRayTLAS 会找到物体背面的出口三角形（或物体后方其他几何）。
             ray.origin = P - Ngeo * EPS_OFFSET;
         else
             ray.origin = P + Ngeo * EPS_OFFSET;
@@ -1271,9 +1482,12 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
             if (rand(seed) >= pcont) break;
             throughput /= pcont;
         }
+        }
+
+        finalRadiance += radiance;
     }
 
-    Output[id.xy] = float4(radiance, 1.0);
+    Output[id.xy] = float4(finalRadiance / spp, 1.0);
 }
 
 // ══════════════════════════════════════════════════════
@@ -1285,10 +1499,12 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
 // 只读资源（SRV）
 Texture2D<float4> History;    // 上一帧累积结果
 Texture2D<float4> CurSample;  // 本帧 PathTrace 输出（= OutputRT）
+Texture2D<float4> PrevGBufferPosDepth;    // 上一帧 G-buffer pos+depth（遮挡检测用）
+Texture2D<float4> PrevGBufferNormalRough; // 上一帧 G-buffer normal+roughness
 // GBufferPosDepth / GBufferNormalRough 复用顶部 RWTexture2D 声明，[] 读取
 
 // 可读写资源（UAV）
-RWTexture2D<float4> Accum;   // 本帧累积输出
+RWTexture2D<float4> Accum;   // 本帧累积输出（.a = 近似方差）
 
 [numthreads(8, 8, 1)]
 void TemporalAccumulate(uint3 id : SV_DispatchThreadID)
@@ -1297,10 +1513,10 @@ void TemporalAccumulate(uint3 id : SV_DispatchThreadID)
 
     float4 cur = CurSample[id.xy];
 
-    // 关闭时域 或 首帧（含相机移动重置）：直接用新样本
+    // 关闭时域 或 首帧（含相机移动重置）：直接用新样本，方差=0
     if (EnableTemporal == 0u || AccumFrame == 0u)
     {
-        Accum[id.xy] = cur;
+        Accum[id.xy] = float4(cur.rgb, 0.0);
         return;
     }
 
@@ -1311,38 +1527,74 @@ void TemporalAccumulate(uint3 id : SV_DispatchThreadID)
     // 天空像素（miss）：不累积，直接用新样本
     if (depth <= 0.0)
     {
-        Accum[id.xy] = cur;
+        Accum[id.xy] = float4(cur.rgb, 0.0);
         return;
     }
 
-    // 重投影：worldPos -> 上一帧屏幕坐标
-    // 静态相机时 PrevViewProj == 当前 viewProj，映射为恒等（prevPos == id）
+    float4 gnr = GBufferNormalRough[id.xy];
+    float3 cN = gnr.rgb;  // 几何面法线（Ngeo）
+
+    // ── 重投影：worldPos -> 上一帧屏幕坐标 ──
     float4 prevClip = mul(PrevViewProj, float4(worldPos, 1.0));
     if (prevClip.w <= 0.0)
     {
-        Accum[id.xy] = cur;
+        Accum[id.xy] = float4(cur.rgb, 0.0);
         return;
     }
     float2 prevNdc = prevClip.xy / prevClip.w;
     float2 prevUV = prevNdc * 0.5 + 0.5;
     if (any(prevUV < 0.0) || any(prevUV > 1.0))
     {
-        Accum[id.xy] = cur;
+        Accum[id.xy] = float4(cur.rgb, 0.0);
         return;
     }
 
     int2 prevPos = int2(prevUV * float2(Width, Height));
     prevPos = clamp(prevPos, int2(0, 0), int2((int)Width - 1, (int)Height - 1));
-    float4 hist = History.Load(int3(prevPos, 0));
 
-    // Neighborhood clamp：改用 History 邻域（多帧累积，方差已降低）定义裁剪范围
-    //
-    // 原方案用 CurSample（1-spp 原始噪声）的 3×3 邻域定义 min/max 范围，
-    // 在阴影区等高方差场景下 9 个样本可能碰巧全暗/全亮，导致正确的历史
-    // 累积值被截断 → 累积反复重置 → 阴影噪声永远无法收敛。
-    //
-    // 修正：用 History（已累积多帧，噪声已大幅降低）的 3×3 邻域定义范围，
-    // 并改为裁剪当前帧噪声样本（而非历史值），防止极端离群值注入累积。
+    // ═══ 阶段1：重投影采样 ═══
+    // 静态相机时 prevUV ≈ 像素中心，双线性退化为点采样
+    // 相机移动时 prevUV 为亚像素位置，双线性保留亚像素精度
+    float4 hist = History.SampleLevel(sampler_History, prevUV, 0);
+
+    // ═══ 阶段2：遮挡检测体系重构 ═══
+    // 视差感知：当前像素与重投影位置的屏幕空间位移（像素数）
+    float2 curPixelUv = (id.xy + 0.5) / float2(Width, Height);
+    float2 deltaUv = curPixelUv - prevUV;
+    float parallaxInPixels = length(deltaUv * float2(Width, Height));
+
+    // 采样上一帧 G-buffer 获取 prevDepth / prevNormal
+    float4 prevGpd = PrevGBufferPosDepth.Load(int3(prevPos, 0));
+    float  prevDepth = prevGpd.a;
+    float3 prevNormal = PrevGBufferNormalRough.Load(int3(prevPos, 0)).rgb;
+    bool prevWasSky = (prevDepth <= 0.0);
+
+    // 掠射角自适应：NoV 越小（掠射角），平面距离误差越大，需放松阈值
+    // 相机方向 V = normalize(camPos - worldPos)，camPos 从 CamToWorld 提取
+    float3 camPos = mul(CamToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+    float3 V = normalize(camPos - worldPos);
+    float NoV = abs(dot(cN, V));
+    // 视差越大，NoVstrict 越趋近1（放松平面距离阈值）
+    float NoVstrict = lerp(NoV, 1.0, saturate(parallaxInPixels / 30.0));
+    float thresholdScale = 1.0 / max(NoVstrict, 0.1);
+
+    // 视差感知阈值：视差越大（可能跨越几何边界），阈值收紧
+    float disocclusionThr = DisocclusionThreshold
+        * (1.0 + 2.0 * parallaxInPixels / 30.0)
+        * thresholdScale;
+
+    // 平面距离检测：当前深度与上一帧深度的相对误差
+    float depthDiff = abs(depth - prevDepth);
+    float relDepthDiff = depthDiff / max(abs(depth) + abs(prevDepth), 1e-4);
+    bool depthValid = !prevWasSky && relDepthDiff < disocclusionThr;
+
+    // 法线连续性检测
+    float normalDot = dot(cN, prevNormal);
+    bool normalValid = !prevWasSky && normalDot > 0.9;
+
+    bool occluded = !depthValid || !normalValid;
+
+    // ── Neighborhood clamp：用 History 邻域定义裁剪范围 ──
     float3 hMin = hist.rgb;
     float3 hMax = hist.rgb;
     [unroll]
@@ -1359,24 +1611,34 @@ void TemporalAccumulate(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    // 扩展裁剪范围：History 邻域可能尚未反映真实色彩分布（早期帧），
-    // 给予 50% 相对扩展 + 0.02 绝对下限，允许当前帧样本渐进收敛
+    // 扩展裁剪范围：50% 相对扩展 + 0.02 绝对下限
     float3 hRange = hMax - hMin;
     hMin -= hRange * 0.5 + 0.02;
     hMax += hRange * 0.5 + 0.02;
 
-    // 裁剪当前帧噪声样本（而非历史值），防止极端离群值注入累积
+    // 裁剪当前帧噪声样本
     float3 curClamped = clamp(cur.rgb, hMin, hMax);
 
-    // EMA：alpha 随帧数递减，clamp 下限保证响应性
+    // ── 自适应 Alpha ──
     float alpha = clamp(1.0 / (float(AccumFrame) + 1.0), 0.02, 1.0);
-    Accum[id.xy] = float4(lerp(hist.rgb, curClamped, alpha), cur.a);
+    // 遮挡区域强制 alpha=1（完全使用当前帧，避免鬼影）
+    if (occluded)
+        alpha = 1.0;
+
+    float3 accumColor = lerp(hist.rgb, curClamped, alpha);
+
+    // ═══ 阶段5：方差跟踪 ═══
+    // 近似方差 = |cur - hist|，供 SpatialFilter 亮度权重使用
+    // 遮挡区域方差=0（无历史可比，保守处理）
+    float variance = occluded ? 0.0 : length(curClamped - hist.rgb);
+
+    Accum[id.xy] = float4(accumColor, variance);
 }
 
 // ══════════════════════════════════════════════════════
-//  Kernel: SpatialFilter（方案B G-buffer 引导空域滤波）
-//  à-trous 3x3 方形核（9 tap），步长 = 1<<PassIndex，各向同性
-//  边缘权重：法线^32 × 深度衰减 × 粗糙度衰减 × 亮度衰减 × 高斯空间衰减
+//  Kernel: SpatialFilter（NRD 移植版 G-buffer 引导空域滤波）
+//  Poisson 采样 + 旋转（8/16 tap），步长 = 1<<PassIndex
+//  边缘权重：法线角度 × 平面距离 × 粗糙度 × 方差驱动亮度 × 高斯空间
 // ══════════════════════════════════════════════════════
 
 // 全局 uniform（由 SetComputeIntParam 设置，仅 SpatialFilter 使用）
@@ -1386,31 +1648,58 @@ uint PassIndex;
 Texture2D<float4>    FilterInput;
 RWTexture2D<float4> FilterOutput;
 
-// 单 tap 累加（邻域 q 相对中心 cC/cD/cN/cR），含高斯空间权重 + 亮度权重
-void filterTap(int2 q, float3 cC, float cD, float3 cN, float cR, float ws,
+// 单 tap 累加（邻域 q 相对中心 cC/cPos/cD/cN/cR/cVar），NRD 权重体系
+void filterTap(int2 q, float3 cC, float3 cPos, float cD,
+               float3 cN, float cR, float cVar, float ws,
                inout float3 sum, inout float wsum)
 {
     int2 qc = clamp(q, int2(0, 0), int2((int)Width - 1, (int)Height - 1));
     float4 qColor = FilterInput.Load(int3(qc, 0));
-    float  qD = GBufferPosDepth[qc].a;
+    float4 qGpd = GBufferPosDepth[qc];
+    float  qD = qGpd.a;
+    float3 qPos = qGpd.rgb;
     float4 qGnr = GBufferNormalRough[qc];
     float3 qN = qGnr.rgb;
     float  qR = qGnr.a;
 
-    float wn = pow(max(dot(cN, qN), 0.0), 32.0);          // 法线权重
-    float wd = exp(-abs(cD - qD) / (cD * 0.05 + 1e-3));    // 深度权重
-    float wr = exp(-abs(cR - qR) / 0.2);                   // 粗糙度权重
+    // ── 阶段3a：法线权重（角度参数化） ──
+    // 粗糙表面收紧（法线差异容忍度低），光滑表面放松
+    // 累积帧数越多，权重越严格（NRD historyLength 驱动）
+    float angle = acos(max(dot(cN, qN), 0.0));
+    float nwp = lerp(8.0, 64.0, saturate(cR))
+             * lerp(0.5, 1.0, saturate((float)AccumFrame / 5.0));
+    // NormalWeightParam > 0 时覆盖为固定值（C# 调试用）
+    if (NormalWeightParam > 0.0) nwp = NormalWeightParam;
+    float wn = exp(-angle * nwp);
 
-    // 亮度权重（自适应）：保护镜面高光等高频亮斑不被糊掉
-    // 分母 = 相对项（HDR 亮度自适应）+ 绝对项（低亮度下限）
-    // 原方案相对系数 0.1 + 绝对下限 0.02 在阴影区（低亮度）过于激进：
-    //   阴影区 cL=0.05/qL=0.15 时分母仅 0.035 → 权重 0.057 → 几乎不滤波
-    // 降低相对系数至 0.05、提高绝对下限至 0.08，使低亮度区域获得充分滤波：
-    //   同场景分母 0.0875 → 权重 0.32（提升 5.6×），阴影边界仍保边（0.002）
+    // ── 阶段3b：几何权重（平面距离） ──
+    // NRD GetPlaneDistanceWeight: distanceToPlane = abs(dot(samplePos - centerPos, N))
+    float3 deltaPos = qPos - cPos;
+    float planeDist = abs(dot(deltaPos, cN));
+    float depthThr = cD * DepthThreshold + 0.01;
+    float wd = (planeDist < depthThr) ? 1.0 : 0.0;
+
+    // 粗糙度权重
+    float wr = exp(-abs(cR - qR) / 0.2);
+
+    // ── 阶段3c/5：亮度权重（方差驱动） ──
     float3 lumW = float3(0.299, 0.587, 0.114);
     float cL = dot(cC, lumW);
     float qL = dot(qColor.rgb, lumW);
-    float wc = exp(-abs(cL - qL) / (max(cL, qL) * 0.05 + 0.08));
+    float wc;
+    if (cVar > 1e-6)
+    {
+        // 方差驱动：高噪声区域权重放松（更多邻居参与）
+        float phiLInv = 1.0 / max(1e-4, PhiLuminance * sqrt(cVar));
+        float luminanceW = abs(cL - qL) * phiLInv;
+        luminanceW = min(MaxLuminanceRelativeDiff, luminanceW);
+        wc = exp(-luminanceW);
+    }
+    else
+    {
+        // 方差=0 时退化为固定参数（兼容原方案）
+        wc = exp(-abs(cL - qL) / (max(cL, qL) * 0.05 + 0.08));
+    }
 
     float w = wn * wd * wr * wc * ws;
     sum += w * qColor.rgb;
@@ -1424,7 +1713,9 @@ void SpatialFilter(uint3 id : SV_DispatchThreadID)
 
     int2 p = id.xy;
     float4 cColor = FilterInput.Load(int3(p, 0));
-    float  cD = GBufferPosDepth[p].a;
+    float4 cGpd = GBufferPosDepth[p];
+    float  cD = cGpd.a;
+    float3 cPos = cGpd.rgb;
 
     // 天空像素（miss）：直接透传，不滤波
     if (cD <= 0.0)
@@ -1437,24 +1728,1117 @@ void SpatialFilter(uint3 id : SV_DispatchThreadID)
     float3 cN = cGnr.rgb;
     float  cR = cGnr.a;
     float3 cC = cColor.rgb;
+    float  cVar = cColor.a;  // 阶段5：从 .a 通道读取方差
 
     int step = 1 << (int)PassIndex;
+
+    // ── 阶段6：大步长随机偏移（减少振铃） ──
+    // 参考 NRD RELAX_Atrous: step > 4 时加入随机偏移
+    int2 offset = 0;
+    if (step > 4)
+    {
+        uint h = xxhash32(uint3(p.x, p.y, FrameCount));
+        float2 rnd = float2(float(h & 0xFFFF) / 65535.0,
+                             float((h >> 16) & 0xFFFF) / 65535.0);
+        offset = int2(step * 0.5 * (rnd - 0.5));
+    }
+
     float3 sum = float3(0.0, 0.0, 0.0);
     float wsum = 0.0;
 
-    // 3x3 方形核（9 tap），各向同性 → 消除菱形伪影
-    // 高斯空间权重：中心权重最高，角落衰减
+    // ── 阶段4：Poisson 采样 + 旋转 ──
+    // 旋转 Poisson 点避免走号，高斯权重基于点半径
+    // D3D11 要求 static const 数组索引为编译时常量，故分两个 [unroll] 分支
+    float2x2 rotator = GetRotator(p, FrameCount);
+
+    if (PoissonTapCount == 16)
+    {
+        [unroll]
+        for (uint n16 = 0; n16 < 16; n16++)
+        {
+            float2 off = g_Poisson16[n16].xy;
+            float r = g_Poisson16[n16].z;
+            float2 rotOff = mul(rotator, off);
+            int2 samplePixel = p + int2(rotOff * step * BlurRadius) + offset;
+            filterTap(samplePixel, cC, cPos, cD, cN, cR, cVar,
+                      GetGaussianWeight(r), sum, wsum);
+        }
+    }
+    else
+    {
+        [unroll]
+        for (uint n8 = 0; n8 < 8; n8++)
+        {
+            float2 off = g_Poisson8[n8].xy;
+            float r = g_Poisson8[n8].z;
+            float2 rotOff = mul(rotator, off);
+            int2 samplePixel = p + int2(rotOff * step * BlurRadius) + offset;
+            filterTap(samplePixel, cC, cPos, cD, cN, cR, cVar,
+                      GetGaussianWeight(r), sum, wsum);
+        }
+    }
+
+    // 中心 tap（权重=1）
+    filterTap(p + offset, cC, cPos, cD, cN, cR, cVar, 1.0, sum, wsum);
+
+    FilterOutput[p] = float4(sum / max(wsum, 1e-6), cColor.a);
+}
+
+// ══════════════════════════════════════════════════════
+//  Kernel: AntiFirefly（3x3 RCRS 极值替换滤波，前置 pass）
+//  检测中心像素是否远超邻域极值，若超阈值则用邻域极值替换
+//  参考 NRD RELAX_AntiFirefly.cs.hlsl 的 RCRS 算法
+// ══════════════════════════════════════════════════════
+
+Texture2D<float4>  AntiFlyInput;
+RWTexture2D<float4> AntiFlyOutput;
+
+[numthreads(8, 8, 1)]
+void AntiFirefly(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    int2 p = id.xy;
+    float4 cColor = AntiFlyInput.Load(int3(p, 0));
+    float  cD = GBufferPosDepth[p].a;
+
+    // 天空像素：直接透传
+    if (cD <= 0.0)
+    {
+        AntiFlyOutput[p] = cColor;
+        return;
+    }
+
+    float3 lumW = float3(0.299, 0.587, 0.114);
+    float cL = dot(cColor.rgb, lumW);
+
+    // 3x3 邻域中找 max 和 min 亮度像素
+    float maxL = -1.0;
+    float minL = 1e6;
+    float3 maxColor = cColor.rgb;
+    float3 minColor = cColor.rgb;
+
     [unroll]
     for (int dy = -1; dy <= 1; dy++)
     {
         [unroll]
         for (int dx = -1; dx <= 1; dx++)
         {
-            float dist2 = (float)(dx * dx + dy * dy);
-            float ws = exp(-dist2 * 0.5); // 中心=1, 边=0.607, 角=0.368
-            filterTap(p + int2(dx * step, dy * step), cC, cD, cN, cR, ws, sum, wsum);
+            if (dx == 0 && dy == 0) continue;
+            int2 q = clamp(p + int2(dx, dy),
+                           int2(0, 0), int2((int)Width - 1, (int)Height - 1));
+            float3 qc = AntiFlyInput.Load(int3(q, 0)).rgb;
+            float ql = dot(qc, lumW);
+            if (ql > maxL) { maxL = ql; maxColor = qc; }
+            if (ql < minL) { minL = ql; minColor = qc; }
         }
     }
 
-    FilterOutput[p] = float4(sum / max(wsum, 1e-6), cColor.a);
+    // RCRS: 中心超邻域 max → 用 max 替换；低于 min → 用 min 替换
+    float3 outColor = cColor.rgb;
+    if (cL > maxL) outColor = maxColor;
+    else if (cL < minL) outColor = minColor;
+
+    // 保留方差通道 .a
+    AntiFlyOutput[p] = float4(outColor, cColor.a);
+}
+
+#define M_MAX 60.0
+#define W_MAX 100.0
+// ══════════════════════════════════════════════════════
+//  ReSTIR Kernel 1: ReSTIR_PrimaryRay
+//  发射主光线求交 → 写 G-buffer → 计算直接光照(NEE+自发光) → 输出 DirectLightingRT
+//  ★ 非 ReSTIR 像素（镜面/半透明）用 roughness 负值标记
+// ══════════════════════════════════════════════════════
+[numthreads(8, 8, 1)]
+void ReSTIR_PrimaryRay(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    // ── 1. 生成主光线 ──
+    float2 uv = (float2(id.x, id.y) + 0.5) / float2(Width, Height);
+    float2 screen = uv * 2.0 - 1.0;
+    float4 pView = mul(InvProjection, float4(screen, 1.0, 1.0));
+    pView.xyz /= pView.w;
+    float3 dirView = normalize(pView.xyz);
+    float3 origin = mul(CamToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+    float3 dir = normalize(mul(CamToWorld, float4(dirView, 0.0)).xyz);
+
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = dir;
+    ray._pad0 = 0.0;
+    ray._pad1 = 0.0;
+
+    RayHit hit;
+    hit.t = FarPlane;
+    hit.u = 0.0; hit.v = 0.0; hit._pad0 = 0;
+    hit.triIndex = MISS_INDEX;
+    hit.instIndex = MISS_INDEX;
+    hit._pad1 = 0; hit._pad2 = 0;
+
+    CastRayTLAS(ray, hit);
+
+    // ── 2. miss → 天空：写空 G-buffer，直接光=环境光 ──
+    if (hit.instIndex == MISS_INDEX)
+    {
+        GBufferPosDepth[id.xy]   = float4(0.0, 0.0, 0.0, 0.0);
+        GBufferNormalRough[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+        ReSTIR_DirectLighting[id.xy] = float4(AmbientColor, 1.0);
+        return;
+    }
+
+    // ── 3. 命中：几何与材质 ──
+    float3 N = getHitWorldNormal(hit);
+    float3 Ngeo = getHitGeoNormal(hit);
+    float3 P = ray.origin + ray.direction * hit.t;
+    PathMaterial mat = getHitMaterial(hit);
+    float2 huv = getHitUV(hit);
+
+    bool frontFace = dot(ray.direction, N) < 0.0;
+    if (!frontFace) { N = -N; Ngeo = -Ngeo; }
+
+    // 法线贴图扰动
+    InstanceGpu inst = InstanceTable[hit.instIndex];
+    float4 tang = getHitTangent(hit);
+    float3 T = normalize(mul(inst.transform, float4(tang.xyz, 0.0)).xyz);
+    float bitangentSign = tang.w >= 0.0 ? 1.0 : -1.0;
+    N = getNormalFromMap(mat, huv, N, T, bitangentSign);
+
+    applyMaterialTextures(mat, huv);
+
+    bool isTransparent = ((mat.flags & MAT_IS_TRANSPARENT) != 0u);
+    if (isTransparent)
+        mat.transmission = 1.0 - mat.albedo.a;
+
+    // ── 4. 写 G-buffer（与现有 PathTrace 格式一致） ──
+    // ★ 非 ReSTIR 像素检测：镜面或半透明 → roughness 取负值标记
+    bool isSpecular = (mat.metallic > 0.5 || mat.roughness < SpecularThreshold);
+    bool isNonReSTIR = isTransparent || isSpecular;
+    float storedRough = isNonReSTIR ? -mat.roughness : mat.roughness;
+
+    GBufferPosDepth[id.xy]   = float4(P, hit.t);
+    GBufferNormalRough[id.xy] = float4(Ngeo, storedRough);
+
+    // ── 5. 直接光照 NEE + 自发光 ──
+    float3 V = -ray.direction;
+    float NdotV = max(dot(N, V), 0.0);
+    float3 directLight = float3(0.0, 0.0, 0.0);
+
+    // 自发光
+    if ((mat.flags & MAT_HAS_EMISS) != 0u)
+    {
+        float2 uvT = huv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
+        float3 emTex = EmissiveArray.SampleLevel(sampler_EmissiveArray,
+            float3(uvT, float(mat.emissiveTexID)), 0.0).rgb;
+        directLight += mat.emissionColor.rgb * emTex;
+    }
+
+    // NEE 遍历光源
+    float3 B;
+    createONB(N, T, B);
+
+    [loop]
+    for (uint li = 0; li < LightCount; li++)
+    {
+        PathLight L = Lights[li];
+        float3 toL; float dist; float3 Lcolor;
+        sampleLightContribution(L, P, toL, dist, Lcolor);
+        float NdotL = dot(N, toL);
+
+        float3 bsdf = float3(0, 0, 0);
+        bool lightValid = false;
+
+        if (isTransparent && NdotL <= 0.0)
+        {
+            float absNdotL = abs(NdotL);
+            bsdf = btdfEval(mat, N, T, B, V, toL, NdotV, absNdotL);
+            lightValid = (dot(N, toL) < 0.0);
+            NdotL = absNdotL;
+        }
+        else if (NdotL > 0.0)
+        {
+            bsdf = evaluateBSDF(mat, N, toL, V, NdotL, NdotV);
+            lightValid = true;
+        }
+
+        if (!lightValid) continue;
+
+        Ray shadowRay;
+        shadowRay.origin = P + Ngeo * EPS_OFFSET;
+        shadowRay.direction = toL;
+        shadowRay._pad0 = 0.0;
+        shadowRay._pad1 = 0.0;
+
+        float3 shadowTrans = traceShadowTransmission(shadowRay, dist);
+        directLight += bsdf * NdotL * Lcolor * shadowTrans;
+    }
+
+    // 加环境光（环境光在 miss 时已加，命中点不加环境光，避免双重）
+    ReSTIR_DirectLighting[id.xy] = float4(directLight, 1.0);
+}
+
+// ══════════════════════════════════════════════════════
+//  ReSTIR Kernel 2: ReSTIR_InitReservoir
+//  从 G-buffer 命中点采样 1 条间接光线 → 追踪一次 → 构建初始蓄水池
+//  ★ 非 ReSTIR 像素（roughness < 0）写空蓄水池
+// ══════════════════════════════════════════════════════
+[numthreads(8, 8, 1)]
+void ReSTIR_InitReservoir(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    // ── 1. 读 G-buffer ──
+    float4 gpd = GBufferPosDepth[id.xy];
+    float depth = gpd.a;
+    float3 pos = gpd.rgb;
+
+    // 天空像素 → 空蓄水池
+    if (depth <= 0.0)
+    {
+        ReservoirRT0[id.xy] = float4(0,0,0,0);
+        ReservoirRT1[id.xy] = float4(0,0,0,0);
+        ReservoirRT2[id.xy] = float4(0,0,0,0);
+        ReservoirRT3[id.xy] = float4(0,0,0,0);
+        return;
+    }
+
+    float4 gnr = GBufferNormalRough[id.xy];
+    float3 Ngeo = gnr.rgb;
+    float roughness = gnr.a;
+
+    // ★ 非 ReSTIR 像素 → 空蓄水池
+    if (roughness < 0.0)
+    {
+        ReservoirRT0[id.xy] = float4(0,0,0,0);
+        ReservoirRT1[id.xy] = float4(0,0,0,0);
+        ReservoirRT2[id.xy] = float4(0,0,0,0);
+        ReservoirRT3[id.xy] = float4(0,0,0,0);
+        return;
+    }
+
+    // ── 2. 重建命中点材质与法线 ──
+    // 从 G-buffer 无法直接获取 instIndex/matID，需重新追踪主光线获取材质信息
+    // 简化方案：重新发射主光线获取 hit 信息
+    float2 uv = (float2(id.x, id.y) + 0.5) / float2(Width, Height);
+    float2 screen = uv * 2.0 - 1.0;
+    float4 pView = mul(InvProjection, float4(screen, 1.0, 1.0));
+    pView.xyz /= pView.w;
+    float3 dirView = normalize(pView.xyz);
+    float3 origin = mul(CamToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+    float3 dir = normalize(mul(CamToWorld, float4(dirView, 0.0)).xyz);
+
+    Ray primRay;
+    primRay.origin = origin;
+    primRay.direction = dir;
+    primRay._pad0 = 0.0;
+    primRay._pad1 = 0.0;
+
+    RayHit hit;
+    hit.t = FarPlane;
+    hit.u = 0.0; hit.v = 0.0; hit._pad0 = 0;
+    hit.triIndex = MISS_INDEX;
+    hit.instIndex = MISS_INDEX;
+    hit._pad1 = 0; hit._pad2 = 0;
+    CastRayTLAS(primRay, hit);
+
+    if (hit.instIndex == MISS_INDEX)
+    {
+        ReservoirRT0[id.xy] = float4(0,0,0,0);
+        ReservoirRT1[id.xy] = float4(0,0,0,0);
+        ReservoirRT2[id.xy] = float4(0,0,0,0);
+        ReservoirRT3[id.xy] = float4(0,0,0,0);
+        return;
+    }
+
+    // 获取材质与扰动法线
+    float3 N = getHitWorldNormal(hit);
+    float3 Ngeo2 = getHitGeoNormal(hit);
+    PathMaterial mat = getHitMaterial(hit);
+    float2 huv = getHitUV(hit);
+
+    bool frontFace = dot(dir, N) < 0.0;
+    if (!frontFace) { N = -N; Ngeo2 = -Ngeo2; }
+
+    InstanceGpu inst = InstanceTable[hit.instIndex];
+    float4 tang = getHitTangent(hit);
+    float3 T = normalize(mul(inst.transform, float4(tang.xyz, 0.0)).xyz);
+    float bitangentSign = tang.w >= 0.0 ? 1.0 : -1.0;
+    N = getNormalFromMap(mat, huv, N, T, bitangentSign);
+    applyMaterialTextures(mat, huv);
+
+    // ── 3. BSDF 采样一条间接光线 ──
+    uint seed = xxhash32(uint3(id.xy, FrameCount));
+    float3 V = -dir;
+    float3 sampleDir;
+    float sourcePdf;
+    float3 bsdf = sampleBSDF(mat, N, V, seed, sampleDir, sourcePdf);
+
+    float NdotL = max(dot(N, sampleDir), 0.0);
+    if (sourcePdf <= 0.0 || NdotL <= 0.0)
+    {
+        ReservoirRT0[id.xy] = float4(0,0,0,0);
+        ReservoirRT1[id.xy] = float4(0,0,0,0);
+        ReservoirRT2[id.xy] = float4(0,0,0,0);
+        ReservoirRT3[id.xy] = float4(0,0,0,0);
+        return;
+    }
+
+    // ── 4. 追踪间接光线 ──
+    Ray bounceRay;
+    bounceRay.origin = pos + Ngeo2 * EPS_OFFSET;
+    bounceRay.direction = sampleDir;
+    bounceRay._pad0 = 0.0;
+    bounceRay._pad1 = 0.0;
+
+    RayHit bounceHit;
+    bounceHit.t = FarPlane;
+    bounceHit.u = 0.0; bounceHit.v = 0.0; bounceHit._pad0 = 0;
+    bounceHit.triIndex = MISS_INDEX;
+    bounceHit.instIndex = MISS_INDEX;
+    bounceHit._pad1 = 0; bounceHit._pad2 = 0;
+    CastRayTLAS(bounceRay, bounceHit);
+
+    // ── 5. 计算间接命中点辐射度 hitRadiance ──
+    float3 hitRadiance = float3(0.0, 0.0, 0.0);
+    float3 hitNormal = float3(0.0, 1.0, 0.0);
+    float hitMatID = 0.0;
+    float dist = bounceHit.t;
+
+    if (bounceHit.instIndex == MISS_INDEX)
+    {
+        // miss → 环境光作为间接来源
+        hitRadiance = AmbientColor;
+        hitNormal = float3(0.0, 1.0, 0.0);
+    }
+    else
+    {
+        hitNormal = getHitWorldNormal(bounceHit);
+        float3 hitNgeo = getHitGeoNormal(bounceHit);
+        PathMaterial hitMat = getHitMaterial(bounceHit);
+        float2 hitUV = getHitUV(bounceHit);
+
+        bool hitFront = dot(sampleDir, hitNormal) < 0.0;
+        if (!hitFront) { hitNormal = -hitNormal; hitNgeo = -hitNgeo; }
+
+        // 自发光
+        if ((hitMat.flags & MAT_HAS_EMISS) != 0u)
+        {
+            float2 uvT = hitUV * hitMat.uvScaleOffset.xy + hitMat.uvScaleOffset.zw;
+            float3 emTex = EmissiveArray.SampleLevel(sampler_EmissiveArray,
+                float3(uvT, float(hitMat.emissiveTexID)), 0.0).rgb;
+            hitRadiance += hitMat.emissionColor.rgb * emTex;
+        }
+
+        // NEE 直接光：对 bounceHit 点做直接光照
+        applyMaterialTextures(hitMat, hitUV);
+        float3 hitV = -sampleDir;
+        float hitNdotV = max(dot(hitNormal, hitV), 0.0);
+        float3 hitT;
+        float3 hitB2;
+        createONB(hitNormal, hitT, hitB2);
+        InstanceGpu hitInst = InstanceTable[bounceHit.instIndex];
+        float4 hitTang = getHitTangent(bounceHit);
+        float3 hitT_world = normalize(mul(hitInst.transform, float4(hitTang.xyz, 0.0)).xyz);
+        float hitBtsign = hitTang.w >= 0.0 ? 1.0 : -1.0;
+        hitNormal = getNormalFromMap(hitMat, hitUV, hitNormal, hitT_world, hitBtsign);
+        createONB(hitNormal, hitT, hitB2);
+        hitNdotV = max(dot(hitNormal, hitV), 0.0);
+
+        float3 bouncePos = bounceRay.origin + sampleDir * bounceHit.t;
+
+        [loop]
+        for (uint li = 0; li < LightCount; li++)
+        {
+            PathLight L = Lights[li];
+            float3 toL; float ldist; float3 Lcolor;
+            sampleLightContribution(L, bouncePos, toL, ldist, Lcolor);
+            float hitNdotL = dot(hitNormal, toL);
+
+            if (hitNdotL <= 0.0) continue;
+
+            float3 hitBsdf = evaluateBSDF(hitMat, hitNormal, toL, hitV, hitNdotL, hitNdotV);
+
+            Ray shadowRay;
+            shadowRay.origin = bouncePos + hitNgeo * EPS_OFFSET;
+            shadowRay.direction = toL;
+            shadowRay._pad0 = 0.0;
+            shadowRay._pad1 = 0.0;
+
+            float3 shadowTrans = traceShadowTransmission(shadowRay, ldist);
+            hitRadiance += hitBsdf * hitNdotL * Lcolor * shadowTrans;
+        }
+
+        // hitMaterialID: 用 instance header.x（matID）
+        hitMatID = float(hitInst.header.x);
+    }
+
+    // ── 6. 计算 RIS 权重 ──
+    // target = NdotL_geo * lum(hitRadiance)，不含 BSDF。
+    // 因 K3/K4 无法获取当前像素材质来重算 bsdf_cur(ω_reused)，
+    // 若 target 含 BSDF，targetRatio 就会退化为两个独立 BSDF 采样之比，
+    // 由 Jensen 不等式 E[bsdf_cur/bsdf_foreign]≥1，使 w 逐帧通胀至 W_MAX。
+    // 去 BSDF 后 targetRatio = cosCur/cosHist，静态精确为 1，无偏置；M=1 仍相消。
+    float NdotL_geo = max(dot(Ngeo2, sampleDir), 0.0);
+    float targetPdf = NdotL_geo * max(luminance(hitRadiance), 1e-6);
+    float W = targetPdf / max(sourcePdf, 1e-8);  // M=1 时 w=W/M=W
+    float M = 1.0;
+
+    // ── 7. 写蓄水池 5 张纹理 ──
+    ReservoirRT0[id.xy] = float4(sampleDir, dist);
+    ReservoirRT1[id.xy] = float4(OctEncode(hitNormal), luminance(hitRadiance), 0.0);
+    ReservoirRT2[id.xy] = float4(W, M, targetPdf, sourcePdf);
+    ReservoirRT3[id.xy] = float4(hitRadiance, hitMatID);
+    ReservoirRT4[id.xy] = float4(bsdf, 0.0);  // 存储 BSDF 供 K3/K4 计算 targetPdf 比例
+}
+
+// ══════════════════════════════════════════════════════
+//  ReSTIR Kernel 3: ReSTIR_TemporalResample
+//  重投影找历史帧蓄水池 → 几何相似度检测 → WRS 合并
+//  ★ 非 ReSTIR 像素写空蓄水池
+//  输入: CurReservoirRT0-3(K2 输出) + PrevReservoirRT0-3(历史帧)
+//  输出: ReservoirRT0-3(时域蓄水池)
+// ══════════════════════════════════════════════════════
+[numthreads(8, 8, 1)]
+void ReSTIR_TemporalResample(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    // ── 1. 读当前帧 G-buffer ──
+    float4 gpd = GBufferPosDepth[id.xy];
+    float depth = gpd.a;
+    float3 pos = gpd.rgb;
+    float4 gnr = GBufferNormalRough[id.xy];
+    float3 Ngeo = gnr.rgb;
+    float roughness = gnr.a;
+
+    // ── 读当前帧初始蓄水池（来自 K2）──
+    float4 curR0 = CurReservoirRT0[id.xy];
+    float4 curR1 = CurReservoirRT1[id.xy];
+    float4 curR2 = CurReservoirRT2[id.xy];
+    float4 curR3 = CurReservoirRT3[id.xy];
+
+    // 天空 / 非 ReSTIR 像素 → 写空蓄水池
+    if (depth <= 0.0 || roughness < 0.0 || curR2.g <= 0.0) // M<=0 = 空蓄水池
+    {
+        ReservoirRT0[id.xy] = float4(0,0,0,0);
+        ReservoirRT1[id.xy] = float4(0,0,0,0);
+        ReservoirRT2[id.xy] = float4(0,0,0,0);
+        ReservoirRT3[id.xy] = float4(0,0,0,0);
+        ReservoirRT4[id.xy] = float4(0,0,0,0);
+        return;
+    }
+
+    // 默认输出 = 当前帧蓄水池
+    float3 outSampleDir = curR0.rgb;
+    float outDist = curR0.a;
+    float2 outOctNormal = curR1.rg;
+    float outLuminance = curR1.b;
+    float3 outHitRadiance = curR3.rgb;
+    float outHitMatID = curR3.a;
+    float outW = curR2.r;
+    float outM = curR2.g;
+    float outTargetPdf = curR2.b;
+    float outSourcePdf = curR2.a;
+    float3 outBsdf = CurReservoirRT4[id.xy].rgb;  // K2 存储的 BSDF
+
+    // ── 2. 重投影: worldPos → PrevViewProj → prevUV ──
+    float4 prevClip = mul(PrevViewProj, float4(pos, 1.0));
+    if (prevClip.w > 0.0)
+    {
+        float2 prevNdc = prevClip.xy / prevClip.w;
+        float2 prevUV = prevNdc * 0.5 + 0.5;
+
+        if (all(prevUV >= 0.0) && all(prevUV <= 1.0))
+        {
+            int2 prevPosBase = int2(prevUV * float2(Width, Height));
+            prevPosBase = clamp(prevPosBase, int2(0,0), int2((int)Width-1, (int)Height-1));
+
+            // ── 3. 3×3 邻域搜索：找与当前 worldPos 差距最小的历史像素 ──
+            float bestDist = 1e10;
+            int2 bestPrev = prevPosBase;
+            [unroll]
+            for (int ny = -1; ny <= 1; ny++)
+            {
+                [unroll]
+                for (int nx = -1; nx <= 1; nx++)
+                {
+                    int2 np = clamp(prevPosBase + int2(nx, ny),
+                                    int2(0,0), int2((int)Width-1, (int)Height-1));
+                    float4 pgpd = PrevGBufferPosDepth.Load(int3(np, 0));
+                    if (pgpd.a <= 0.0) continue; // 天空
+                    float3 delta = pgpd.rgb - pos;
+                    float d2 = dot(delta, delta);
+                    if (d2 < bestDist) { bestDist = d2; bestPrev = np; }
+                }
+            }
+
+            // ── 4. 几何相似度检测 ──
+            float4 prevGpd = PrevGBufferPosDepth.Load(int3(bestPrev, 0));
+            float4 prevGnr = PrevGBufferNormalRough.Load(int3(bestPrev, 0));
+            float prevDepth = prevGpd.a;
+            float3 prevNormal = prevGnr.rgb;
+
+            bool similar = GeometricSimilarity(pos, Ngeo, depth, prevGpd.rgb, prevNormal, prevDepth, DisocclusionThreshold);
+
+            if (similar)
+            {
+                // ── 5. 读历史帧蓄水池 ──
+                float4 pR0 = PrevReservoirRT0[bestPrev];
+                float4 pR1 = PrevReservoirRT1[bestPrev];
+                float4 pR2 = PrevReservoirRT2[bestPrev];
+                float4 pR3 = PrevReservoirRT3[bestPrev];
+                float4 pR4 = PrevReservoirRT4[bestPrev];
+
+                float prevW = pR2.r;
+                float prevM = pR2.g;
+                float prevTargetPdf = pR2.b;
+                float3 prevBsdf = pR4.rgb;
+
+                if (prevM > 0.0 && prevW > 0.0)
+                {
+                    // ── 6. WRS 合并历史蓄水池（对齐论文：含 targetPdf 比例）──
+                    float3 histSampleDir = pR0.rgb;
+                    float histDist = pR0.a;
+
+                    float cosCur = max(dot(Ngeo, histSampleDir), 0.0);
+                    float3 prevPos = prevGpd.rgb;
+                    float3 prevNgeo = prevNormal;
+                    float cosHist = max(dot(prevNgeo, histSampleDir), 0.0);
+
+                    // 时域复用重连的路径是 pos → histHitPos，dCur 必须取这条复用路径的长度，
+                    // 而非当前 K2 样本自身的弹射距离 outDist（那是另一条路径）。
+                    // 旧实现 J=(dHist/outDist)²，dHist 与 outDist 独立同分布，
+                    // 由 Jensen 不等式 E[(dHist/outDist)²]≥1，使 w_hist 系统性偏大、w 逐帧通胀至 W_MAX。
+                    float dCur = max(length(prevPos + histSampleDir * histDist - pos), 0.01);
+                    float dHist = max(histDist, 0.01);
+
+                    float jacobian = (cosCur / max(cosHist, 1e-4)) * (dHist * dHist / (dCur * dCur));
+                    jacobian = clamp(jacobian, 0.25, 4.0);
+
+                    // target 不含 BSDF，故 targetRatio = p̂_cur/p̂_hist = cosCur/cosHist
+                    // （hitRadiance 在同一命中点相同而消去）。静态同表面精确为 1，
+                    // 避免 lum(bsdf_cur)/lum(bsdf_prev) 的 Jensen 偏置导致 w 通胀。
+                    float targetRatio = cosCur / max(cosHist, 1e-8);
+                    targetRatio = clamp(targetRatio, 0.25, 4.0);  // 防极端值
+
+                    // 合并权重：w_hist = prevW * prevM * (p̂_cur/p̂_hist) * J
+                    float w_hist = prevW * prevM * targetRatio * jacobian;
+                    float W_sum = outW * outM + w_hist;
+                    float M_sum = outM + prevM;
+
+                    // WRS 选择
+                    uint sel = xxhash32(uint3(id.xy, FrameCount));
+                    float rsel = float(sel) * (1.0 / 4294967296.0);
+                    if (rsel < w_hist / max(W_sum, 1e-8))
+                    {
+                        outSampleDir = histSampleDir;
+                        float3 histHitPos = prevPos + histSampleDir * histDist;
+                        outDist = length(histHitPos - pos);
+                        outOctNormal = pR1.rg;
+                        outLuminance = pR1.b;
+                        outHitRadiance = pR3.rgb;
+                        outHitMatID = pR3.a;
+                        outSourcePdf = pR2.a;
+                        outTargetPdf = prevTargetPdf;
+                        outBsdf = prevBsdf;  // 更新为选中样本的 BSDF
+                    }
+                    outW = min(W_sum / max(M_sum, 1.0), W_MAX);
+                    outM = min(M_sum, M_MAX);
+                }
+            }
+        }
+    }
+
+    // ── 7. 写时域蓄水池 ──
+    ReservoirRT0[id.xy] = float4(outSampleDir, outDist);
+    ReservoirRT1[id.xy] = float4(outOctNormal, outLuminance, 0.0);
+    ReservoirRT2[id.xy] = float4(outW, outM, outTargetPdf, outSourcePdf);
+    ReservoirRT3[id.xy] = float4(outHitRadiance, outHitMatID);
+    ReservoirRT4[id.xy] = float4(outBsdf, 0.0);
+}
+
+// ══════════════════════════════════════════════════════
+//  ReSTIR Kernel 4: ReSTIR_SpatialResample
+//  从邻居像素的时域蓄水池复用路径 → Jacobian 缩放 → WRS 合并
+//  ★ 非 ReSTIR 像素写空蓄水池
+//  输入: CurReservoirRT0-3(K3 输出)
+//  输出: ReservoirRT0-3(空域蓄水池)
+// ══════════════════════════════════════════════════════
+[numthreads(8, 8, 1)]
+void ReSTIR_SpatialResample(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    // ── 1. 读当前像素的时域蓄水池（来自 K3）──
+    float4 gpd = GBufferPosDepth[id.xy];
+    float depth = gpd.a;
+    float3 pos = gpd.rgb;
+    float4 gnr = GBufferNormalRough[id.xy];
+    float3 Ngeo = gnr.rgb;
+    float roughness = gnr.a;
+
+    float4 curR0 = CurReservoirRT0[id.xy];
+    float4 curR1 = CurReservoirRT1[id.xy];
+    float4 curR2 = CurReservoirRT2[id.xy];
+    float4 curR3 = CurReservoirRT3[id.xy];
+
+    // 天空 / 非 ReSTIR 像素 → 空蓄水池
+    if (depth <= 0.0 || roughness < 0.0 || curR2.g <= 0.0)
+    {
+        ReservoirRT0[id.xy] = float4(0,0,0,0);
+        ReservoirRT1[id.xy] = float4(0,0,0,0);
+        ReservoirRT2[id.xy] = float4(0,0,0,0);
+        ReservoirRT3[id.xy] = float4(0,0,0,0);
+        ReservoirRT4[id.xy] = float4(0,0,0,0);
+        return;
+    }
+
+    // 当前像素蓄水池
+    float3 outSampleDir = curR0.rgb;
+    float outDist = curR0.a;
+    float2 outOctNormal = curR1.rg;
+    float outLuminance = curR1.b;
+    float3 outHitRadiance = curR3.rgb;
+    float outHitMatID = curR3.a;
+    float outW = curR2.r;
+    float outM = curR2.g;
+    float outTargetPdf = curR2.b;
+    float outSourcePdf = curR2.a;
+    float3 outBsdf = CurReservoirRT4[id.xy].rgb;  // K3 输出的 BSDF
+
+    // ── 2. 随机采样 N 个邻居 ──
+    // 种子按像素固定（不含 FrameCount），使邻居偏移与 WRS 选择在静态相机下逐帧稳定，
+    // 消除 K4 每帧重掷导致的色块移动（病根：等权候选 + 每帧重选样）。
+    // 代价：空域不再逐帧探索新邻居，但 K2 每帧新 BSDF 采样已提供时域多样性。
+    uint seed = xxhash32(uint3(id.xy, 0x9E3779B1));
+    uint neighborCount = SpatialNeighborCount;
+
+    [loop]
+    for (uint si = 0; si < 8; si++) // 最多 8 个邻居（D3D11 不支持动态循环边界）
+    {
+        if (si >= neighborCount) break;
+
+        // 随机偏移（步长 1~4 像素）
+        float r1 = rand(seed);
+        float r2 = rand(seed);
+        int2 offset = int2(int(r1 * 8.0) - 4, int(r2 * 8.0) - 4);
+        int2 q = clamp(int2(id.xy) + offset, int2(0,0), int2((int)Width-1, (int)Height-1));
+
+        // ── 3. 对每个邻居 q ──
+        float4 qGpd = GBufferPosDepth[q];
+        float4 qGnr = GBufferNormalRough[q];
+        float qDepth = qGpd.a;
+        float3 qPos = qGpd.rgb;
+        float3 qNgeo = qGnr.rgb;
+
+        if (qDepth <= 0.0) continue;
+
+        // a. 几何相似度
+        float normalDot = dot(Ngeo, qNgeo);
+        if (normalDot < 0.9) continue;
+        float relDepthDiff = abs(depth - qDepth) / max(abs(depth) + abs(qDepth), 1e-4);
+        if (relDepthDiff > DisocclusionThreshold) continue;
+
+        // 读邻居蓄水池
+        float4 qR0 = CurReservoirRT0[q];
+        float4 qR1 = CurReservoirRT1[q];
+        float4 qR2 = CurReservoirRT2[q];
+        float4 qR3 = CurReservoirRT3[q];
+        float4 qR4 = CurReservoirRT4[q];
+
+        float qW = qR2.r;
+        float qM = qR2.g;
+        float qTargetPdf = qR2.b;
+        float3 qBsdf = qR4.rgb;
+        if (qM <= 0.0 || qW <= 0.0) continue;
+
+        float3 qSampleDir = qR0.rgb;
+        float qDist = qR0.a;
+
+        // b. 半球可见性: dot(sampleDir_q, N_cur) > 0
+        float cosCur = dot(Ngeo, qSampleDir);
+        if (cosCur <= 0.0) continue;
+
+        // c. Jacobian (1-bounce random replay)
+        // J = max(0, dot(N_cur, dir)) / max(0, dot(N_q, dir)) × (dist_q² / dist_cur²)
+        float cosHist = max(dot(qNgeo, qSampleDir), 0.0);
+        float dCur = length(qPos + qSampleDir * qDist - pos); // 重连路径
+        float dQ = max(qDist, 0.01);
+
+        float jacobian = (cosCur / max(cosHist, 1e-4)) * (dQ * dQ / max(dCur * dCur, 1e-4));
+        jacobian = clamp(jacobian, 0.25, 4.0);  // 紧缩范围防 firefly
+
+        // d. targetPdf 比例 + Jacobian（对齐论文）
+        // target 不含 BSDF，targetRatio = p̂_cur/p̂_q = cosCur/cosHist（hitRadiance 同点消去），
+        // 避免 lum(outBsdf)/lum(qBsdf) 的 Jensen 偏置（两者为独立 BSDF 采样，E[比]≥1 致 w 通胀）。
+        float targetRatio = cosCur / max(cosHist, 1e-8);
+        targetRatio = clamp(targetRatio, 0.25, 4.0);
+        // 合并权重：w_q = qW * qM * (p̂_cur/p̂_q) * J
+        // 邻居蓄水池代表 qM 个候选，故 W 与 M 必须同比例累加（论文 M_new = M_cur + M_q）。
+        // 此前误用 M_sum = outM + 1.0 会使 w=W/M 的分母严重低估、w 被放大数十倍。
+        float w_q = qW * qM * targetRatio * jacobian;
+
+        float W_sum = outW * outM + w_q;
+        float M_sum = outM + qM;
+
+        // e. WRS merge
+        float rsel = rand(seed);
+        if (rsel < w_q / max(W_sum, 1e-8))
+        {
+            // 选中邻居样本
+            outSampleDir = qSampleDir;
+            outDist = dCur;
+            outOctNormal = qR1.rg;
+            outLuminance = qR1.b;
+            outHitRadiance = qR3.rgb;
+            outHitMatID = qR3.a;
+            outSourcePdf = qR2.a;
+            outTargetPdf = qTargetPdf;
+            outBsdf = qBsdf;  // 更新为选中样本的 BSDF
+        }
+        // 不在循环内截断 M：每轮 min(M_sum,M_MAX) 会使重建 W=outW*outM 逐轮减半，
+        // 末位邻居权重主导(~50%)、时域样本被稀释至 1/16 → 选样逐帧漂移（火焰噪点）。
+        // 循环内保留真实累加（outW*outM = W_sum），M 截断推迟到循环外一次性执行。
+        outW = W_sum / max(M_sum, 1.0);
+        outM = M_sum;
+    }
+
+    // 循环外一次性 M 截断（滑动窗口）：w=W_sum/M_sum 为正确均值，重建 W=w*M_MAX
+    outM = min(outM, M_MAX);
+    outW = min(outW, W_MAX);
+
+    // ── 4. 写空域蓄水池 ──
+    ReservoirRT0[id.xy] = float4(outSampleDir, outDist);
+    ReservoirRT1[id.xy] = float4(outOctNormal, outLuminance, 0.0);
+    ReservoirRT2[id.xy] = float4(outW, outM, outTargetPdf, outSourcePdf);
+    ReservoirRT3[id.xy] = float4(outHitRadiance, outHitMatID);
+    ReservoirRT4[id.xy] = float4(outBsdf, 0.0);
+}
+
+// ── 多弹射路径追踪回退函数（供 K5 非 ReSTIR 像素调用） ──
+// 复用现有 PathTrace kernel 的核心循环逻辑
+float3 ReSTIR_FallbackMultiBounce(float3 origin, float3 dir, uint2 pixel, uint seedVal)
+{
+    uint seed = seedVal;
+    float3 radiance = float3(0.0, 0.0, 0.0);
+    float3 throughput = float3(1.0, 1.0, 1.0);
+    bool isInside = false;
+
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = dir;
+    ray._pad0 = 0.0;
+    ray._pad1 = 0.0;
+
+    [loop]
+    for (int depth = 0; depth < (int)MaxDepth; depth++)
+    {
+        RayHit hit;
+        hit.t = FarPlane;
+        hit.u = 0.0; hit.v = 0.0; hit._pad0 = 0;
+        hit.triIndex = MISS_INDEX;
+        hit.instIndex = MISS_INDEX;
+        hit._pad1 = 0; hit._pad2 = 0;
+
+        CastRayTLAS(ray, hit);
+
+        if (hit.instIndex == MISS_INDEX)
+        {
+            radiance += throughput * AmbientColor;
+            break;
+        }
+
+        float3 N = getHitWorldNormal(hit);
+        float3 Ngeo = getHitGeoNormal(hit);
+        float3 P = ray.origin + ray.direction * hit.t;
+        PathMaterial mat = getHitMaterial(hit);
+        float2 huv = getHitUV(hit);
+
+        bool frontFace = dot(ray.direction, N) < 0.0;
+
+        // 体积衰减（Beer 定律）
+        if (isInside && mat.thinWalled == 0u && mat.transmission > 0.0)
+        {
+            float3 absorbColor = max(mat.albedo.rgb, float3(0.001, 0.001, 0.001));
+            float3 absCoeff = -log(absorbColor) / max(mat.ior * 2.0, 0.1);
+            throughput *= exp(-hit.t * absCoeff);
+        }
+
+        if (!frontFace) { N = -N; Ngeo = -Ngeo; }
+
+        InstanceGpu inst = InstanceTable[hit.instIndex];
+        float4 tang = getHitTangent(hit);
+        float3 T = normalize(mul(inst.transform, float4(tang.xyz, 0.0)).xyz);
+        float bitangentSign = tang.w >= 0.0 ? 1.0 : -1.0;
+        N = getNormalFromMap(mat, huv, N, T, bitangentSign);
+
+        float3 B;
+        createONB(N, T, B);
+
+        applyMaterialTextures(mat, huv);
+        if ((mat.flags & MAT_IS_TRANSPARENT) != 0u)
+            mat.transmission = 1.0 - mat.albedo.a;
+
+        // 自发光
+        if ((mat.flags & MAT_HAS_EMISS) != 0u)
+        {
+            float2 uvT = huv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
+            float3 emTex = EmissiveArray.SampleLevel(sampler_EmissiveArray,
+                float3(uvT, float(mat.emissiveTexID)), 0.0).rgb;
+            radiance += throughput * mat.emissionColor.rgb * emTex;
+        }
+
+        float3 V = -ray.direction;
+        float NdotV = max(dot(N, V), 0.0);
+        bool isTransparent = ((mat.flags & MAT_IS_TRANSPARENT) != 0u);
+
+        // NEE 直接光照
+        [loop]
+        for (uint li = 0; li < LightCount; li++)
+        {
+            PathLight L = Lights[li];
+            float3 toL; float dist; float3 Lcolor;
+            sampleLightContribution(L, P, toL, dist, Lcolor);
+            float NdotL = dot(N, toL);
+
+            float3 bsdf = float3(0,0,0);
+            bool lightValid = false;
+
+            if (isTransparent && NdotL <= 0.0)
+            {
+                float absNdotL = abs(NdotL);
+                bsdf = btdfEval(mat, N, T, B, V, toL, NdotV, absNdotL);
+                lightValid = (dot(N, toL) < 0.0);
+                NdotL = absNdotL;
+            }
+            else if (NdotL > 0.0)
+            {
+                bsdf = evaluateBSDF(mat, N, toL, V, NdotL, NdotV);
+                lightValid = true;
+            }
+            if (!lightValid) continue;
+
+            Ray shadowRay;
+            shadowRay.origin = P + Ngeo * EPS_OFFSET;
+            shadowRay.direction = toL;
+            shadowRay._pad0 = 0.0;
+            shadowRay._pad1 = 0.0;
+            float3 shadowTrans = traceShadowTransmission(shadowRay, dist);
+            radiance += throughput * bsdf * NdotL * Lcolor * shadowTrans;
+        }
+
+        // BSDF 采样（间接弹射）
+        float3 newDir; float pdf;
+        float3 bsdf;
+
+        if (isTransparent)
+        {
+            int lobe = findLobe(mat, dot(N, V), rand(seed));
+            if (lobe == LOBE_SPECULAR_TRANSMISSION || lobe == LOBE_DIFFUSE_TRANSMISSION)
+            {
+                if (lobe == LOBE_SPECULAR_TRANSMISSION)
+                    btdfSample(mat, N, T, B, V, seed, newDir, pdf, bsdf);
+                else
+                {
+                    newDir = cosineSampleHemisphere(float2(rand(seed),rand(seed)), T, B, -N);
+                    pdf = abs(dot(newDir, N)) / PI;
+                    bsdf = mat.albedo.rgb * mat.diffuseTransmission;
+                }
+                if (mat.thinWalled == 0u)
+                    isInside = !isInside;
+            }
+            else
+            {
+                bsdf = sampleBSDF(mat, N, V, seed, newDir, pdf);
+            }
+        }
+        else
+        {
+            bsdf = sampleBSDF(mat, N, V, seed, newDir, pdf);
+        }
+
+        float NdotL_new = max(dot(N, newDir), 0.0);
+        if (isTransparent) NdotL_new = abs(dot(N, newDir));
+        if (pdf <= 0.0 || NdotL_new <= 0.0) break;
+        if (!isTransparent && dot(N, newDir) <= 0.0) break;
+        throughput *= bsdf * NdotL_new / pdf;
+
+        bool isTransmission = (dot(newDir, Ngeo) < 0.0);
+        ray.origin = isTransmission ? (P - Ngeo * EPS_OFFSET) : (P + Ngeo * EPS_OFFSET);
+        ray.direction = newDir;
+
+        // 俄罗斯轮盘
+        if (depth > 3)
+        {
+            float pcont = min(max(max(throughput.x, throughput.y), throughput.z) + 0.001, 0.95);
+            if (rand(seed) >= pcont) break;
+            throughput /= pcont;
+        }
+    }
+
+    return radiance;
+}
+
+// ══════════════════════════════════════════════════════
+//  ReSTIR Kernel 5: ReSTIR_FinalShading
+//  从最终蓄水池 RIS 估计间接光 → 叠加直接光 → 输出
+//  ★ 非 ReSTIR 像素回退完整多弹射路径追踪
+//  输入: CurReservoirRT0-3(K4 输出) + ReSTIR_DirectLighting(K1 输出) + G-buffer
+//  输出: Output
+// ══════════════════════════════════════════════════════
+[numthreads(8, 8, 1)]
+void ReSTIR_FinalShading(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    // ── 1. 读 G-buffer ──
+    float4 gpd = GBufferPosDepth[id.xy];
+    float depth = gpd.a;
+    float3 pos = gpd.rgb;
+    float4 gnr = GBufferNormalRough[id.xy];
+    float3 Ngeo = gnr.rgb;
+    float roughness = gnr.a;
+
+    float3 directLight = ReSTIR_DirectLighting[id.xy].rgb;
+
+    // 天空像素 → 直接输出环境光
+    if (depth <= 0.0)
+    {
+        Output[id.xy] = float4(directLight, 1.0);
+        return;
+    }
+
+    // ── 2. 非 ReSTIR 像素（roughness < 0）→ 回退完整多弹射 ──
+    if (roughness < 0.0)
+    {
+        // 重建主光线方向
+        float2 uv = (float2(id.x, id.y) + 0.5) / float2(Width, Height);
+        float2 screen = uv * 2.0 - 1.0;
+        float4 pView = mul(InvProjection, float4(screen, 1.0, 1.0));
+        pView.xyz /= pView.w;
+        float3 dirView = normalize(pView.xyz);
+        float3 origin = mul(CamToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+        float3 dir = normalize(mul(CamToWorld, float4(dirView, 0.0)).xyz);
+
+        uint seed = xxhash32(uint3(id.xy, FrameCount));
+        float3 fallback = ReSTIR_FallbackMultiBounce(origin, dir, id.xy, seed);
+        Output[id.xy] = float4(fallback, 1.0);
+        return;
+    }
+
+    // ── 3. 读最终蓄水池（来自 K4）──
+    float4 r0 = CurReservoirRT0[id.xy];
+    float4 r1 = CurReservoirRT1[id.xy];
+    float4 r2 = CurReservoirRT2[id.xy];
+    float4 r3 = CurReservoirRT3[id.xy];
+
+    float w = r2.r;  // w = W/M（平均权重，有界不溢出）
+    float M = r2.g;
+
+    // 蓄水池为空 → 仅输出直接光
+    if (M <= 0.0 || w <= 0.0)
+    {
+        Output[id.xy] = float4(directLight, 1.0);
+        return;
+    }
+
+    // ── 4. 从蓄水池取最优样本 ──
+    float3 sampleDir = r0.rgb;
+    float3 hitRadiance = r3.rgb;
+
+    // ── 5. 重算 BSDF（当前像素材质，sampleDir 方向）──
+    // 需重新追踪主光线获取材质信息
+    float2 uv = (float2(id.x, id.y) + 0.5) / float2(Width, Height);
+    float2 screen = uv * 2.0 - 1.0;
+    float4 pView = mul(InvProjection, float4(screen, 1.0, 1.0));
+    pView.xyz /= pView.w;
+    float3 dirView = normalize(pView.xyz);
+    float3 origin = mul(CamToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz;
+    float3 dir = normalize(mul(CamToWorld, float4(dirView, 0.0)).xyz);
+
+    Ray primRay;
+    primRay.origin = origin;
+    primRay.direction = dir;
+    primRay._pad0 = 0.0;
+    primRay._pad1 = 0.0;
+
+    RayHit hit;
+    hit.t = FarPlane;
+    hit.u = 0.0; hit.v = 0.0; hit._pad0 = 0;
+    hit.triIndex = MISS_INDEX;
+    hit.instIndex = MISS_INDEX;
+    hit._pad1 = 0; hit._pad2 = 0;
+    CastRayTLAS(primRay, hit);
+
+    if (hit.instIndex == MISS_INDEX)
+    {
+        Output[id.xy] = float4(directLight, 1.0);
+        return;
+    }
+
+    float3 N = getHitWorldNormal(hit);
+    float3 Ngeo2 = getHitGeoNormal(hit);
+    PathMaterial mat = getHitMaterial(hit);
+    float2 huv = getHitUV(hit);
+
+    bool frontFace = dot(dir, N) < 0.0;
+    if (!frontFace) { N = -N; Ngeo2 = -Ngeo2; }
+
+    InstanceGpu inst = InstanceTable[hit.instIndex];
+    float4 tang = getHitTangent(hit);
+    float3 T = normalize(mul(inst.transform, float4(tang.xyz, 0.0)).xyz);
+    float bitangentSign = tang.w >= 0.0 ? 1.0 : -1.0;
+    N = getNormalFromMap(mat, huv, N, T, bitangentSign);
+    applyMaterialTextures(mat, huv);
+
+// ReSTIR 调试可视化开关：0=正常输出, 1=L_indirect, 2=directLight, 3=W, 4=M, 5=targetPdf, 6=hitRadiance, 7=bsdf, 8=sourcePdf, 9=L_per_sample(bsdf*NdotL*hitRad/sourcePdf)
+#define RESTIR_DEBUG 0
+
+    // ── 6. RIS 估计: L = w × bsdf × NdotL × hitRadiance / targetPdf ──
+    // w = W/M（已存为平均权重，无需再除 M）
+    float3 V = -dir;
+    float NdotL = max(dot(N, sampleDir), 0.0);
+    float NdotV = max(dot(N, V), 0.0);
+
+    float3 bsdf = evaluateBSDF(mat, N, sampleDir, V, NdotL, NdotV);
+
+    // 分母 = p̂_cur(y) = NdotL_geo * lum(hitRadiance)（与 K2/K3/K4 的 target 定义一致，不含 BSDF）。
+    // K3/K4 已用 targetRatio = cosCur/cosHist 把 W 折算到 p̂_cur 基下，分母须同基。
+    float NdotL_geo = max(dot(Ngeo2, sampleDir), 0.0);
+    float targetPdf = NdotL_geo * max(luminance(hitRadiance), 1e-6);
+    float sourcePdf = r2.a;
+    // K3/K4 已含 targetPdf 比例补偿 Jacobian 放大，w 应正确，不再钳制
+    float3 L_indirect = w * bsdf * NdotL * hitRadiance / max(targetPdf, 1e-8);
+    // 安全网：防 NaN/负值/firefly
+    // if (any(L_indirect < 0.0) || any(isnan(L_indirect))) L_indirect = float3(0.0, 0.0, 0.0);
+    // firefly 钳制：间接光不超过直接光的 5 倍 + 1.0 绝对上限
+    float maxIndirect = luminance(directLight) * 5.0 + 1.0;
+    L_indirect = min(L_indirect, maxIndirect);
+    // 单样本理论值（M=1 时的正确估计，用于对比）
+    float3 L_per_sample = bsdf * NdotL * hitRadiance / max(sourcePdf, 1e-8);
+
+#if RESTIR_DEBUG == 0
+    // ── 7. 最终输出 = 直接光 + 间接光 ──
+    float3 finalColor = directLight + L_indirect;
+    Output[id.xy] = float4(finalColor, 0.0);
+#elif RESTIR_DEBUG == 1
+    Output[id.xy] = float4(L_indirect, 0.0);
+#elif RESTIR_DEBUG == 2
+    Output[id.xy] = float4(directLight, 0.0);
+#elif RESTIR_DEBUG == 3
+    Output[id.xy] = float4(w * 0.1, 0.0, 0.0, 0.0);  // w 缩放以便可视化
+#elif RESTIR_DEBUG == 4
+    Output[id.xy] = float4(0.0, M * 0.01, 0.0, 0.0);  // M 缩放以便可视化
+#elif RESTIR_DEBUG == 5
+    Output[id.xy] = float4(targetPdf * 100.0, 0.0, 0.0, 0.0);  // targetPdf 缩放
+#elif RESTIR_DEBUG == 6
+    Output[id.xy] = float4(hitRadiance, 0.0);
+#elif RESTIR_DEBUG == 7
+    Output[id.xy] = float4(bsdf * 10.0, 0.0);  // bsdf 缩放
+#elif RESTIR_DEBUG == 8
+    Output[id.xy] = float4(sourcePdf * 10.0, 0.0, 0.0, 0.0);  // sourcePdf 缩放
+#elif RESTIR_DEBUG == 9
+    Output[id.xy] = float4(L_per_sample, 0.0);  // 单样本理论值
+#endif
 }

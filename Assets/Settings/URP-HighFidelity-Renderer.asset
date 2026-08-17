@@ -119,9 +119,22 @@ MonoBehaviour:
   pathTraceShader: {fileID: 7200000, guid: b7f0d0256d3797a44bb3711ac875d1a7, type: 3}
   outputFormat: 2
   groupXY: 8
-  maxDepth: 8
+  maxDepth: 4
+  samplesPerPixel: 1
   ambientColor: {r: 0.02, g: 0.02, b: 0.02, a: 1}
   denoisingEnabled: 1
   temporalEnabled: 1
-  spatialEnabled: 0
-  spatialPasses: 3
+  spatialEnabled: 1
+  spatialPasses: 1
+  disocclusionThreshold: 0.02
+  normalWeightParam: 0
+  depthThreshold: 0.02
+  poissonTapCount: 8
+  blurRadius: 1
+  phiLuminance: 1
+  maxLuminanceRelativeDiff: 0.1
+  enableAntiFirefly: 1
+  useReSTIRGI: 1
+  spatialNeighborCount: 4
+  restirSpatialPostFilter: 0
+  specularThreshold: 0.182
