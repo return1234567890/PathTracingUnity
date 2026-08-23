@@ -2174,13 +2174,7 @@ void ReSTIR_InitReservoir(uint3 id : SV_DispatchThreadID)
     }
 
     // ── 6. 计算 RIS 权重 ──
-    // target = NdotL_geo * lum(hitRadiance)，不含 BSDF。
-    // 因 K3/K4 无法获取当前像素材质来重算 bsdf_cur(ω_reused)，
-    // 若 target 含 BSDF，targetRatio 就会退化为两个独立 BSDF 采样之比，
-    // 由 Jensen 不等式 E[bsdf_cur/bsdf_foreign]≥1，使 w 逐帧通胀至 W_MAX。
-    // 去 BSDF 后 targetRatio = cosCur/cosHist，静态精确为 1，无偏置；M=1 仍相消。
-    float NdotL_geo = max(dot(Ngeo2, sampleDir), 0.0);
-    float targetPdf = NdotL_geo * max(luminance(hitRadiance), 1e-6);
+    float targetPdf = max(luminance(hitRadiance), 1e-6);
     float W = targetPdf / max(sourcePdf, 1e-8);  // M=1 时 w=W/M=W
     float M = 1.0;
 
@@ -2301,50 +2295,54 @@ void ReSTIR_TemporalResample(uint3 id : SV_DispatchThreadID)
                     float3 histSampleDir = pR0.rgb;
                     float histDist = pR0.a;
 
-                    float cosCur = max(dot(Ngeo, histSampleDir), 0.0);
                     float3 prevPos = prevGpd.rgb;
                     float3 prevNgeo = prevNormal;
+
+                    // 计算重连方向: pos → histHitPos
+                    float3 histHitPos = prevPos + histSampleDir * histDist;
+                    float3 reconnectDir = normalize(histHitPos - pos);
+                    float dCur = max(length(histHitPos - pos), 0.01);
+
+                    // 半球可见性: 重连方向必须在当前像素法线半球内
+                    float cosCur = max(dot(Ngeo, reconnectDir), 0.0);
+
+                    // Jacobian: J = (d_hist² / d_cur²) × (cosθ_cur / cosθ_hist)
                     float cosHist = max(dot(prevNgeo, histSampleDir), 0.0);
 
-                    // 时域复用重连的路径是 pos → histHitPos，dCur 必须取这条复用路径的长度，
-                    // 而非当前 K2 样本自身的弹射距离 outDist（那是另一条路径）。
-                    // 旧实现 J=(dHist/outDist)²，dHist 与 outDist 独立同分布，
-                    // 由 Jensen 不等式 E[(dHist/outDist)²]≥1，使 w_hist 系统性偏大、w 逐帧通胀至 W_MAX。
-                    float dCur = max(length(prevPos + histSampleDir * histDist - pos), 0.01);
-                    float dHist = max(histDist, 0.01);
-
-                    float jacobian = (cosCur / max(cosHist, 1e-4)) * (dHist * dHist / (dCur * dCur));
-                    jacobian = clamp(jacobian, 0.25, 4.0);
-
-                    // target 不含 BSDF，故 targetRatio = p̂_cur/p̂_hist = cosCur/cosHist
-                    // （hitRadiance 在同一命中点相同而消去）。静态同表面精确为 1，
-                    // 避免 lum(bsdf_cur)/lum(bsdf_prev) 的 Jensen 偏置导致 w 通胀。
-                    float targetRatio = cosCur / max(cosHist, 1e-8);
-                    targetRatio = clamp(targetRatio, 0.25, 4.0);  // 防极端值
-
-                    // 合并权重：w_hist = prevW * prevM * (p̂_cur/p̂_hist) * J
-                    float w_hist = prevW * prevM * targetRatio * jacobian;
-                    float W_sum = outW * outM + w_hist;
-                    float M_sum = outM + prevM;
-
-                    // WRS 选择
-                    uint sel = xxhash32(uint3(id.xy, FrameCount));
-                    float rsel = float(sel) * (1.0 / 4294967296.0);
-                    if (rsel < w_hist / max(W_sum, 1e-8))
+                    // 源 PDF 覆盖检查 + 半球检查
+                    if (cosCur > 0.0 && cosHist > 1e-4)
                     {
-                        outSampleDir = histSampleDir;
-                        float3 histHitPos = prevPos + histSampleDir * histDist;
-                        outDist = length(histHitPos - pos);
-                        outOctNormal = pR1.rg;
-                        outLuminance = pR1.b;
-                        outHitRadiance = pR3.rgb;
-                        outHitMatID = pR3.a;
-                        outSourcePdf = pR2.a;
-                        outTargetPdf = prevTargetPdf;
-                        outBsdf = prevBsdf;  // 更新为选中样本的 BSDF
+                        float dHist = max(histDist, 0.01);
+                        float jacobian = (dHist * dHist / (dCur * dCur))
+                                       * (cosCur / cosHist);
+                        jacobian = clamp(jacobian, 0.25, 4.0);
+
+                        // target = luminance(hitRadiance)，重连到同一命中点时 hitRadiance 不变
+                        float targetRatio = 1.0;
+
+                        // 合并权重：w_hist = prevW * prevM * (p̂_cur/p̂_hist) * J
+                        float w_hist = prevW * prevM * targetRatio * jacobian;
+                        float W_sum = outW * outM + w_hist;
+                        float M_sum = outM + prevM;
+
+                        // WRS 选择
+                        uint sel = xxhash32(uint3(id.xy, FrameCount));
+                        float rsel = float(sel) * (1.0 / 4294967296.0);
+                        if (rsel < w_hist / max(W_sum, 1e-8))
+                        {
+                            outSampleDir = reconnectDir;
+                            outDist = dCur;
+                            outOctNormal = pR1.rg;
+                            outLuminance = pR1.b;
+                            outHitRadiance = pR3.rgb;
+                            outHitMatID = pR3.a;
+                            outSourcePdf = pR2.a;
+                            outTargetPdf = prevTargetPdf;
+                            outBsdf = prevBsdf;  // 更新为选中样本的 BSDF
+                        }
+                        outW = min(W_sum / max(M_sum, 1.0), W_MAX);
+                        outM = min(M_sum, M_MAX);
                     }
-                    outW = min(W_sum / max(M_sum, 1.0), W_MAX);
-                    outM = min(M_sum, M_MAX);
                 }
             }
         }
@@ -2456,27 +2454,30 @@ void ReSTIR_SpatialResample(uint3 id : SV_DispatchThreadID)
         float3 qSampleDir = qR0.rgb;
         float qDist = qR0.a;
 
-        // b. 半球可见性: dot(sampleDir_q, N_cur) > 0
-        float cosCur = dot(Ngeo, qSampleDir);
+        // b. 计算重连方向与距离
+        float3 qHitPos = qPos + qSampleDir * qDist;
+        float3 reconnectDir = normalize(qHitPos - pos);
+        float dCur = length(qHitPos - pos);
+
+        // 半球可见性: 重连方向必须在当前像素法线半球内
+        float cosCur = dot(Ngeo, reconnectDir);
         if (cosCur <= 0.0) continue;
 
         // c. Jacobian (1-bounce random replay)
-        // J = max(0, dot(N_cur, dir)) / max(0, dot(N_q, dir)) × (dist_q² / dist_cur²)
+        // J = (d_q² / d_cur²) × (cosθ_cur / cosθ_q)
+        //   cosθ_cur = dot(N_cur, reconnectDir)  — 当前像素法线与重连方向
+        //   cosθ_q   = dot(N_q, qSampleDir)     — 邻居法线与原采样方向
         float cosHist = max(dot(qNgeo, qSampleDir), 0.0);
-        float dCur = length(qPos + qSampleDir * qDist - pos); // 重连路径
-        float dQ = max(qDist, 0.01);
+        if (cosHist < 1e-4) continue;  // 邻居源 PDF 无法覆盖此方向（退化的几何配置）
 
-        float jacobian = (cosCur / max(cosHist, 1e-4)) * (dQ * dQ / max(dCur * dCur, 1e-4));
+        float dQ = max(qDist, 0.01);
+        float jacobian = (dQ * dQ / max(dCur * dCur, 1e-4))
+                       * (cosCur / cosHist);
         jacobian = clamp(jacobian, 0.25, 4.0);  // 紧缩范围防 firefly
 
-        // d. targetPdf 比例 + Jacobian（对齐论文）
-        // target 不含 BSDF，targetRatio = p̂_cur/p̂_q = cosCur/cosHist（hitRadiance 同点消去），
-        // 避免 lum(outBsdf)/lum(qBsdf) 的 Jensen 偏置（两者为独立 BSDF 采样，E[比]≥1 致 w 通胀）。
-        float targetRatio = cosCur / max(cosHist, 1e-8);
-        targetRatio = clamp(targetRatio, 0.25, 4.0);
-        // 合并权重：w_q = qW * qM * (p̂_cur/p̂_q) * J
-        // 邻居蓄水池代表 qM 个候选，故 W 与 M 必须同比例累加（论文 M_new = M_cur + M_q）。
-        // 此前误用 M_sum = outM + 1.0 会使 w=W/M 的分母严重低估、w 被放大数十倍。
+        // target = luminance(hitRadiance)，重连到同一命中点时 hitRadiance 不变
+        float targetRatio = 1.0;
+
         float w_q = qW * qM * targetRatio * jacobian;
 
         float W_sum = outW * outM + w_q;
@@ -2487,7 +2488,7 @@ void ReSTIR_SpatialResample(uint3 id : SV_DispatchThreadID)
         if (rsel < w_q / max(W_sum, 1e-8))
         {
             // 选中邻居样本
-            outSampleDir = qSampleDir;
+            outSampleDir = reconnectDir;  // 存重连方向而非邻居原采样方向
             outDist = dCur;
             outOctNormal = qR1.rg;
             outLuminance = qR1.b;
@@ -2803,10 +2804,7 @@ void ReSTIR_FinalShading(uint3 id : SV_DispatchThreadID)
 
     float3 bsdf = evaluateBSDF(mat, N, sampleDir, V, NdotL, NdotV);
 
-    // 分母 = p̂_cur(y) = NdotL_geo * lum(hitRadiance)（与 K2/K3/K4 的 target 定义一致，不含 BSDF）。
-    // K3/K4 已用 targetRatio = cosCur/cosHist 把 W 折算到 p̂_cur 基下，分母须同基。
-    float NdotL_geo = max(dot(Ngeo2, sampleDir), 0.0);
-    float targetPdf = NdotL_geo * max(luminance(hitRadiance), 1e-6);
+    float targetPdf = max(luminance(hitRadiance), 1e-6);
     float sourcePdf = r2.a;
     // K3/K4 已含 targetPdf 比例补偿 Jacobian 放大，w 应正确，不再钳制
     float3 L_indirect = w * bsdf * NdotL * hitRadiance / max(targetPdf, 1e-8);

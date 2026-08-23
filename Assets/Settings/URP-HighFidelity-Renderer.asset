@@ -137,4 +137,4 @@ MonoBehaviour:
   useReSTIRGI: 1
   spatialNeighborCount: 4
   restirSpatialPostFilter: 0
-  specularThreshold: 0.182
+  specularThreshold: 0.3
