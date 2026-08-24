@@ -139,3 +139,4 @@ MonoBehaviour:
   restirSpatialPostFilter: 0
   specularThreshold: 0.3
   restirSpatialTwoPass: 1
+  historyValidationInterval: 6

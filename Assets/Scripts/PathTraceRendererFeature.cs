@@ -96,6 +96,9 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
              "加速相机移动时新进入屏幕像素的收敛（M < M_MAX/2 才合并）")]
     public bool restirSpatialTwoPass = true;
 
+    [Tooltip("历史样本验证间隔：每N帧重追验证历史蓄水池命中点，刷新hitRadiance（0=禁用）")]
+    [Range(0, 30)] public int historyValidationInterval = 6;
+
     private PathTraceRenderPass _pass;
 
     public override void Create()
@@ -292,6 +295,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
         {
             cmd.SetComputeIntParam(cs, "SpatialNeighborCount", _feature.spatialNeighborCount);
             cmd.SetComputeFloatParam(cs, "SpecularThreshold", _feature.specularThreshold);
+            cmd.SetComputeIntParam(cs, "HistoryValidationInterval", Mathf.Max(0, _feature.historyValidationInterval));
         }
 
         // ── 3. 维护所有 RT ──
@@ -337,6 +341,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
             cmd.SetComputeTextureParam(cs, _kRestirTemp, "PrevReservoirRT4", _prevReservoirRT4);
             BindReservoirUAVs(cmd, cs, _kRestirTemp, _temporalResRT0, _temporalResRT1, _temporalResRT2, _temporalResRT3);
             cmd.SetComputeTextureParam(cs, _kRestirTemp, "ReservoirRT4", _temporalResRT4);
+            _bufferMgr.Bind(cmd, cs, _kRestirTemp);
             cmd.DispatchCompute(cs, _kRestirTemp, gx, gy, 1);
 
             // ═══ K4 Pass 1: ReSTIR_SpatialResample ═══

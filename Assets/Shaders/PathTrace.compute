@@ -257,7 +257,7 @@ cbuffer ReSTIRCB
     uint  SpatialNeighborCount;   // 空域重采样邻居数（4 或 8）
     uint  K4_PassIndex;            // K4 两 pass 模式：0=Pass1(读时域), 1=Pass2(读空域, M<M_MAX/2 才合并)
     float SpecularThreshold;      // 镜面判定阈值，roughness < 此值 → 非 ReSTIR 像素
-    uint  _restirPad0;
+    uint  HistoryValidationInterval;  // 历史样本验证间隔（0=禁用，N=每N帧验证+刷新）
     uint  _restirPad1;
 };
 
@@ -1846,6 +1846,8 @@ void AntiFirefly(uint3 id : SV_DispatchThreadID)
 
 #define M_MAX 60.0
 #define W_MAX 100.0
+#define M_MAX_HIT_RADIANCE 10.0
+#define M_MAX_INDIRECT_RADIANCE 5.0
 // ══════════════════════════════════════════════════════
 //  ReSTIR Kernel 1: ReSTIR_PrimaryRay
 //  发射主光线求交 → 写 G-buffer → 计算直接光照(NEE+自发光) → 输出 DirectLightingRT
@@ -2174,6 +2176,13 @@ void ReSTIR_InitReservoir(uint3 id : SV_DispatchThreadID)
         hitMatID = float(hitInst.header.x);
     }
 
+    // ── 5.1. 钳制 hitRadiance ──
+    float hitLum = luminance(hitRadiance);
+    if (hitLum > M_MAX_HIT_RADIANCE)
+    {
+        hitRadiance *= M_MAX_HIT_RADIANCE / hitLum;
+    }
+
     // ── 6. 计算 RIS 权重 ──
     float targetPdf = max(luminance(hitRadiance), 1e-6);
     float W = targetPdf / max(sourcePdf, 1e-8);  // M=1 时 w=W/M=W
@@ -2318,31 +2327,142 @@ void ReSTIR_TemporalResample(uint3 id : SV_DispatchThreadID)
                                        * (cosCur / cosHist);
                         jacobian = clamp(jacobian, 0.25, 4.0);
 
-                        // target = luminance(hitRadiance)，重连到同一命中点时 hitRadiance 不变
+                        // ★ 历史样本验证 + hitRadiance 刷新（每 N 帧）
+                        // 重追 reconnectDir 验证命中点几何一致性，刷新 hitRadiance 消除光照/几何变化偏差
                         float targetRatio = 1.0;
+                        bool skipMerge = false;
 
-                        // 合并权重：w_hist = prevW * prevM * (p̂_cur/p̂_hist) * J
-                        float w_hist = prevW * prevM * targetRatio * jacobian;
-                        float W_sum = outW * outM + w_hist;
-                        float M_sum = outM + prevM;
-
-                        // WRS 选择
-                        uint sel = xxhash32(uint3(id.xy, FrameCount));
-                        float rsel = float(sel) * (1.0 / 4294967296.0);
-                        if (rsel < w_hist / max(W_sum, 1e-8))
+                        if (HistoryValidationInterval > 0u &&
+                            (FrameCount % HistoryValidationInterval) == 0u)
                         {
-                            outSampleDir = reconnectDir;
-                            outDist = dCur;
-                            outOctNormal = pR1.rg;
-                            outLuminance = pR1.b;
-                            outHitRadiance = pR3.rgb;
-                            outHitMatID = pR3.a;
-                            outSourcePdf = pR2.a;
-                            outTargetPdf = prevTargetPdf;
-                            outBsdf = prevBsdf;  // 更新为选中样本的 BSDF
+                            // 重追 reconnectDir 验证命中点
+                            Ray validRay;
+                            validRay.origin = pos + Ngeo * EPS_OFFSET;
+                            validRay.direction = reconnectDir;
+                            validRay._pad0 = 0.0;
+                            validRay._pad1 = 0.0;
+
+                            RayHit validHit;
+                            validHit.t = FarPlane;
+                            validHit.u = 0.0; validHit.v = 0.0; validHit._pad0 = 0;
+                            validHit.triIndex = MISS_INDEX;
+                            validHit.instIndex = MISS_INDEX;
+                            validHit._pad1 = 0; validHit._pad2 = 0;
+                            CastRayTLAS(validRay, validHit);
+
+                            bool wasHit = (histDist < FarPlane * 0.99);
+                            bool isHit = (validHit.instIndex != MISS_INDEX);
+
+                            if (wasHit != isHit)
+                            {
+                                // miss <-> hit 变化 -> 几何变化，清除历史
+                                skipMerge = true;
+                            }
+                            else if (isHit)
+                            {
+                                // 几何验证：dist + 法线
+                                float relDistErr = abs(validHit.t - dCur) / max(dCur, 0.01);
+                                float3 newNormal = getHitWorldNormal(validHit);
+                                float3 newHitNgeo = getHitGeoNormal(validHit);
+
+                                bool hitFront = dot(reconnectDir, newNormal) < 0.0;
+                                if (!hitFront) { newNormal = -newNormal; newHitNgeo = -newHitNgeo; }
+
+                                float3 storedNormal = OctDecode(pR1.rg);
+                                bool distValid = relDistErr < 0.15;
+                                bool normalValid = dot(newNormal, storedNormal) > 0.9;
+
+                                if (!distValid || !normalValid)
+                                {
+                                    // 几何变化 -> 清除历史
+                                    skipMerge = true;
+                                }
+                                else
+                                {
+                                    // 几何有效 -> 刷新 hitRadiance（自发光 + NEE 含阴影射线）
+                                    PathMaterial hitMat = getHitMaterial(validHit);
+                                    float2 hitUV = getHitUV(validHit);
+                                    InstanceGpu hitInst = InstanceTable[validHit.instIndex];
+                                    float4 hitTang = getHitTangent(validHit);
+                                    float3 hitT_world = normalize(mul(hitInst.transform, float4(hitTang.xyz, 0.0)).xyz);
+                                    float hitBtsign = hitTang.w >= 0.0 ? 1.0 : -1.0;
+                                    newNormal = getNormalFromMap(hitMat, hitUV, newNormal, hitT_world, hitBtsign);
+                                    applyMaterialTextures(hitMat, hitUV);
+
+                                    float3 bouncePos = validRay.origin + reconnectDir * validHit.t;
+                                    float3 hitV = -reconnectDir;
+                                    float hitNdotV = max(dot(newNormal, hitV), 0.0);
+                                    float3 hitT; float3 hitB2;
+                                    createONB(newNormal, hitT, hitB2);
+
+                                    float3 refreshedHitRadiance = float3(0.0, 0.0, 0.0);
+
+                                    // 自发光
+                                    if ((hitMat.flags & MAT_HAS_EMISS) != 0u)
+                                    {
+                                        float2 uvT = hitUV * hitMat.uvScaleOffset.xy + hitMat.uvScaleOffset.zw;
+                                        float3 emTex = EmissiveArray.SampleLevel(sampler_EmissiveArray,
+                                            float3(uvT, float(hitMat.emissiveTexID)), 0.0).rgb;
+                                        refreshedHitRadiance += hitMat.emissionColor.rgb * emTex;
+                                    }
+
+                                    // NEE 直接光照（含阴影射线）
+                                    [loop]
+                                    for (uint li = 0; li < LightCount; li++)
+                                    {
+                                        PathLight L = Lights[li];
+                                        float3 toL; float ldist; float3 Lcolor;
+                                        sampleLightContribution(L, bouncePos, toL, ldist, Lcolor);
+                                        float hitNdotL = dot(newNormal, toL);
+                                        if (hitNdotL <= 0.0) continue;
+                                        float3 hitBsdf = evaluateBSDF(hitMat, newNormal, toL, hitV, hitNdotL, hitNdotV);
+                                        Ray shadowRay;
+                                        shadowRay.origin = bouncePos + newHitNgeo * EPS_OFFSET;
+                                        shadowRay.direction = toL;
+                                        shadowRay._pad0 = 0.0;
+                                        shadowRay._pad1 = 0.0;
+                                        float3 shadowTrans = traceShadowTransmission(shadowRay, ldist);
+                                        refreshedHitRadiance += hitBsdf * hitNdotL * Lcolor * shadowTrans;
+                                    }
+
+                                    // 更新局部变量（供后续 WRS 合并使用）
+                                    float refreshedTargetPdf = max(luminance(refreshedHitRadiance), 1e-6);
+                                    pR3 = float4(refreshedHitRadiance, float(hitInst.header.x));
+                                    pR1 = float4(OctEncode(newNormal), luminance(refreshedHitRadiance), 0.0);
+                                    targetRatio = refreshedTargetPdf / max(prevTargetPdf, 1e-8);
+                                    prevTargetPdf = refreshedTargetPdf;
+                                }
+                            }
+                            // else: wasHit==false && isHit==false (miss->miss)
+                            // 环境光视为常量，不刷新
                         }
-                        outW = min(W_sum / max(M_sum, 1.0), W_MAX);
-                        outM = min(M_sum, M_MAX);
+
+                        // WRS 合并（仅在几何验证通过时执行）
+                        if (!skipMerge)
+                        {
+                            // 合并权重：w_hist = prevW * prevM * (p̂_cur/p̂_hist) * J
+                            float w_hist = prevW * prevM * targetRatio * jacobian;
+                            float W_sum = outW * outM + w_hist;
+                            float M_sum = outM + prevM;
+
+                            // WRS 选择
+                            uint sel = xxhash32(uint3(id.xy, FrameCount));
+                            float rsel = float(sel) * (1.0 / 4294967296.0);
+                            if (rsel < w_hist / max(W_sum, 1e-8))
+                            {
+                                outSampleDir = reconnectDir;
+                                outDist = dCur;
+                                outOctNormal = pR1.rg;       // 刷新后的法线
+                                outLuminance = pR1.b;          // 刷新后的亮度
+                                outHitRadiance = pR3.rgb;     // 刷新后的辐射度
+                                outHitMatID = pR3.a;          // 刷新后的 matID
+                                outSourcePdf = pR2.a;
+                                outTargetPdf = prevTargetPdf; // 刷新后的 targetPdf
+                                outBsdf = prevBsdf;            // 更新为选中样本的 BSDF
+                            }
+                            outW = min(W_sum / max(M_sum, 1.0), W_MAX);
+                            outM = min(M_sum, M_MAX);
+                        }
                     }
                 }
             }
@@ -2825,8 +2945,15 @@ void ReSTIR_FinalShading(uint3 id : SV_DispatchThreadID)
     // 安全网：防 NaN/负值/firefly
     // if (any(L_indirect < 0.0) || any(isnan(L_indirect))) L_indirect = float3(0.0, 0.0, 0.0);
     // firefly 钳制：间接光不超过直接光的 5 倍 + 1.0 绝对上限
-    float maxIndirect = luminance(directLight) * 5.0 + 1.0;
-    L_indirect = min(L_indirect, maxIndirect);
+    // float maxIndirect = luminance(directLight) * 5.0 + 1.0;
+    // L_indirect = min(L_indirect, maxIndirect);
+
+    float maxIndirect = luminance(L_indirect);
+    if (maxIndirect > M_MAX_INDIRECT_RADIANCE)
+    {
+        L_indirect *= M_MAX_INDIRECT_RADIANCE / maxIndirect;
+    }
+
     // 单样本理论值（M=1 时的正确估计，用于对比）
     float3 L_per_sample = bsdf * NdotL * hitRadiance / max(sourcePdf, 1e-8);
 
