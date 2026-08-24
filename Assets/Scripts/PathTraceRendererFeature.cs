@@ -86,9 +86,6 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
     [Tooltip("空域重采样邻居数（4 或 8）")]
     [Range(4, 8)] public int spatialNeighborCount = 4;
 
-    [Tooltip("ReSTIR 输出后再做几 pass 軻量空域滤波（0=直接输出）")]
-    [Range(0, 3)] public int restirSpatialPostFilter = 1;
-
     [Tooltip("粗糙度低于此值的表面视为镜面，走回退多弹射而非 ReSTIR 重采样")]
     [Range(0.01f, 0.5f)] public float specularThreshold = 0.3f;
 
@@ -307,7 +304,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
         RTHandle colorTarget = Renderer.cameraColorTargetHandle;
 
         // ══════════════════════════════════════════════════════════════
-        //  ReSTIR GI 5-kernel 管线分支
+        //  阶段 1：路径生成 → _outputRT（ReSTIR 5-kernel 或原始 PathTrace）
         // ══════════════════════════════════════════════════════════════
         if (_feature.useReSTIRGI)
         {
@@ -397,67 +394,20 @@ public class PathTraceRenderPass : ScriptableRenderPass
             cmd.SetComputeTextureParam(cs, _kRestirShade, "Output", _outputRT);
             _bufferMgr.Bind(cmd, cs, _kRestirShade);
             cmd.DispatchCompute(cs, _kRestirShade, gx, gy, 1);
-
-            // ═══ 可选: 軻量空域滤波后处理 ═══
-            if (_feature.restirSpatialPostFilter > 0)
-            {
-                cmd.SetComputeTextureParam(cs, _kSpatial, "GBufferPosDepth", _gbuffer0);
-                cmd.SetComputeTextureParam(cs, _kSpatial, "GBufferNormalRough", _gbuffer1);
-                RenderTexture src = _outputRT;
-                RenderTexture dst = _filterInRT;
-                for (int p = 0; p < _feature.restirSpatialPostFilter; p++)
-                {
-                    cmd.SetComputeTextureParam(cs, _kSpatial, "FilterInput", src);
-                    cmd.SetComputeTextureParam(cs, _kSpatial, "FilterOutput", dst);
-                    cmd.SetComputeIntParam(cs, "PassIndex", p);
-                    cmd.DispatchCompute(cs, _kSpatial, gx, gy, 1);
-                    src = dst;
-                    dst = (dst == _filterInRT) ? _filterOutRT : _filterInRT;
-                }
-                cmd.Blit(src, colorTarget);
-            }
-            else
-            {
-                cmd.Blit(_outputRT, colorTarget);
-            }
-
-            context.ExecuteCommandBuffer(cmd);
-            CommandBufferPool.Release(cmd);
-
-            // ═══ ping-pong: prevReservoir ← 时域蓄水池（K3 输出）═══
-            // ReSTIR GI 论文规定：跨帧反馈的是 Temporal Reservoir（样本严格来自同一像素、
-            // 同 domain，保证 RIS 无偏）。Spatial Reservoir 已混入邻居像素样本（经
-            // Jacobian shift 跨 domain），若反馈会使空间 shift 偏差跨帧复合 + M 指数饱和。
-            // 因此 prevReservoir 与 _temporalResRT ping-pong，_spatialResRT 退化为瞬态。
-            Swap(ref _prevReservoirRT0, ref _temporalResRT0);
-            Swap(ref _prevReservoirRT1, ref _temporalResRT1);
-            Swap(ref _prevReservoirRT2, ref _temporalResRT2);
-            Swap(ref _prevReservoirRT3, ref _temporalResRT3);
-            Swap(ref _prevReservoirRT4, ref _temporalResRT4);
-
-            // ═══ ping-pong: prevGBuffer ← 本帧 G-buffer ═══
-            Swap(ref _prevGbuffer0, ref _gbuffer0);
-            Swap(ref _prevGbuffer1, ref _gbuffer1);
-
-            _prevView = curView;
-            _prevProj = curProj;
-            _hasPrev = true;
-            return;
+        }
+        else
+        {
+            // ═══ PathTrace ═══
+            cmd.SetComputeTextureParam(cs, _kPathTrace, "Output", _outputRT);
+            cmd.SetComputeTextureParam(cs, _kPathTrace, "GBufferPosDepth", _gbuffer0);
+            cmd.SetComputeTextureParam(cs, _kPathTrace, "GBufferNormalRough", _gbuffer1);
+            _bufferMgr.Bind(cmd, cs, _kPathTrace);
+            cmd.DispatchCompute(cs, _kPathTrace, gx, gy, 1);
         }
 
         // ══════════════════════════════════════════════════════════════
-        //  现有管线（非 ReSTIR GI 模式）
+        //  阶段 2：降噪（共享：时域累积 + 空域滤波）
         // ══════════════════════════════════════════════════════════════
-
-        // ═══ 阶段 1：PathTrace ═══
-        cmd.SetComputeTextureParam(cs, _kPathTrace, "Output", _outputRT);
-        cmd.SetComputeTextureParam(cs, _kPathTrace, "GBufferPosDepth", _gbuffer0);
-        cmd.SetComputeTextureParam(cs, _kPathTrace, "GBufferNormalRough", _gbuffer1);
-        _bufferMgr.Bind(cmd, cs, _kPathTrace);
-        cmd.DispatchCompute(cs, _kPathTrace, gx, gy, 1);
-
-        // ═══ 阶段 4：Blit → 相机颜色目标 ═══
-        // colorTarget 已在上方声明
 
         // ── 降噪总开关关闭：跳过时域+空域，直接 Blit 原始输出 ──
         if (!_feature.denoisingEnabled)
@@ -466,14 +416,28 @@ public class PathTraceRenderPass : ScriptableRenderPass
             context.ExecuteCommandBuffer(cmd);
             CommandBufferPool.Release(cmd);
 
-            // 仍更新上一帧矩阵，保证重新开启时能正确检测相机移动
+            // ── ping-pong：history ← 本帧 accum ──
+            Swap(ref _historyRT, ref _accumRT);
+            // ── ping-pong：prevGBuffer ← 本帧 G-buffer ──
+            Swap(ref _prevGbuffer0, ref _gbuffer0);
+            Swap(ref _prevGbuffer1, ref _gbuffer1);
+            // ── ReSTIR 蓄水池 swap（仅 ReSTIR 模式）──
+            if (_feature.useReSTIRGI)
+            {
+                Swap(ref _prevReservoirRT0, ref _temporalResRT0);
+                Swap(ref _prevReservoirRT1, ref _temporalResRT1);
+                Swap(ref _prevReservoirRT2, ref _temporalResRT2);
+                Swap(ref _prevReservoirRT3, ref _temporalResRT3);
+                Swap(ref _prevReservoirRT4, ref _temporalResRT4);
+            }
+            // ── 更新上一帧矩阵 ──
             _prevView = curView;
             _prevProj = curProj;
             _hasPrev = true;
             return;
         }
 
-        // ═══ 阶段 2：TemporalAccumulate ═══
+        // ═══ 阶段 3：TemporalAccumulate ═══
         // 读：History(_historyRT) + CurSample(_outputRT) + GBuffer(_gbuffer0/1) + PrevGBuffer(_prevGbuffer0/1)
         // 写：Accum(_accumRT)，.a 通道存储近似方差
         cmd.SetComputeTextureParam(cs, _kTemporal, "History", _historyRT);
@@ -485,7 +449,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
         cmd.SetComputeTextureParam(cs, _kTemporal, "Accum", _accumRT);
         cmd.DispatchCompute(cs, _kTemporal, gx, gy, 1);
 
-        // ═══ 阶段 2.5：AntiFirefly（可选前置 pass） ═══
+        // ═══ 阶段 3.5：AntiFirefly（可选前置 pass） ═══
         // 3x3 RCRS 极值替换，消除镜面反射单像素刺眼亮点
         // 输入 _accumRT → 输出 _filterInRT，供后续 SpatialFilter 使用
         RenderTexture spatialInput = _accumRT;
@@ -498,7 +462,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
             spatialInput = _filterInRT;
         }
 
-        // ═══ 阶段 3：SpatialFilter（Poisson + à-trous 多 pass） ═══
+        // ═══ 阶段 4：SpatialFilter（Poisson + à-trous 多 pass） ═══
         RenderTexture finalRT;
         if (_feature.spatialEnabled && _feature.spatialPasses > 0)
         {
@@ -538,6 +502,19 @@ public class PathTraceRenderPass : ScriptableRenderPass
         // ── ping-pong：prevGBuffer ← 本帧 G-buffer ──
         Swap(ref _prevGbuffer0, ref _gbuffer0);
         Swap(ref _prevGbuffer1, ref _gbuffer1);
+
+        // ── ReSTIR 蓄水池 swap（仅 ReSTIR 模式）──
+        // ReSTIR GI 论文规定：跨帧反馈的是 Temporal Reservoir（样本严格来自同一像素、
+        // 同 domain，保证 RIS 无偏）。Spatial Reservoir 已混入邻居像素样本（经
+        // Jacobian shift 跨 domain），若反馈会使空间 shift 偏差跨帧复合 + M 指数饱和。
+        if (_feature.useReSTIRGI)
+        {
+            Swap(ref _prevReservoirRT0, ref _temporalResRT0);
+            Swap(ref _prevReservoirRT1, ref _temporalResRT1);
+            Swap(ref _prevReservoirRT2, ref _temporalResRT2);
+            Swap(ref _prevReservoirRT3, ref _temporalResRT3);
+            Swap(ref _prevReservoirRT4, ref _temporalResRT4);
+        }
 
         // ── 更新上一帧矩阵 ──
         _prevView = curView;
