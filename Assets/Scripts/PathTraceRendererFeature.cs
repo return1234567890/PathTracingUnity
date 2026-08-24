@@ -92,6 +92,10 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
     [Tooltip("粗糙度低于此值的表面视为镜面，走回退多弹射而非 ReSTIR 重采样")]
     [Range(0.01f, 0.5f)] public float specularThreshold = 0.3f;
 
+    [Tooltip("K4 两 pass 模式：Pass 2 读 Pass 1 的空域输出再做一轮空域复用，" +
+             "加速相机移动时新进入屏幕像素的收敛（M < M_MAX/2 才合并）")]
+    public bool restirSpatialTwoPass = true;
+
     private PathTraceRenderPass _pass;
 
     public override void Create()
@@ -335,9 +339,10 @@ public class PathTraceRenderPass : ScriptableRenderPass
             cmd.SetComputeTextureParam(cs, _kRestirTemp, "ReservoirRT4", _temporalResRT4);
             cmd.DispatchCompute(cs, _kRestirTemp, gx, gy, 1);
 
-            // ═══ K4: ReSTIR_SpatialResample ═══
+            // ═══ K4 Pass 1: ReSTIR_SpatialResample ═══
             // 读 G-buffer + 时域蓄水池(K3)
             // 写空域蓄水池 → _spatialResRT0-4
+            cmd.SetComputeIntParam(cs, "K4_PassIndex", 0);
             cmd.SetComputeTextureParam(cs, _kRestirSpat, "GBufferPosDepth", _gbuffer0);
             cmd.SetComputeTextureParam(cs, _kRestirSpat, "GBufferNormalRough", _gbuffer1);
             BindCurReservoirSRVs(cmd, cs, _kRestirSpat, _temporalResRT0, _temporalResRT1, _temporalResRT2, _temporalResRT3);
@@ -346,14 +351,44 @@ public class PathTraceRenderPass : ScriptableRenderPass
             cmd.SetComputeTextureParam(cs, _kRestirSpat, "ReservoirRT4", _spatialResRT4);
             cmd.DispatchCompute(cs, _kRestirSpat, gx, gy, 1);
 
+            // K5 读取的蓄水池来源：两 pass 模式下读 _reservoirRT（Pass 2 输出），
+            // 否则读 _spatialResRT（Pass 1 输出）
+            RenderTexture k5ResR0 = _spatialResRT0;
+            RenderTexture k5ResR1 = _spatialResRT1;
+            RenderTexture k5ResR2 = _spatialResRT2;
+            RenderTexture k5ResR3 = _spatialResRT3;
+            RenderTexture k5ResR4 = _spatialResRT4;
+
+            // ═══ K4 Pass 2: 额外空域复用（读 Pass 1 输出）═══
+            // 读 G-buffer + 空域蓄水池(Pass 1 输出)
+            // 写 _reservoirRT0-4（复用 K2 输出纹理，已不再需要）
+            // Pass 2 在 outM < M_MAX/2 时合并邻居空域蓄水池，加速新像素收敛
+            if (_feature.restirSpatialTwoPass)
+            {
+                cmd.SetComputeIntParam(cs, "K4_PassIndex", 1);
+                cmd.SetComputeTextureParam(cs, _kRestirSpat, "GBufferPosDepth", _gbuffer0);
+                cmd.SetComputeTextureParam(cs, _kRestirSpat, "GBufferNormalRough", _gbuffer1);
+                BindCurReservoirSRVs(cmd, cs, _kRestirSpat, _spatialResRT0, _spatialResRT1, _spatialResRT2, _spatialResRT3);
+                cmd.SetComputeTextureParam(cs, _kRestirSpat, "CurReservoirRT4", _spatialResRT4);
+                BindReservoirUAVs(cmd, cs, _kRestirSpat, _reservoirRT0, _reservoirRT1, _reservoirRT2, _reservoirRT3);
+                cmd.SetComputeTextureParam(cs, _kRestirSpat, "ReservoirRT4", _reservoirRT4);
+                cmd.DispatchCompute(cs, _kRestirSpat, gx, gy, 1);
+
+                k5ResR0 = _reservoirRT0;
+                k5ResR1 = _reservoirRT1;
+                k5ResR2 = _reservoirRT2;
+                k5ResR3 = _reservoirRT3;
+                k5ResR4 = _reservoirRT4;
+            }
+
             // ═══ K5: ReSTIR_FinalShading ═══
-            // 读 G-buffer + 直接光照 + 空域蓄水池(K4)
+            // 读 G-buffer + 直接光照 + 最终蓄水池(K4 输出)
             // 写 Output
             cmd.SetComputeTextureParam(cs, _kRestirShade, "GBufferPosDepth", _gbuffer0);
             cmd.SetComputeTextureParam(cs, _kRestirShade, "GBufferNormalRough", _gbuffer1);
             cmd.SetComputeTextureParam(cs, _kRestirShade, "ReSTIR_DirectLighting", _directLightRT);
-            BindCurReservoirSRVs(cmd, cs, _kRestirShade, _spatialResRT0, _spatialResRT1, _spatialResRT2, _spatialResRT3);
-            cmd.SetComputeTextureParam(cs, _kRestirShade, "CurReservoirRT4", _spatialResRT4);
+            BindCurReservoirSRVs(cmd, cs, _kRestirShade, k5ResR0, k5ResR1, k5ResR2, k5ResR3);
+            cmd.SetComputeTextureParam(cs, _kRestirShade, "CurReservoirRT4", k5ResR4);
             cmd.SetComputeTextureParam(cs, _kRestirShade, "Output", _outputRT);
             _bufferMgr.Bind(cmd, cs, _kRestirShade);
             cmd.DispatchCompute(cs, _kRestirShade, gx, gy, 1);

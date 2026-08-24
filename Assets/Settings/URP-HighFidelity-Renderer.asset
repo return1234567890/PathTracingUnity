@@ -138,3 +138,4 @@ MonoBehaviour:
   spatialNeighborCount: 4
   restirSpatialPostFilter: 0
   specularThreshold: 0.3
+  restirSpatialTwoPass: 1

@@ -28,7 +28,7 @@
 
 #define PI 3.14159265359
 #define MISS_INDEX 0xFFFFFFFFu
-#define DET_EPSILON 1e-7   // Möller-Trumbore 行列式退化剔除阈值（绝对值）
+#define DET_EPSILON 1e-12   // Möller-Trumbore 行列式退化剔除阈值（绝对值）
 #define EPS_OFFSET 5e-3
 
 // 调试开关：=1 时画面只输出阴影可见性可视化（白=无阴影，黑=完全阴影）
@@ -255,6 +255,7 @@ RWTexture2D<float4> ReSTIR_DirectLighting;
 cbuffer ReSTIRCB
 {
     uint  SpatialNeighborCount;   // 空域重采样邻居数（4 或 8）
+    uint  K4_PassIndex;            // K4 两 pass 模式：0=Pass1(读时域), 1=Pass2(读空域, M<M_MAX/2 才合并)
     float SpecularThreshold;      // 镜面判定阈值，roughness < 此值 → 非 ReSTIR 像素
     uint  _restirPad0;
     uint  _restirPad1;
@@ -2404,6 +2405,19 @@ void ReSTIR_SpatialResample(uint3 id : SV_DispatchThreadID)
     float outTargetPdf = curR2.b;
     float outSourcePdf = curR2.a;
     float3 outBsdf = CurReservoirRT4[id.xy].rgb;  // K3 输出的 BSDF
+
+    // ── Pass 2: 已收敛像素跳过空域合并 ──
+    // Pass 1 输出（空域蓄水池）作为 Pass 2 输入；M 已充足的像素直接拷贝到输出，
+    // 避免不必要的 Jacobian 组合偏差与 M 双计。
+    if (K4_PassIndex > 0 && outM >= M_MAX * 0.5)
+    {
+        ReservoirRT0[id.xy] = float4(outSampleDir, outDist);
+        ReservoirRT1[id.xy] = float4(outOctNormal, outLuminance, 0.0);
+        ReservoirRT2[id.xy] = float4(outW, outM, outTargetPdf, outSourcePdf);
+        ReservoirRT3[id.xy] = float4(outHitRadiance, outHitMatID);
+        ReservoirRT4[id.xy] = float4(outBsdf, 0.0);
+        return;
+    }
 
     // ── 2. 随机采样 N 个邻居 ──
     // 种子按像素固定（不含 FrameCount），使邻居偏移与 WRS 选择在静态相机下逐帧稳定，
