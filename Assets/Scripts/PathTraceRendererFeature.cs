@@ -146,6 +146,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
     private RenderTexture _outputRT;     // PathTrace radiance 输出
     private RenderTexture _gbuffer0;     // worldPos.xyz + depth (ARGBFloat)
     private RenderTexture _gbuffer1;     // normal.xyz + roughness (ARGBHalf)
+    private RenderTexture _gbuffer2;     // hitInfo: instIndex/triIndex/u/v (ARGBFloat, ReSTIR 专用)
     private RenderTexture _prevGbuffer0;  // 上一帧 G-buffer pos+depth（遮挡检测）
     private RenderTexture _prevGbuffer1;  // 上一帧 G-buffer normal+roughness
     private RenderTexture _accumRT;      // 本帧累积结果（ping-pong A）
@@ -312,6 +313,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
             // 写 G-buffer + 直接光照
             cmd.SetComputeTextureParam(cs, _kRestirPrimary, "GBufferPosDepth", _gbuffer0);
             cmd.SetComputeTextureParam(cs, _kRestirPrimary, "GBufferNormalRough", _gbuffer1);
+            cmd.SetComputeTextureParam(cs, _kRestirPrimary, "GBufferHitInfo", _gbuffer2);
             cmd.SetComputeTextureParam(cs, _kRestirPrimary, "ReSTIR_DirectLighting", _directLightRT);
             _bufferMgr.Bind(cmd, cs, _kRestirPrimary);
             cmd.DispatchCompute(cs, _kRestirPrimary, gx, gy, 1);
@@ -320,6 +322,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
             // 读 G-buffer，写初始蓄水池 → _reservoirRT0-4
             cmd.SetComputeTextureParam(cs, _kRestirInit, "GBufferPosDepth", _gbuffer0);
             cmd.SetComputeTextureParam(cs, _kRestirInit, "GBufferNormalRough", _gbuffer1);
+            cmd.SetComputeTextureParam(cs, _kRestirInit, "GBufferHitInfo", _gbuffer2);
             BindReservoirUAVs(cmd, cs, _kRestirInit, _reservoirRT0, _reservoirRT1, _reservoirRT2, _reservoirRT3);
             cmd.SetComputeTextureParam(cs, _kRestirInit, "ReservoirRT4", _reservoirRT4);
             _bufferMgr.Bind(cmd, cs, _kRestirInit);
@@ -388,6 +391,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
             // 写 Output
             cmd.SetComputeTextureParam(cs, _kRestirShade, "GBufferPosDepth", _gbuffer0);
             cmd.SetComputeTextureParam(cs, _kRestirShade, "GBufferNormalRough", _gbuffer1);
+            cmd.SetComputeTextureParam(cs, _kRestirShade, "GBufferHitInfo", _gbuffer2);
             cmd.SetComputeTextureParam(cs, _kRestirShade, "ReSTIR_DirectLighting", _directLightRT);
             BindCurReservoirSRVs(cmd, cs, _kRestirShade, k5ResR0, k5ResR1, k5ResR2, k5ResR3);
             cmd.SetComputeTextureParam(cs, _kRestirShade, "CurReservoirRT4", k5ResR4);
@@ -549,6 +553,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
         _outputRT   = NewRT(w, h, _feature.outputFormat);
         _gbuffer0   = NewRT(w, h, RenderTextureFormat.ARGBFloat);
         _gbuffer1   = NewRT(w, h, RenderTextureFormat.ARGBHalf);
+        _gbuffer2   = NewRT(w, h, RenderTextureFormat.ARGBFloat);  // ReSTIR hit info
         _prevGbuffer0 = NewRT(w, h, RenderTextureFormat.ARGBFloat);
         _prevGbuffer1 = NewRT(w, h, RenderTextureFormat.ARGBHalf);
         _accumRT    = NewRT(w, h, RenderTextureFormat.ARGBFloat);
@@ -610,6 +615,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
         Release(ref _outputRT);
         Release(ref _gbuffer0);
         Release(ref _gbuffer1);
+        Release(ref _gbuffer2);
         Release(ref _prevGbuffer0);
         Release(ref _prevGbuffer1);
         Release(ref _accumRT);

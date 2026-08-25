@@ -173,6 +173,10 @@ RWTexture2D<float4> Output;
 RWTexture2D<float4> GBufferPosDepth;
 // GBuffer1: worldNormal.xyz + roughness；miss 时为 0
 RWTexture2D<float4> GBufferNormalRough;
+// GBuffer2: 主命中索引与重心坐标，供 K2/K5 重建 RayHit 而免重复追踪
+//   x = float(hit.instIndex), y = float(hit.triIndex), z = hit.u, w = hit.v
+//   miss 时写 (MISS_INDEX, 0, 0, 0) 哨兵；K2/K5 在 depth<=0 已 early-return 不会读取
+RWTexture2D<float4> GBufferHitInfo;
 
 // ── 常量缓冲（由渲染器注入） ──
 cbuffer PathTraceCB
@@ -1887,6 +1891,7 @@ void ReSTIR_PrimaryRay(uint3 id : SV_DispatchThreadID)
     {
         GBufferPosDepth[id.xy]   = float4(0.0, 0.0, 0.0, 0.0);
         GBufferNormalRough[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+        GBufferHitInfo[id.xy]    = float4(float(MISS_INDEX), 0.0, 0.0, 0.0);
         ReSTIR_DirectLighting[id.xy] = float4(AmbientColor, 1.0);
         return;
     }
@@ -1922,6 +1927,7 @@ void ReSTIR_PrimaryRay(uint3 id : SV_DispatchThreadID)
 
     GBufferPosDepth[id.xy]   = float4(P, hit.t);
     GBufferNormalRough[id.xy] = float4(Ngeo, storedRough);
+    GBufferHitInfo[id.xy]    = float4(float(hit.instIndex), float(hit.triIndex), hit.u, hit.v);
 
     // ── 5. 直接光照 NEE + 自发光 ──
     float3 V = -ray.direction;
@@ -2020,9 +2026,9 @@ void ReSTIR_InitReservoir(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    // ── 2. 重建命中点材质与法线 ──
-    // 从 G-buffer 无法直接获取 instIndex/matID，需重新追踪主光线获取材质信息
-    // 简化方案：重新发射主光线获取 hit 信息
+    // ── 2. 重建主光线方向与命中信息（免重复追踪） ──
+    // dir 仍需用于 V/frontFace/BSDF 评估，但仅矩阵重建，无 BVH 遍历
+    // hit 直接从 K1 写入的 GBufferHitInfo 重建，省掉一次主光线 CastRayTLAS
     float2 uv = (float2(id.x, id.y) + 0.5) / float2(Width, Height);
     float2 screen = uv * 2.0 - 1.0;
     float4 pView = mul(InvProjection, float4(screen, 1.0, 1.0));
@@ -2031,20 +2037,15 @@ void ReSTIR_InitReservoir(uint3 id : SV_DispatchThreadID)
     float3 origin = mul(CamToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz;
     float3 dir = normalize(mul(CamToWorld, float4(dirView, 0.0)).xyz);
 
-    Ray primRay;
-    primRay.origin = origin;
-    primRay.direction = dir;
-    primRay._pad0 = 0.0;
-    primRay._pad1 = 0.0;
-
+    float4 ghi = GBufferHitInfo[id.xy];
     RayHit hit;
-    hit.t = FarPlane;
-    hit.u = 0.0; hit.v = 0.0; hit._pad0 = 0;
-    hit.triIndex = MISS_INDEX;
-    hit.instIndex = MISS_INDEX;
+    hit.t = depth;
+    hit.u = ghi.z; hit.v = ghi.w; hit._pad0 = 0;
+    hit.triIndex = uint(ghi.y);
+    hit.instIndex = uint(ghi.x);
     hit._pad1 = 0; hit._pad2 = 0;
-    CastRayTLAS(primRay, hit);
 
+    // depth>0 的像素必然命中，此处为防御性检查
     if (hit.instIndex == MISS_INDEX)
     {
         ReservoirRT0[id.xy] = float4(0,0,0,0);
@@ -2180,7 +2181,7 @@ void ReSTIR_InitReservoir(uint3 id : SV_DispatchThreadID)
     float hitLum = luminance(hitRadiance);
     if (hitLum > M_MAX_HIT_RADIANCE)
     {
-        hitRadiance *= M_MAX_HIT_RADIANCE / hitLum;
+        hitRadiance *= M_MAX_HIT_RADIANCE / max(hitLum, 1e-8);
     }
 
     // ── 6. 计算 RIS 权重 ──
@@ -2327,9 +2328,8 @@ void ReSTIR_TemporalResample(uint3 id : SV_DispatchThreadID)
                                        * (cosCur / cosHist);
                         jacobian = clamp(jacobian, 0.25, 4.0);
 
-                        // ★ 历史样本验证 + hitRadiance 刷新（每 N 帧）
-                        // 重追 reconnectDir 验证命中点几何一致性，刷新 hitRadiance 消除光照/几何变化偏差
-                        float targetRatio = 1.0;
+                        // ★ 历史样本验证（每 N 帧）
+                        // 重追 reconnectDir 验证命中点几何一致性，变化时清除历史样本
                         bool skipMerge = false;
 
                         if (HistoryValidationInterval > 0u &&
@@ -2363,10 +2363,9 @@ void ReSTIR_TemporalResample(uint3 id : SV_DispatchThreadID)
                                 // 几何验证：dist + 法线
                                 float relDistErr = abs(validHit.t - dCur) / max(dCur, 0.01);
                                 float3 newNormal = getHitWorldNormal(validHit);
-                                float3 newHitNgeo = getHitGeoNormal(validHit);
 
                                 bool hitFront = dot(reconnectDir, newNormal) < 0.0;
-                                if (!hitFront) { newNormal = -newNormal; newHitNgeo = -newHitNgeo; }
+                                if (!hitFront) newNormal = -newNormal;
 
                                 float3 storedNormal = OctDecode(pR1.rg);
                                 bool distValid = relDistErr < 0.15;
@@ -2377,69 +2376,17 @@ void ReSTIR_TemporalResample(uint3 id : SV_DispatchThreadID)
                                     // 几何变化 -> 清除历史
                                     skipMerge = true;
                                 }
-                                else
-                                {
-                                    // 几何有效 -> 刷新 hitRadiance（自发光 + NEE 含阴影射线）
-                                    PathMaterial hitMat = getHitMaterial(validHit);
-                                    float2 hitUV = getHitUV(validHit);
-                                    InstanceGpu hitInst = InstanceTable[validHit.instIndex];
-                                    float4 hitTang = getHitTangent(validHit);
-                                    float3 hitT_world = normalize(mul(hitInst.transform, float4(hitTang.xyz, 0.0)).xyz);
-                                    float hitBtsign = hitTang.w >= 0.0 ? 1.0 : -1.0;
-                                    newNormal = getNormalFromMap(hitMat, hitUV, newNormal, hitT_world, hitBtsign);
-                                    applyMaterialTextures(hitMat, hitUV);
-
-                                    float3 bouncePos = validRay.origin + reconnectDir * validHit.t;
-                                    float3 hitV = -reconnectDir;
-                                    float hitNdotV = max(dot(newNormal, hitV), 0.0);
-                                    float3 hitT; float3 hitB2;
-                                    createONB(newNormal, hitT, hitB2);
-
-                                    float3 refreshedHitRadiance = float3(0.0, 0.0, 0.0);
-
-                                    // 自发光
-                                    if ((hitMat.flags & MAT_HAS_EMISS) != 0u)
-                                    {
-                                        float2 uvT = hitUV * hitMat.uvScaleOffset.xy + hitMat.uvScaleOffset.zw;
-                                        float3 emTex = EmissiveArray.SampleLevel(sampler_EmissiveArray,
-                                            float3(uvT, float(hitMat.emissiveTexID)), 0.0).rgb;
-                                        refreshedHitRadiance += hitMat.emissionColor.rgb * emTex;
-                                    }
-
-                                    // NEE 直接光照（含阴影射线）
-                                    [loop]
-                                    for (uint li = 0; li < LightCount; li++)
-                                    {
-                                        PathLight L = Lights[li];
-                                        float3 toL; float ldist; float3 Lcolor;
-                                        sampleLightContribution(L, bouncePos, toL, ldist, Lcolor);
-                                        float hitNdotL = dot(newNormal, toL);
-                                        if (hitNdotL <= 0.0) continue;
-                                        float3 hitBsdf = evaluateBSDF(hitMat, newNormal, toL, hitV, hitNdotL, hitNdotV);
-                                        Ray shadowRay;
-                                        shadowRay.origin = bouncePos + newHitNgeo * EPS_OFFSET;
-                                        shadowRay.direction = toL;
-                                        shadowRay._pad0 = 0.0;
-                                        shadowRay._pad1 = 0.0;
-                                        float3 shadowTrans = traceShadowTransmission(shadowRay, ldist);
-                                        refreshedHitRadiance += hitBsdf * hitNdotL * Lcolor * shadowTrans;
-                                    }
-
-                                    // 更新局部变量（供后续 WRS 合并使用）
-                                    float refreshedTargetPdf = max(luminance(refreshedHitRadiance), 1e-6);
-                                    pR3 = float4(refreshedHitRadiance, float(hitInst.header.x));
-                                    pR1 = float4(OctEncode(newNormal), luminance(refreshedHitRadiance), 0.0);
-                                    targetRatio = refreshedTargetPdf / max(prevTargetPdf, 1e-8);
-                                    prevTargetPdf = refreshedTargetPdf;
-                                }
                             }
                             // else: wasHit==false && isHit==false (miss->miss)
-                            // 环境光视为常量，不刷新
+                            // 环境光视为常量，无需处理
                         }
 
                         // WRS 合并（仅在几何验证通过时执行）
                         if (!skipMerge)
                         {
+                            // target = luminance(hitRadiance)，重连到同一命中点时 hitRadiance 不变
+                            float targetRatio = 1.0;
+
                             // 合并权重：w_hist = prevW * prevM * (p̂_cur/p̂_hist) * J
                             float w_hist = prevW * prevM * targetRatio * jacobian;
                             float W_sum = outW * outM + w_hist;
@@ -2452,13 +2399,13 @@ void ReSTIR_TemporalResample(uint3 id : SV_DispatchThreadID)
                             {
                                 outSampleDir = reconnectDir;
                                 outDist = dCur;
-                                outOctNormal = pR1.rg;       // 刷新后的法线
-                                outLuminance = pR1.b;          // 刷新后的亮度
-                                outHitRadiance = pR3.rgb;     // 刷新后的辐射度
-                                outHitMatID = pR3.a;          // 刷新后的 matID
+                                outOctNormal = pR1.rg;
+                                outLuminance = pR1.b;
+                                outHitRadiance = pR3.rgb;
+                                outHitMatID = pR3.a;
                                 outSourcePdf = pR2.a;
-                                outTargetPdf = prevTargetPdf; // 刷新后的 targetPdf
-                                outBsdf = prevBsdf;            // 更新为选中样本的 BSDF
+                                outTargetPdf = prevTargetPdf;
+                                outBsdf = prevBsdf;  // 更新为选中样本的 BSDF
                             }
                             outW = min(W_sum / max(M_sum, 1.0), W_MAX);
                             outM = min(M_sum, M_MAX);
@@ -2883,7 +2830,8 @@ void ReSTIR_FinalShading(uint3 id : SV_DispatchThreadID)
     float3 hitRadiance = r3.rgb;
 
     // ── 5. 重算 BSDF（当前像素材质，sampleDir 方向）──
-    // 需重新追踪主光线获取材质信息
+    // hit 从 K1 写入的 GBufferHitInfo 重建，免一次主光线 CastRayTLAS
+    // dir 仍需矩阵重建用于 V/frontFace/BSDF 评估（无 BVH 开销）
     float2 uv = (float2(id.x, id.y) + 0.5) / float2(Width, Height);
     float2 screen = uv * 2.0 - 1.0;
     float4 pView = mul(InvProjection, float4(screen, 1.0, 1.0));
@@ -2892,20 +2840,15 @@ void ReSTIR_FinalShading(uint3 id : SV_DispatchThreadID)
     float3 origin = mul(CamToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz;
     float3 dir = normalize(mul(CamToWorld, float4(dirView, 0.0)).xyz);
 
-    Ray primRay;
-    primRay.origin = origin;
-    primRay.direction = dir;
-    primRay._pad0 = 0.0;
-    primRay._pad1 = 0.0;
-
+    float4 ghi = GBufferHitInfo[id.xy];
     RayHit hit;
-    hit.t = FarPlane;
-    hit.u = 0.0; hit.v = 0.0; hit._pad0 = 0;
-    hit.triIndex = MISS_INDEX;
-    hit.instIndex = MISS_INDEX;
+    hit.t = depth;
+    hit.u = ghi.z; hit.v = ghi.w; hit._pad0 = 0;
+    hit.triIndex = uint(ghi.y);
+    hit.instIndex = uint(ghi.x);
     hit._pad1 = 0; hit._pad2 = 0;
-    CastRayTLAS(primRay, hit);
 
+    // depth>0 的像素必然命中，此处为防御性检查
     if (hit.instIndex == MISS_INDEX)
     {
         Output[id.xy] = float4(directLight, 1.0);
@@ -2945,14 +2888,10 @@ void ReSTIR_FinalShading(uint3 id : SV_DispatchThreadID)
     // 安全网：防 NaN/负值/firefly
     // if (any(L_indirect < 0.0) || any(isnan(L_indirect))) L_indirect = float3(0.0, 0.0, 0.0);
     // firefly 钳制：间接光不超过直接光的 5 倍 + 1.0 绝对上限
-    // float maxIndirect = luminance(directLight) * 5.0 + 1.0;
-    // L_indirect = min(L_indirect, maxIndirect);
-
-    float maxIndirect = luminance(L_indirect);
-    if (maxIndirect > M_MAX_INDIRECT_RADIANCE)
-    {
-        L_indirect *= M_MAX_INDIRECT_RADIANCE / maxIndirect;
-    }
+    float maxIndirect = luminance(directLight) * 2.0 + 0.5;
+    float IndLum = luminance(L_indirect);
+    if (IndLum > maxIndirect)
+        L_indirect *= maxIndirect / max(IndLum, 1e-8);
 
     // 单样本理论值（M=1 时的正确估计，用于对比）
     float3 L_per_sample = bsdf * NdotL * hitRadiance / max(sourcePdf, 1e-8);
