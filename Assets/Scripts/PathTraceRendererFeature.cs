@@ -79,6 +79,14 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
     [Tooltip("启用 anti-firefly 前置 pass（3x3 RCRS 极值替换）")]
     public bool enableAntiFirefly = false;
 
+    [Header("Debug 验证（阶段2.6）")]
+    [Tooltip("启用灰度深度图验证模式：跳过路径追踪管线，用 Vulkan RayQuery 对 TLAS 发射射线并输出灰度深度。" +
+             "近=白，远=黑，未命中=黑。用于验证 BLAS/TLAS 构建正确性。")]
+    public bool debugDepthMode = false;
+
+    [Tooltip("Debug 深度图渲染分辨率（正方形，越小越快）")]
+    [Range(64, 1024)] public int debugDepthResolution = 512;
+
     [Header("ReSTIR GI")]
     [Tooltip("启用 ReSTIR GI 模式（关闭则走当前时域+空域管线）")]
     public bool useReSTIRGI = false;
@@ -97,6 +105,10 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
     [Range(0, 30)] public int historyValidationInterval = 6;
 
     private PathTraceRenderPass _pass;
+    private bool _nativeInitialized;
+
+    /// <summary>Native 插件是否已就绪（供 Pass 检查）</summary>
+    public bool IsNativeReady => _nativeInitialized;
 
     public override void Create()
     {
@@ -110,6 +122,22 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
     {
         if (pathTraceShader == null || ModelManager.Instance == null)
             return;
+
+        // 一次性初始化 Native Vulkan 插件
+        if (!_nativeInitialized)
+        {
+            _nativeInitialized = NativeBridge.TryInitialize();
+            if (_nativeInitialized && NativeBridge.IsRayQuerySupported())
+                Debug.Log("[PathTrace] Native Vulkan plugin ready, RayQuery supported.");
+        }
+
+        // 如果插件刚就绪且有待推送数据，重新推送
+        if (_nativeInitialized && ModelManager.Instance.NativePushPending)
+        {
+            Debug.Log("[PathTrace] Retrying deferred PushToNative.");
+            ModelManager.Instance.PushToNative();
+        }
+
         _pass.Renderer = renderer;
         renderer.EnqueuePass(_pass);
     }
@@ -117,6 +145,11 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
     protected override void Dispose(bool disposing)
     {
         _pass?.Dispose();
+        if (_nativeInitialized)
+        {
+            NativeBridge.VPT_Destroy();
+            _nativeInitialized = false;
+        }
     }
 }
 
@@ -180,6 +213,10 @@ public class PathTraceRenderPass : ScriptableRenderPass
     private int _cachedW = -1;
     private int _cachedH = -1;
 
+    // ── Debug depth RenderTexture（阶段2.6验证） ──
+    // GPU device-local，compute shader 直接写入 VkImage，无 CPU 回读
+    private RenderTexture _debugDepthRT;
+
     // ── 时域累积状态 ──
     private Matrix4x4 _prevView;   // 上一帧 camera.worldToCameraMatrix
     private Matrix4x4 _prevProj;   // 上一帧 camera.projectionMatrix
@@ -221,6 +258,13 @@ public class PathTraceRenderPass : ScriptableRenderPass
 
     public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
     {
+        // ── Debug 深度图模式：跳过 compute shader 管线 ──
+        if (_feature.debugDepthMode)
+        {
+            ExecuteDebugDepth(context, ref renderingData);
+            return;
+        }
+
         ComputeShader cs = ResolveKernels();
         if (cs == null) return;
 
@@ -402,11 +446,53 @@ public class PathTraceRenderPass : ScriptableRenderPass
         else
         {
             // ═══ PathTrace ═══
-            cmd.SetComputeTextureParam(cs, _kPathTrace, "Output", _outputRT);
-            cmd.SetComputeTextureParam(cs, _kPathTrace, "GBufferPosDepth", _gbuffer0);
-            cmd.SetComputeTextureParam(cs, _kPathTrace, "GBufferNormalRough", _gbuffer1);
-            _bufferMgr.Bind(cmd, cs, _kPathTrace);
-            cmd.DispatchCompute(cs, _kPathTrace, gx, gy, 1);
+            if (_feature.IsNativeReady)
+            {
+                // Vulkan RayQuery 硬件加速路径追踪
+                var camData = new NativeBridge.VPT_CameraData
+                {
+                    viewInv = MatrixToFloat16(camToWorld),
+                    projInv = MatrixToFloat16(invProj),
+                    position = new float[]
+                    {
+                        camera.transform.position.x,
+                        camera.transform.position.y,
+                        camera.transform.position.z
+                    },
+                    fov = camera.fieldOfView,
+                    jitter = new float[] { 0f, 0f },
+                    nearPlane = camera.nearClipPlane,
+                    farPlane = camera.farClipPlane,
+                    frameCount = Time.frameCount,
+                    maxDepth = Mathf.Max(1, _feature.maxDepth),
+                    ambientColor = new float[]
+                    {
+                        _feature.ambientColor.r,
+                        _feature.ambientColor.g,
+                        _feature.ambientColor.b
+                    },
+                    pad = 0f
+                };
+
+                // 阶段4：传入 4 个 Texture2DArray 原生指针供 native shader 采样
+                TextureArrayManager texArr = mm.TextureArrays;
+                NativeBridge.DispatchPathTrace(_outputRT, _gbuffer0, _gbuffer1,
+                    texArr != null ? texArr.BaseColorArray : null,
+                    texArr != null ? texArr.MetallicSmoothArray : null,
+                    texArr != null ? texArr.NormalArray : null,
+                    texArr != null ? texArr.EmissiveArray : null,
+                    w, h, ref camData,
+                    lightCount, Mathf.Max(1, _feature.samplesPerPixel));
+            }
+            else
+            {
+                // Fallback: Unity compute shader (HLSL software BVH)
+                cmd.SetComputeTextureParam(cs, _kPathTrace, "Output", _outputRT);
+                cmd.SetComputeTextureParam(cs, _kPathTrace, "GBufferPosDepth", _gbuffer0);
+                cmd.SetComputeTextureParam(cs, _kPathTrace, "GBufferNormalRough", _gbuffer1);
+                _bufferMgr.Bind(cmd, cs, _kPathTrace);
+                cmd.DispatchCompute(cs, _kPathTrace, gx, gy, 1);
+            }
         }
 
         // ══════════════════════════════════════════════════════════════
@@ -526,6 +612,77 @@ public class PathTraceRenderPass : ScriptableRenderPass
         _hasPrev = true;
     }
 
+    // ══════════════════════════════════════════════════════════════
+    //  Debug 深度图渲染（阶段2.6 验证）
+    //  跳过 compute shader 管线，直接用 Vulkan RayQuery 对 TLAS 发射射线
+    //  输出灰度深度图 Blit 到相机颜色目标
+    // ══════════════════════════════════════════════════════════════
+
+    private void ExecuteDebugDepth(ScriptableRenderContext context, ref RenderingData renderingData)
+    {
+        if (!_feature.IsNativeReady)
+            return;
+
+        Camera camera = renderingData.cameraData.camera;
+        int w = _feature.debugDepthResolution;
+        int h = _feature.debugDepthResolution;
+
+        // 创建/复用 device-local RenderTexture
+        // enableRandomWrite=true 确保 Unity 创建 VkImage 时包含 STORAGE_IMAGE usage flag
+        if (_debugDepthRT == null || _debugDepthRT.width != w || _debugDepthRT.height != h)
+        {
+            if (_debugDepthRT != null)
+                _debugDepthRT.Release();
+            _debugDepthRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGB32)
+            {
+                enableRandomWrite = true,
+                filterMode = FilterMode.Bilinear
+            };
+            _debugDepthRT.Create();
+        }
+
+        // 填充 VPT_CameraData（行主序矩阵，与 Unity Matrix4x4 存储一致）
+        var camData = new NativeBridge.VPT_CameraData
+        {
+            viewInv = MatrixToFloat16(camera.cameraToWorldMatrix),
+            projInv = MatrixToFloat16(camera.projectionMatrix.inverse),
+            position = new float[]
+            {
+                camera.transform.position.x,
+                camera.transform.position.y,
+                camera.transform.position.z
+            },
+            fov = camera.fieldOfView,
+            jitter = new float[] { 0f, 0f },
+            nearPlane = camera.nearClipPlane,
+            farPlane = camera.farClipPlane,
+            frameCount = Time.frameCount,
+            maxDepth = 1,
+            ambientColor = new float[] { 0f, 0f, 0f },
+            pad = 0f
+        };
+
+        // 直接写入 GPU RenderTexture 的 VkImage — 无 CPU 回读
+        NativeBridge.DispatchDebugDepth(_debugDepthRT.GetNativeTexturePtr(), w, h, ref camData);
+
+        // Blit 到相机颜色目标（GPU 内部操作，无 CPU 参与）
+        RTHandle colorTarget = Renderer.cameraColorTargetHandle;
+        CommandBuffer cmd = CommandBufferPool.Get("DebugDepth");
+        cmd.Blit(_debugDepthRT, colorTarget);
+        context.ExecuteCommandBuffer(cmd);
+        CommandBufferPool.Release(cmd);
+    }
+
+    /// <summary>将 Unity Matrix4x4 转换为行主序 float[16]</summary>
+    private static float[] MatrixToFloat16(Matrix4x4 m)
+    {
+        float[] f = new float[16];
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++)
+                f[r * 4 + c] = m[r, c];
+        return f;
+    }
+
     public override void OnCameraCleanup(CommandBuffer cmd)
     {
     }
@@ -533,6 +690,11 @@ public class PathTraceRenderPass : ScriptableRenderPass
     public void Dispose()
     {
         ReleaseRTs();
+        if (_debugDepthRT != null)
+        {
+            _debugDepthRT.Release();
+            _debugDepthRT = null;
+        }
         _bufferMgr?.Dispose();
         _bufferMgr = null;
     }

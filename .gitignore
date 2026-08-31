@@ -33,9 +33,14 @@
 # ====================
 *.exe
 *.dll
+# 保留原生路径追踪插件 DLL
+!Assets/Plugins/x86_64/VulkanPathTracePlugin.dll
+!Assets/Plugins/x86_64/TinyBVHNative.dll
 *.apk
 *.aab
 *.ipa
+# 备份 DLL 不提交
+Assets/Plugins/x86_64/*.dll.old
 
 # ====================
 # 操作系统文件
@@ -43,6 +48,11 @@
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# ====================
+# NativePlugin 构建产物
+# ====================
+NativePlugin/build/
 
 # ====================
 # dep/tinybvh 构建产物

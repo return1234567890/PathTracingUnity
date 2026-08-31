@@ -45,11 +45,14 @@ public class LightManager : MonoBehaviour
             return;
         }
         Instance = this;
+        // 在 Awake 中收集光源，确保 ModelManager.Start() → PushToNative() 时 Lights 已就绪
+        // （Unity 不保证不同 MonoBehaviour 的 Start() 执行顺序）
+        CollectLights();
     }
 
     private void Start()
     {
-        CollectLights();
+        // CollectLights 已在 Awake 中调用，此处不再重复
     }
 
     private void OnDestroy()

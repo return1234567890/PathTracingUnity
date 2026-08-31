@@ -125,7 +125,7 @@ MonoBehaviour:
   denoisingEnabled: 1
   temporalEnabled: 1
   spatialEnabled: 1
-  spatialPasses: 1
+  spatialPasses: 0
   disocclusionThreshold: 0.02
   normalWeightParam: 0
   depthThreshold: 0.02
@@ -134,8 +134,10 @@ MonoBehaviour:
   phiLuminance: 1
   maxLuminanceRelativeDiff: 0.1
   enableAntiFirefly: 1
-  useReSTIRGI: 1
+  debugDepthMode: 0
+  debugDepthResolution: 521
+  useReSTIRGI: 0
   spatialNeighborCount: 4
-  specularThreshold: 0.3
+  specularThreshold: 0.1
   restirSpatialTwoPass: 1
   historyValidationInterval: 6

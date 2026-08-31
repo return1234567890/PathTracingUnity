@@ -1,7 +1,7 @@
 // URPPT 纯软件路径追踪计算着色器
 // 单 kernel PathTrace：每像素多弹射路径追踪
 // BSDF: 简化金属度-粗糙度 GGX（diffuse + GGX specular, metallic workflow）
-// 直接光照: NEE 遍历所有光源 + 阴影早退遍历
+// 直接光照: NEE 每帧随机采样 1 个光源（乘 LightCount 无偏补偿），DEBUG_SHADOW 调试块仍遍历全量
 // 间接弹射: 按分支重要性采样（余弦半球/GGX NDF）+ 俄罗斯轮盘
 //
 // 关键约定（已核对 tiny_bvh_wrapper.cpp 第339-385行）:
@@ -1385,10 +1385,10 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
         float NdotV = max(dot(N, V), 0.0);
         bool isTransparent = ((mat.flags & MAT_IS_TRANSPARENT) != 0u);
 
-        // ── 3. NEE 直接光照：遍历所有光源 ──
-        [loop]
-        for (uint li = 0; li < LightCount; li++)
+        // ── 3. NEE 直接光照：每帧随机采样 1 个光源（乘 LightCount 无偏补偿） ──
+        if (LightCount > 0u)
         {
+            uint li = (uint)(rand(seed) * float(LightCount)) % LightCount;
             PathLight L = Lights[li];
             float3 toL; float dist; float3 Lcolor;
             sampleLightContribution(L, P, toL, dist, Lcolor);
@@ -1412,21 +1412,23 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
                 lightValid = (NdotL_smooth > 0.0);
             }
 
-            if (!lightValid) continue;
+            if (lightValid)
+            {
+                Ray shadowRay;
+                shadowRay.origin = P + Ngeo * EPS_OFFSET;
+                shadowRay.direction = toL;
+                shadowRay._pad0 = 0.0;
+                shadowRay._pad1 = 0.0;
 
-            Ray shadowRay;
-            shadowRay.origin = P + Ngeo * EPS_OFFSET;
-            shadowRay.direction = toL;
-            shadowRay._pad0 = 0.0;
-            shadowRay._pad1 = 0.0;
-
-            // ★ 性能瓶颈点：统一用半透明阴影遍历，透明物体不遮挡后方光照
-            // traceShadowTransmission 对不透明物体返回 (0,0,0)，对透明物体累积透射率，未命中返回 (1,1,1)
-            // 性能注意：每个光源每条路径都做 closest-hit + 最多 16 层循环，
-            // 比二值遮挡 OccludedTLAS(any-hit 早退出) 慢得多。
-            // 优化方向：C# 侧设 HasTransparentMaterials 开关，无透明物体时回退 OccludedTLAS。
-            float3 shadowTrans = traceShadowTransmission(shadowRay, dist);
-            radiance += throughput * bsdf * NdotL * Lcolor * shadowTrans;
+                // ★ 性能瓶颈点：统一用半透明阴影遍历，透明物体不遮挡后方光照
+                // traceShadowTransmission 对不透明物体返回 (0,0,0)，对透明物体累积透射率，未命中返回 (1,1,1)
+                // 性能注意：随机采样的单光源每条路径做 closest-hit + 最多 16 层循环，
+                // 比二值遮挡 OccludedTLAS(any-hit 早退出) 慢得多。
+                // 优化方向：C# 侧设 HasTransparentMaterials 开关，无透明物体时回退 OccludedTLAS。
+                float3 shadowTrans = traceShadowTransmission(shadowRay, dist);
+                radiance += throughput * bsdf * NdotL * Lcolor * shadowTrans
+                          * float(LightCount);
+            }
         }
 
         // ── 4. BSDF 采样（间接弹射） ──
@@ -1600,8 +1602,13 @@ void TemporalAccumulate(uint3 id : SV_DispatchThreadID)
     bool occluded = !depthValid || !normalValid;
 
     // ── Neighborhood clamp：用 History 邻域定义裁剪范围 ──
+    // 同时统计当前帧 3×3 局部范围（以当前像素 id.xy 为中心），
+    // 用于按当前帧噪声自适应扩展 clamp（单光源高方差时放行真值，避免边缘泄漏）
     float3 hMin = hist.rgb;
     float3 hMax = hist.rgb;
+    float3 curMin = cur.rgb;
+    float3 curMax = cur.rgb;
+    int2 curPos = (int2)id.xy;
     [unroll]
     for (int ny = -1; ny <= 1; ny++)
     {
@@ -1613,13 +1620,24 @@ void TemporalAccumulate(uint3 id : SV_DispatchThreadID)
             float3 hc = History.Load(int3(hp, 0)).rgb;
             hMin = min(hMin, hc);
             hMax = max(hMax, hc);
+            // 当前帧邻域（围绕当前像素，非 prevPos）
+            int2 cp = clamp(curPos + int2(nx, ny), int2(0, 0), int2((int)Width - 1, (int)Height - 1));
+            float3 cc = CurSample.Load(int3(cp, 0)).rgb;
+            curMin = min(curMin, cc);
+            curMax = max(curMax, cc);
         }
     }
 
-    // 扩展裁剪范围：50% 相对扩展 + 0.02 绝对下限
+    // 扩展裁剪范围：50% 相对扩展 + 自适应绝对下限
+    // 绝对下限取 max(0.02, 0.5*curStd)：低方差时退化为 0.02（兼容原行为），
+    // 高方差（单光源 0 与 ~LightCount×均值 两极跳动）时按半极差放宽，
+    // 让无偏真值穿透、不被钳到邻域极值 → 消除边缘泄漏型渐糊。
+    // 0.5 为可调系数（调大更不易泄漏、更易鬼影；调小反之）。
     float3 hRange = hMax - hMin;
-    hMin -= hRange * 0.5 + 0.02;
-    hMax += hRange * 0.5 + 0.02;
+    float3 curStd = (curMax - curMin) * 0.5;
+    float3 expansion = hRange * 0.5 + max(float3(0.02, 0.02, 0.02), 0.5 * curStd);
+    hMin -= expansion;
+    hMax += expansion;
 
     // 裁剪当前帧噪声样本
     float3 curClamped = clamp(cur.rgb, hMin, hMax);
@@ -1943,13 +1961,15 @@ void ReSTIR_PrimaryRay(uint3 id : SV_DispatchThreadID)
         directLight += mat.emissionColor.rgb * emTex;
     }
 
-    // NEE 遍历光源
+    // NEE 每帧随机采样 1 个光源（乘 LightCount 无偏补偿）
+    // ★ seed 用独立盐，与 K2 NEE 的光源采样解耦，避免直接+间接求和的正相关方差放大
+    uint neeSeed = xxhash32(uint3(id.xy, FrameCount ^ 0xA5A5A5A5u));
     float3 B;
     createONB(N, T, B);
 
-    [loop]
-    for (uint li = 0; li < LightCount; li++)
+    if (LightCount > 0u)
     {
+        uint li = (uint)(rand(neeSeed) * float(LightCount)) % LightCount;
         PathLight L = Lights[li];
         float3 toL; float dist; float3 Lcolor;
         sampleLightContribution(L, P, toL, dist, Lcolor);
@@ -1971,16 +1991,17 @@ void ReSTIR_PrimaryRay(uint3 id : SV_DispatchThreadID)
             lightValid = true;
         }
 
-        if (!lightValid) continue;
+        if (lightValid)
+        {
+            Ray shadowRay;
+            shadowRay.origin = P + Ngeo * EPS_OFFSET;
+            shadowRay.direction = toL;
+            shadowRay._pad0 = 0.0;
+            shadowRay._pad1 = 0.0;
 
-        Ray shadowRay;
-        shadowRay.origin = P + Ngeo * EPS_OFFSET;
-        shadowRay.direction = toL;
-        shadowRay._pad0 = 0.0;
-        shadowRay._pad1 = 0.0;
-
-        float3 shadowTrans = traceShadowTransmission(shadowRay, dist);
-        directLight += bsdf * NdotL * Lcolor * shadowTrans;
+            float3 shadowTrans = traceShadowTransmission(shadowRay, dist);
+            directLight += bsdf * NdotL * Lcolor * shadowTrans * float(LightCount);
+        }
     }
 
     // 加环境光（环境光在 miss 时已加，命中点不加环境光，避免双重）
@@ -2151,26 +2172,31 @@ void ReSTIR_InitReservoir(uint3 id : SV_DispatchThreadID)
 
         float3 bouncePos = bounceRay.origin + sampleDir * bounceHit.t;
 
-        [loop]
-        for (uint li = 0; li < LightCount; li++)
+        // NEE 每帧随机采样 1 个光源（乘 LightCount 无偏补偿）
+        // ★ 风险：此处 hitRadiance → targetPdf → W，单光源采样使 targetPdf 噪声放大，
+        //   可能导致 W 方差增大与偶发 firefly；K5 的 M_MAX/W_MAX 钳制可兜底。
+        //   seed 复用 BSDF 采样后已推进的状态，与 K1 NEE 光源采样天然解耦。
+        if (LightCount > 0u)
         {
+            uint li = (uint)(rand(seed) * float(LightCount)) % LightCount;
             PathLight L = Lights[li];
             float3 toL; float ldist; float3 Lcolor;
             sampleLightContribution(L, bouncePos, toL, ldist, Lcolor);
             float hitNdotL = dot(hitNormal, toL);
 
-            if (hitNdotL <= 0.0) continue;
+            if (hitNdotL > 0.0)
+            {
+                float3 hitBsdf = evaluateBSDF(hitMat, hitNormal, toL, hitV, hitNdotL, hitNdotV);
 
-            float3 hitBsdf = evaluateBSDF(hitMat, hitNormal, toL, hitV, hitNdotL, hitNdotV);
+                Ray shadowRay;
+                shadowRay.origin = bouncePos + hitNgeo * EPS_OFFSET;
+                shadowRay.direction = toL;
+                shadowRay._pad0 = 0.0;
+                shadowRay._pad1 = 0.0;
 
-            Ray shadowRay;
-            shadowRay.origin = bouncePos + hitNgeo * EPS_OFFSET;
-            shadowRay.direction = toL;
-            shadowRay._pad0 = 0.0;
-            shadowRay._pad1 = 0.0;
-
-            float3 shadowTrans = traceShadowTransmission(shadowRay, ldist);
-            hitRadiance += hitBsdf * hitNdotL * Lcolor * shadowTrans;
+                float3 shadowTrans = traceShadowTransmission(shadowRay, ldist);
+                hitRadiance += hitBsdf * hitNdotL * Lcolor * shadowTrans * float(LightCount);
+            }
         }
 
         // hitMaterialID: 用 instance header.x（matID）
@@ -2675,10 +2701,10 @@ float3 ReSTIR_FallbackMultiBounce(float3 origin, float3 dir, uint2 pixel, uint s
         float NdotV = max(dot(N, V), 0.0);
         bool isTransparent = ((mat.flags & MAT_IS_TRANSPARENT) != 0u);
 
-        // NEE 直接光照
-        [loop]
-        for (uint li = 0; li < LightCount; li++)
+        // NEE 每帧随机采样 1 个光源（乘 LightCount 无偏补偿）
+        if (LightCount > 0u)
         {
+            uint li = (uint)(rand(seed) * float(LightCount)) % LightCount;
             PathLight L = Lights[li];
             float3 toL; float dist; float3 Lcolor;
             sampleLightContribution(L, P, toL, dist, Lcolor);
@@ -2699,15 +2725,18 @@ float3 ReSTIR_FallbackMultiBounce(float3 origin, float3 dir, uint2 pixel, uint s
                 bsdf = evaluateBSDF(mat, N, toL, V, NdotL, NdotV);
                 lightValid = true;
             }
-            if (!lightValid) continue;
 
-            Ray shadowRay;
-            shadowRay.origin = P + Ngeo * EPS_OFFSET;
-            shadowRay.direction = toL;
-            shadowRay._pad0 = 0.0;
-            shadowRay._pad1 = 0.0;
-            float3 shadowTrans = traceShadowTransmission(shadowRay, dist);
-            radiance += throughput * bsdf * NdotL * Lcolor * shadowTrans;
+            if (lightValid)
+            {
+                Ray shadowRay;
+                shadowRay.origin = P + Ngeo * EPS_OFFSET;
+                shadowRay.direction = toL;
+                shadowRay._pad0 = 0.0;
+                shadowRay._pad1 = 0.0;
+                float3 shadowTrans = traceShadowTransmission(shadowRay, dist);
+                radiance += throughput * bsdf * NdotL * Lcolor * shadowTrans
+                         * float(LightCount);
+            }
         }
 
         // BSDF 采样（间接弹射）

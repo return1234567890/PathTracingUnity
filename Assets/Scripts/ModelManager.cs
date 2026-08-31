@@ -158,6 +158,7 @@ public class ModelManager : MonoBehaviour
 
     private void OnDestroy()
     {
+        OnDestroyNative();
         if (Instance == this)
             Instance = null;
         Scene?.Dispose();
@@ -306,6 +307,9 @@ public class ModelManager : MonoBehaviour
                 $"全局BLAS节点={GlobalBlasNodes.Length}, 全局BLASprimIdx={GlobalBlasPrimIdx.Length}, " +
                 $"三角形={GlobalTriangles.Length}, 顶点={GlobalVertices.Length}");
         }
+
+        // 6. 推送场景数据到 Native Vulkan 插件（BLAS/TLAS 构建）
+        PushToNative();
     }
 
     // ── 材质参数提取（albedo + metallic + roughness） ──────
@@ -486,5 +490,170 @@ public class ModelManager : MonoBehaviour
         for (int i = 0; i < count; i++)
             arr[i] = Marshal.PtrToStructure<TinyBVHNative.InstanceRecord>(ptr + i * size);
         return arr;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Native Vulkan 插件数据推送
+    // ═══════════════════════════════════════════════════════════
+
+    // GCHandle 列表（场景重建前 Free）
+    private System.Collections.Generic.List<GCHandle> _nativePins = new();
+    // 非托管内存分配列表（场景重建前 FreeHGlobal）
+    private System.Collections.Generic.List<IntPtr> _nativeAllocs = new();
+
+    /// <summary>是否有待推送的场景数据（插件未就绪时延迟）。</summary>
+    public bool NativePushPending => _nativePushPending;
+
+    /// <summary>
+    /// 将场景数据推送到 Native Vulkan 插件。
+    /// 在 BuildScene() 完成后调用，将顶点/索引/材质/光源/实例数据
+    /// 打包为 VPT_SceneUpdate 结构传入 Native。
+    /// </summary>
+    /// <summary>插件尚未就绪时置 true，待 PathTraceRendererFeature 初始化后重试。</summary>
+    private bool _nativePushPending = false;
+
+    public void PushToNative()
+    {
+        // 确保插件已初始化（首次调用触发 DLL 加载 + UnityPluginLoad + VPT_Initialize）
+        if (!NativeBridge.TryInitialize())
+        {
+            Debug.LogWarning("[ModelManager] PushToNative: plugin not ready, deferring.");
+            _nativePushPending = true;
+            return;
+        }
+
+        _nativePushPending = false;
+
+        // 释放上次的 pinned handle 和非托管分配
+        foreach (var h in _nativePins) if (h.IsAllocated) h.Free();
+        _nativePins.Clear();
+        foreach (var p in _nativeAllocs) Marshal.FreeHGlobal(p);
+        _nativeAllocs.Clear();
+
+        if (BlasDescriptors == null || GlobalVertices == null || GlobalTriangles == null)
+        {
+            Debug.LogWarning("[ModelManager] PushToNative: scene data not ready.");
+            return;
+        }
+
+        // 1. 顶点重打包: PathVertex(64B) → VertexGpuData(80B)
+        var verts80 = new RenderBufferManager.VertexGpuData[GlobalVertices.Length];
+        for (int i = 0; i < GlobalVertices.Length; i++)
+        {
+            verts80[i] = new RenderBufferManager.VertexGpuData
+            {
+                pos     = GlobalVertices[i].pos,
+                normal  = GlobalVertices[i].normal,
+                tangent = GlobalVertices[i].tangent,
+                uv      = GlobalVertices[i].uv,
+                color   = GlobalVertices[i].color
+            };
+        }
+        var vertPin = GCHandle.Alloc(verts80, GCHandleType.Pinned);
+        _nativePins.Add(vertPin);
+
+        // 2. 索引扁平化: PathTriangle[] → uint[]
+        var flatIndices = new uint[GlobalTriangles.Length * 3];
+        for (int i = 0; i < GlobalTriangles.Length; i++)
+        {
+            flatIndices[i * 3]     = GlobalTriangles[i].v0;
+            flatIndices[i * 3 + 1] = GlobalTriangles[i].v1;
+            flatIndices[i * 3 + 2] = GlobalTriangles[i].v2;
+        }
+        var idxPin = GCHandle.Alloc(flatIndices, GCHandleType.Pinned);
+        _nativePins.Add(idxPin);
+
+        // 3. 构建 VPT_MeshData[]（每个 BLAS 一个）
+        var meshDataArr = new NativeBridge.VPT_MeshData[BlasDescriptors.Length];
+        for (int i = 0; i < BlasDescriptors.Length; i++)
+        {
+            var desc = BlasDescriptors[i];
+            // 获取该 BLAS 的三角形数
+            int triCount = (i < BlasDescriptors.Length - 1)
+                ? (int)(BlasDescriptors[i + 1].triBase - desc.triBase)
+                : (GlobalTriangles.Length - (int)desc.triBase);
+            int vertCount = (i < BlasDescriptors.Length - 1)
+                ? (int)(BlasDescriptors[i + 1].vertBase - desc.vertBase)
+                : (GlobalVertices.Length - (int)desc.vertBase);
+
+            meshDataArr[i] = new NativeBridge.VPT_MeshData
+            {
+                vertices    = vertPin.AddrOfPinnedObject() + (int)desc.vertBase * 80,
+                vertexCount = (uint)vertCount,
+                indices     = idxPin.AddrOfPinnedObject() + (int)desc.triBase * 3 * 4,
+                indexCount  = (uint)(triCount * 3),
+                materialID  = 0  // materialID 由 instance 携带
+            };
+        }
+        var meshPin = GCHandle.Alloc(meshDataArr, GCHandleType.Pinned);
+        _nativePins.Add(meshPin);
+
+        // 4. 材质数据（PathMaterial 96B 直接兼容）
+        var matPin = GCHandle.Alloc(Materials, GCHandleType.Pinned);
+        _nativePins.Add(matPin);
+
+        // 5. 光源数据
+        IntPtr lightPtr = IntPtr.Zero;
+        int lightCount = 0;
+        if (LightManager.Instance != null && LightManager.Instance.Lights != null)
+        {
+            var lightPin = GCHandle.Alloc(LightManager.Instance.Lights, GCHandleType.Pinned);
+            _nativePins.Add(lightPin);
+            lightPtr = lightPin.AddrOfPinnedObject();
+            lightCount = LightManager.Instance.Lights.Length;
+        }
+
+        // 6. 实例数据转换: InstanceRecord → VPT_InstanceData
+        var vptInstances = new NativeBridge.VPT_InstanceData[InstanceTable.Length];
+        for (int i = 0; i < InstanceTable.Length; i++)
+        {
+            var rec = InstanceTable[i];
+            // 从 4x4 行主序 transform 提取 3x4 (前 3 行)
+            float[] transform3x4 = new float[12];
+            for (int row = 0; row < 3; row++)
+                for (int col = 0; col < 4; col++)
+                    transform3x4[row * 4 + col] = rec.transform[row * 4 + col];
+
+            vptInstances[i] = new NativeBridge.VPT_InstanceData
+            {
+                materialID = rec.materialID,
+                blasID     = rec.blasID,
+                transform  = transform3x4
+            };
+        }
+        // VPT_InstanceData 含 float[] 字段（ByValArray），GCHandle.Pinned 使用托管布局
+        // （float[] 存为 8B 引用而非 48B 内联），与 C++ sizeof=56B 步长不匹配。
+        // 改用 Marshal.AllocHGlobal + StructureToPtr 逐元素封送，确保 56B/元素。
+        int instSize = Marshal.SizeOf<NativeBridge.VPT_InstanceData>();
+        IntPtr instPtr = Marshal.AllocHGlobal(instSize * vptInstances.Length);
+        for (int i = 0; i < vptInstances.Length; i++)
+            Marshal.StructureToPtr(vptInstances[i], instPtr + instSize * i, false);
+        _nativeAllocs.Add(instPtr);
+
+        // 7. 组装 VPT_SceneUpdate 并推送
+        var sceneUpdate = new NativeBridge.VPT_SceneUpdate
+        {
+            meshes        = meshPin.AddrOfPinnedObject(),
+            meshCount     = meshDataArr.Length,
+            materials     = matPin.AddrOfPinnedObject(),
+            materialCount = Materials.Length,
+            lights        = lightPtr,
+            lightCount    = lightCount,
+            instances     = instPtr,
+            instanceCount = vptInstances.Length
+        };
+
+        NativeBridge.UpdateScene(ref sceneUpdate);
+        Debug.Log($"[ModelManager] PushToNative: {meshDataArr.Length} meshes, " +
+                  $"{Materials.Length} mats, {lightCount} lights, " +
+                  $"{vptInstances.Length} instances");
+    }
+
+    private void OnDestroyNative()
+    {
+        foreach (var h in _nativePins) if (h.IsAllocated) h.Free();
+        _nativePins.Clear();
+        foreach (var p in _nativeAllocs) Marshal.FreeHGlobal(p);
+        _nativeAllocs.Clear();
     }
 }
