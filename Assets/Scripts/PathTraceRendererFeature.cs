@@ -1,3 +1,4 @@
+using System;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
@@ -474,15 +475,19 @@ public class PathTraceRenderPass : ScriptableRenderPass
                     pad = 0f
                 };
 
-                // 阶段4：传入 4 个 Texture2DArray 原生指针供 native shader 采样
+                // Plan B: 两阶段 dispatch（消除 vkQueueWaitIdle）
+                // Phase 1: 准备 dispatch 参数（AccessTexture + UBO + DescriptorSet）
+                // Phase 2: IssuePluginEvent 将 dispatch 录制进 Unity 的命令缓冲
+                // 后续 Unity compute shader dispatch 自然在同一命令流中执行
                 TextureArrayManager texArr = mm.TextureArrays;
-                NativeBridge.DispatchPathTrace(_outputRT, _gbuffer0, _gbuffer1,
+                IntPtr callbackPtr = NativeBridge.PrepareDispatch(_outputRT, _gbuffer0, _gbuffer1,
                     texArr != null ? texArr.BaseColorArray : null,
                     texArr != null ? texArr.MetallicSmoothArray : null,
                     texArr != null ? texArr.NormalArray : null,
                     texArr != null ? texArr.EmissiveArray : null,
                     w, h, ref camData,
                     lightCount, Mathf.Max(1, _feature.samplesPerPixel));
+                cmd.IssuePluginEvent(callbackPtr, NativeBridge.EventPathTrace);
             }
             else
             {

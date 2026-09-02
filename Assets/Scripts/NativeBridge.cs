@@ -72,13 +72,34 @@ public static class NativeBridge
         int lightCount, int samplesPerPixel);
 
     /// <summary>执行 debug 深度图 dispatch（直接写入 Unity RenderTexture 的 VkImage）</summary>
-    /// <param name="nativeTexturePtr">RenderTexture 的原生纹理指针 (GetNativeTexturePtr())</param>
-    /// <param name="width">渲染宽度</param>
-    /// <param name="height">渲染高度</param>
-    /// <param name="cameraData">指向 VPT_CameraData 结构的指针</param>
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_DispatchDebugDepth(
         IntPtr nativeTexturePtr, int width, int height, IntPtr cameraData);
+
+    // ── Plan B: Two-phase dispatch (eliminates vkQueueWaitIdle) ──────────
+
+    /// <summary>渲染事件 ID：路径追踪 dispatch</summary>
+    public const int EventPathTrace = 1;
+
+    /// <summary>
+    /// Phase 1: 准备路径追踪 dispatch（在 IssuePluginEvent 之前调用）。
+    /// 访问 Unity 纹理、填充 UBO、更新描述符集，不提交命令缓冲。
+    /// 参数与 VPT_DispatchPathTrace 完全一致。
+    /// </summary>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_PrepareDispatch(
+        IntPtr outputPtr, IntPtr gbuf0Ptr, IntPtr gbuf1Ptr,
+        IntPtr baseColorPtr, IntPtr metallicRoughPtr, IntPtr normalPtr, IntPtr emissivePtr,
+        int width, int height,
+        IntPtr cameraData,
+        int lightCount, int samplesPerPixel);
+
+    /// <summary>
+    /// 获取渲染回调函数指针（供 CommandBuffer.IssuePluginEvent 使用）。
+    /// 返回的 IntPtr 指向 native 端 VPT_RenderCallback 函数。
+    /// </summary>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern IntPtr VPT_GetRenderCallback();
 
     // ── 便捷方法 ──────────────────────────────────────────
 
@@ -128,6 +149,45 @@ public static class NativeBridge
         {
             Marshal.FreeHGlobal(camPtr);
         }
+    }
+
+    /// <summary>
+    /// Plan B: 准备路径追踪 dispatch 并返回渲染回调指针。
+    /// 调用方随后使用 cmd.IssuePluginEvent(callbackPtr, EventPathTrace)
+    /// 将原生 dispatch 录制进 Unity 的命令缓冲，消除 vkQueueWaitIdle。
+    /// </summary>
+    /// <returns>渲染回调函数指针，传给 CommandBuffer.IssuePluginEvent</returns>
+    public static IntPtr PrepareDispatch(
+        UnityEngine.RenderTexture outputRT, UnityEngine.RenderTexture gbuf0RT, UnityEngine.RenderTexture gbuf1RT,
+        UnityEngine.Texture2DArray baseColorArr, UnityEngine.Texture2DArray metallicRoughArr,
+        UnityEngine.Texture2DArray normalArr, UnityEngine.Texture2DArray emissiveArr,
+        int width, int height, ref VPT_CameraData cameraData,
+        int lightCount, int samplesPerPixel)
+    {
+        IntPtr outputPtr = outputRT.GetNativeTexturePtr();
+        IntPtr gbuf0Ptr  = gbuf0RT.GetNativeTexturePtr();
+        IntPtr gbuf1Ptr  = gbuf1RT.GetNativeTexturePtr();
+
+        IntPtr baseColorPtr    = baseColorArr    != null ? baseColorArr.GetNativeTexturePtr()    : IntPtr.Zero;
+        IntPtr metallicRoughPtr = metallicRoughArr != null ? metallicRoughArr.GetNativeTexturePtr() : IntPtr.Zero;
+        IntPtr normalPtr       = normalArr       != null ? normalArr.GetNativeTexturePtr()       : IntPtr.Zero;
+        IntPtr emissivePtr     = emissiveArr     != null ? emissiveArr.GetNativeTexturePtr()     : IntPtr.Zero;
+
+        int camSize = Marshal.SizeOf<VPT_CameraData>();
+        IntPtr camPtr = Marshal.AllocHGlobal(camSize);
+        try
+        {
+            Marshal.StructureToPtr(cameraData, camPtr, false);
+            VPT_PrepareDispatch(outputPtr, gbuf0Ptr, gbuf1Ptr,
+                baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
+                width, height, camPtr, lightCount, samplesPerPixel);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(camPtr);
+        }
+
+        return VPT_GetRenderCallback();
     }
 
     /// <summary>

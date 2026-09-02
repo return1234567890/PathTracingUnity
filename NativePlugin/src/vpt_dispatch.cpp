@@ -920,6 +920,269 @@ void VPTDispatch::DispatchPathTrace(
 }
 
 // ═══════════════════════════════════════════════════════════
+//  Plan B: Two-phase dispatch (eliminates vkQueueWaitIdle)
+//  PrepareDispatch + RenderCallback replace DispatchPathTrace.
+// ═══════════════════════════════════════════════════════════
+
+// Pending dispatch state (set by PrepareDispatch, consumed by RenderCallback)
+static int32_t  s_PendingWidth   = 0;
+static int32_t  s_PendingHeight  = 0;
+static bool     s_DispatchPending = false;
+
+// ── Phase 1: PrepareDispatch ──────────────────────────────
+// Called from C# before cmd.IssuePluginEvent.
+// Accesses Unity textures (ObserveOnly), fills UBO, updates descriptor sets.
+// Does NOT create/submit command buffers — just prepares GPU state.
+
+void VPTDispatch::PrepareDispatch(
+    void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+    void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
+    int32_t width, int32_t height,
+    const VPT_CameraData& cameraData,
+    uint32_t lightCount, uint32_t samplesPerPixel)
+{
+    if (!s_PathReady || !outputPtr || !gbuf0Ptr || !gbuf1Ptr || width <= 0 || height <= 0)
+        return;
+
+    IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
+    VkDevice device = VPT_GetInstance().device;
+
+    // ── Access 3 Unity RenderTextures as VkImages (ObserveOnly: query handles only) ──
+    if (!EnsureImageView(vulkan, device, outputPtr, 0)) return;
+    if (!EnsureImageView(vulkan, device, gbuf0Ptr,  1)) return;
+    if (!EnsureImageView(vulkan, device, gbuf1Ptr,  2)) return;
+
+    // ── Access 4 Unity Texture2DArrays as VkImages (read) ──
+    if (baseColorPtr)    EnsureTextureArrayView(vulkan, device, baseColorPtr,    0);
+    if (metallicRoughPtr) EnsureTextureArrayView(vulkan, device, metallicRoughPtr, 1);
+    if (normalPtr)       EnsureTextureArrayView(vulkan, device, normalPtr,       2);
+    if (emissivePtr)     EnsureTextureArrayView(vulkan, device, emissivePtr,     3);
+
+    // ── Fill PathTraceCameraUBO from VPT_CameraData ──
+    PathTraceCameraUBO ubo{};
+    memcpy(ubo.viewInv,  cameraData.viewInv,  64);
+    memcpy(ubo.projInv,  cameraData.projInv,  64);
+    ubo.posFov[0] = cameraData.position[0];
+    ubo.posFov[1] = cameraData.position[1];
+    ubo.posFov[2] = cameraData.position[2];
+    ubo.posFov[3] = cameraData.fov;
+    ubo.jitterNearFar[0] = cameraData.jitter[0];
+    ubo.jitterNearFar[1] = cameraData.jitter[1];
+    ubo.jitterNearFar[2] = cameraData.nearPlane;
+    ubo.jitterNearFar[3] = cameraData.farPlane;
+    ubo.frameMaxDepth[0] = cameraData.frameCount;
+    ubo.frameMaxDepth[1] = cameraData.maxDepth;
+    ubo.frameMaxDepth[2] = 0;
+    ubo.frameMaxDepth[3] = 0;
+    ubo.ambientPad[0] = cameraData.ambientColor[0];
+    ubo.ambientPad[1] = cameraData.ambientColor[1];
+    ubo.ambientPad[2] = cameraData.ambientColor[2];
+    ubo.ambientPad[3] = cameraData.pad;
+    ubo.lightCount = lightCount;
+    ubo.samplesPerPixel = samplesPerPixel;
+    if (VPTScene::GetLightBuffer() == VK_NULL_HANDLE)
+        ubo.lightCount = 0;
+    memcpy(s_PathUBOMapped, &ubo, sizeof(PathTraceCameraUBO));
+
+    // ── Update descriptor set: TLAS + 3 images + UBO + 5 SSBOs + 4 tex arrays ──
+    VkAccelerationStructureKHR tlas = VPTScene::GetTLAS();
+    if (tlas == VK_NULL_HANDLE)
+    {
+        fprintf(stderr, "[VPT] PrepareDispatch: TLAS not ready\n");
+        return;
+    }
+
+    VkWriteDescriptorSetAccelerationStructureKHR asInfo{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+    asInfo.accelerationStructureCount = 1;
+    asInfo.pAccelerationStructures = &tlas;
+
+    VkDescriptorImageInfo imgInfos[3] = {};
+    for (int i = 0; i < 3; i++)
+    {
+        imgInfos[i].sampler     = VK_NULL_HANDLE;
+        imgInfos[i].imageView   = s_OutputViews[i].view;
+        imgInfos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+
+    VkDescriptorBufferInfo uboInfo{};
+    uboInfo.buffer = s_PathUBOBuffer;
+    uboInfo.offset = 0;
+    uboInfo.range  = sizeof(PathTraceCameraUBO);
+
+    VkBuffer ssboBuffers[5] = {
+        VPTScene::GetUnifiedVertexBuffer(),
+        VPTScene::GetUnifiedIndexBuffer(),
+        VPTScene::GetInstanceInfoBuffer(),
+        VPTScene::GetMaterialBuffer(),
+        VPTScene::GetLightBuffer()
+    };
+    VkDescriptorBufferInfo ssboInfos[5] = {};
+    for (int i = 0; i < 5; i++)
+    {
+        ssboInfos[i].buffer = ssboBuffers[i];
+        ssboInfos[i].offset = 0;
+        ssboInfos[i].range  = VK_WHOLE_SIZE;
+    }
+
+    VkDescriptorImageInfo texInfos[4] = {};
+    for (int i = 0; i < 4; i++)
+    {
+        texInfos[i].sampler     = s_TexSampler;
+        texInfos[i].imageView   = s_TexViews[i].view;
+        texInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
+    VkWriteDescriptorSet writes[14] = {};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].pNext = &asInfo;
+    writes[0].dstSet = s_PathDescSet;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+
+    for (int i = 0; i < 3; i++)
+    {
+        writes[1 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1 + i].dstSet = s_PathDescSet;
+        writes[1 + i].dstBinding = 1 + i;
+        writes[1 + i].descriptorCount = 1;
+        writes[1 + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[1 + i].pImageInfo = &imgInfos[i];
+    }
+
+    writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[4].dstSet = s_PathDescSet;
+    writes[4].dstBinding = 4;
+    writes[4].descriptorCount = 1;
+    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[4].pBufferInfo = &uboInfo;
+
+    for (int i = 0; i < 5; i++)
+    {
+        writes[5 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[5 + i].dstSet = s_PathDescSet;
+        writes[5 + i].dstBinding = 5 + i;
+        writes[5 + i].descriptorCount = 1;
+        writes[5 + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[5 + i].pBufferInfo = &ssboInfos[i];
+    }
+
+    for (int i = 0; i < 4; i++)
+    {
+        writes[10 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[10 + i].dstSet = s_PathDescSet;
+        writes[10 + i].dstBinding = 10 + i;
+        writes[10 + i].descriptorCount = 1;
+        writes[10 + i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[10 + i].pImageInfo = &texInfos[i];
+    }
+
+    vkUpdateDescriptorSets(device, 14, writes, 0, nullptr);
+
+    // ── Store pending dispatch dimensions for RenderCallback ──
+    s_PendingWidth    = width;
+    s_PendingHeight   = height;
+    s_DispatchPending = true;
+}
+
+// ── Phase 2: RenderCallback ────────────────────────────────
+// Called by Unity during command buffer execution via IssuePluginEvent.
+// Gets Unity's VkCommandBuffer via CommandRecordingState, records
+// barriers + dispatch into it. No vkQueueSubmit / vkQueueWaitIdle.
+
+void VPTDispatch::RenderCallback(int eventID)
+{
+    if (eventID != EVENT_PATHTRACE || !s_DispatchPending)
+        return;
+
+    s_DispatchPending = false;  // consume pending state
+
+    if (!s_PathReady)
+        return;
+
+    IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
+    if (!vulkan)
+        return;
+
+    // ── Get Unity's current VkCommandBuffer ──
+    // DontCare mode: we record into Unity's current command buffer, no direct queue submit.
+    // (Allow mode would disable access to Unity's command buffer, returning null)
+    UnityVulkanRecordingState recState{};
+    if (!vulkan->CommandRecordingState(&recState, kUnityVulkanGraphicsQueueAccess_DontCare))
+    {
+        fprintf(stderr, "[VPT] RenderCallback: CommandRecordingState failed\n");
+        return;
+    }
+
+    VkCommandBuffer cmd = recState.commandBuffer;
+    if (cmd == VK_NULL_HANDLE)
+    {
+        fprintf(stderr, "[VPT] RenderCallback: Unity command buffer is null\n");
+        return;
+    }
+
+    VkDevice device = VPT_GetInstance().device;
+
+    // ── Barrier 1: UBO host write → compute read + 3 images → GENERAL ──
+    VkBufferMemoryBarrier uboBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+    uboBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    uboBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    uboBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    uboBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    uboBarrier.buffer = s_PathUBOBuffer;
+    uboBarrier.offset = 0;
+    uboBarrier.size = sizeof(PathTraceCameraUBO);
+
+    VkImageMemoryBarrier imgBarriers[3] = {};
+    for (int i = 0; i < 3; i++)
+    {
+        imgBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        imgBarriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imgBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        imgBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        imgBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        imgBarriers[i].image = s_OutputViews[i].image;
+        imgBarriers[i].subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        imgBarriers[i].subresourceRange.baseMipLevel   = 0;
+        imgBarriers[i].subresourceRange.levelCount     = 1;
+        imgBarriers[i].subresourceRange.baseArrayLayer = 0;
+        imgBarriers[i].subresourceRange.layerCount     = 1;
+        imgBarriers[i].srcAccessMask = 0;
+        imgBarriers[i].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    }
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 1, &uboBarrier, 3, imgBarriers);
+
+    // ── Dispatch ──
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_PathPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        s_PathPipeLayout, 0, 1, &s_PathDescSet, 0, nullptr);
+
+    uint32_t gx = (s_PendingWidth + 7) / 8;
+    uint32_t gy = (s_PendingHeight + 7) / 8;
+    vkCmdDispatch(cmd, gx, gy, 1);
+
+    // ── Barrier 2: 3 images GENERAL → SHADER_READ_ONLY (for Unity compute reads) ──
+    for (int i = 0; i < 3; i++)
+    {
+        imgBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        imgBarriers[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imgBarriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        imgBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    }
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 3, imgBarriers);
+}
+
+bool VPTDispatch::IsDispatchPending() { return s_DispatchPending; }
+
+// ═══════════════════════════════════════════════════════════
 //  PathTrace pipeline cleanup
 // ═══════════════════════════════════════════════════════════
 

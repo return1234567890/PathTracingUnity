@@ -51,6 +51,24 @@ extern "C" {
     /// 返回: 1=支持 VK_KHR_ray_query, 0=不支持
     UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_QueryRayQuerySupport();
 
+    // ── Plan B: Two-phase dispatch (eliminates vkQueueWaitIdle) ──────────
+
+    /// Phase 1: 准备路径追踪 dispatch（在 IssuePluginEvent 之前调用）
+    /// 访问 Unity 纹理、填充 UBO、更新描述符集，不提交命令缓冲
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_PrepareDispatch(
+        void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+        void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
+        int32_t width, int32_t height,
+        const VPT_CameraData* cameraData,
+        int32_t lightCount, int32_t samplesPerPixel);
+
+    /// Phase 2: Unity 渲染事件回调（由 IssuePluginEvent 在命令缓冲执行期间触发）
+    /// 通过 CommandRecordingState 获取 Unity 的 VkCommandBuffer，录制 dispatch
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_RenderCallback(int32_t eventID);
+
+    /// 获取渲染回调函数指针（供 C# IssuePluginEvent 使用）
+    UNITY_INTERFACE_EXPORT void* UNITY_INTERFACE_API VPT_GetRenderCallback();
+
 #ifdef __cplusplus
 }
 #endif

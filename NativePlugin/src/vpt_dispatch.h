@@ -56,4 +56,30 @@ namespace VPTDispatch {
     /// Whether PathTrace pipeline is initialized
     bool IsPathTraceReady();
 
+    // ── Plan B: Two-phase dispatch (eliminates vkQueueWaitIdle) ─────────
+    // Phase 1 (PrepareDispatch): Called from C# before cmd.IssuePluginEvent.
+    //   Accesses Unity textures (ObserveOnly), fills UBO, updates descriptor sets.
+    //   Does NOT create/submit command buffers — just prepares GPU state.
+    // Phase 2 (RenderCallback): Called by Unity during command buffer execution
+    //   via IssuePluginEvent. Uses CommandRecordingState to get Unity's VkCommandBuffer,
+    //   records barriers + dispatch into it. No vkQueueSubmit / vkQueueWaitIdle.
+
+    /// Event ID for Unity rendering event (passed to IssuePluginEvent)
+    static constexpr int EVENT_PATHTRACE = 1;
+
+    /// Phase 1: Prepare dispatch parameters (call from C# before IssuePluginEvent)
+    void PrepareDispatch(
+        void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+        void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
+        int32_t width, int32_t height,
+        const VPT_CameraData& cameraData,
+        uint32_t lightCount, uint32_t samplesPerPixel);
+
+    /// Phase 2: Unity rendering event callback (called during cmd buffer execution)
+    /// Records path trace dispatch into Unity's VkCommandBuffer via CommandRecordingState
+    void RenderCallback(int eventID);
+
+    /// Whether a dispatch is pending (prepared but not yet executed by callback)
+    bool IsDispatchPending();
+
 } // namespace VPTDispatch

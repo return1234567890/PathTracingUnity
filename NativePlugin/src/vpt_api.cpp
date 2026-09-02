@@ -61,6 +61,23 @@ VPT_Initialize()
     VPT_SetInitialized(true);
     VPTDispatch::InitPipeline(inst.device, inst.physicalDevice);
     VPTDispatch::InitPathTracePipeline(inst.device, inst.physicalDevice);
+
+    // ── Configure rendering event for Plan B (CommandRecordingState) ──
+    // Event must be outside render pass (compute dispatch) and allow queue access
+    // so that CommandRecordingState returns a valid Unity VkCommandBuffer.
+    {
+        IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
+        UnityVulkanPluginEventConfig eventCfg{};
+        eventCfg.renderPassPrecondition = kUnityVulkanRenderPass_EnsureOutside;
+        // DontCare: plugin records into Unity's current VkCommandBuffer (no direct queue submit)
+        // Allow would disable access to Unity's command buffer, causing null return
+        eventCfg.graphicsQueueAccess    = kUnityVulkanGraphicsQueueAccess_DontCare;
+        eventCfg.flags                  = kUnityVulkanEventConfigFlag_EnsurePreviousFrameSubmission
+                                       | kUnityVulkanEventConfigFlag_ModifiesCommandBuffersState;
+        vulkan->ConfigureEvent(VPTDispatch::EVENT_PATHTRACE, &eventCfg);
+        fprintf(stderr, "[VPT] ConfigureEvent: PATHTRACE event configured (EnsureOutside + QueueAccess_DontCare).\n");
+    }
+
     fprintf(stderr, "[VPT] VPT_Initialize succeeded. Device ready for RayQuery.\n");
     fflush(stderr);
     return 0;
@@ -137,4 +154,41 @@ extern "C" UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API
 VPT_QueryRayQuerySupport()
 {
     return VPT_IsRayQuerySupported() ? 1 : 0;
+}
+
+// ── Plan B: Two-phase dispatch exports ─────────────────────
+
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_PrepareDispatch(
+    void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+    void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
+    int32_t width, int32_t height,
+    const VPT_CameraData* cameraData,
+    int32_t lightCount, int32_t samplesPerPixel)
+{
+    if (!VPT_IsInitialized() || !cameraData || !outputPtr || !gbuf0Ptr || !gbuf1Ptr)
+        return;
+    if (!VPTDispatch::IsPathTraceReady())
+        VPTDispatch::InitPathTracePipeline(VPT_GetInstance().device, VPT_GetInstance().physicalDevice);
+    if (!VPTDispatch::IsPathTraceReady())
+    {
+        fprintf(stderr, "[VPT] VPT_PrepareDispatch: pipeline not ready\n");
+        return;
+    }
+    VPTDispatch::PrepareDispatch(outputPtr, gbuf0Ptr, gbuf1Ptr,
+        baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
+        width, height, *cameraData,
+        (uint32_t)lightCount, (uint32_t)samplesPerPixel);
+}
+
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_RenderCallback(int32_t eventID)
+{
+    VPTDispatch::RenderCallback(eventID);
+}
+
+extern "C" UNITY_INTERFACE_EXPORT void* UNITY_INTERFACE_API
+VPT_GetRenderCallback()
+{
+    return (void*)&VPT_RenderCallback;
 }
