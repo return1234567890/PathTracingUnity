@@ -31,13 +31,14 @@ namespace VPTDispatch {
     // ── PathTrace dispatch (Phase 3) ──────────────────────
     // Multi-bounce PBR path tracing with NEE, GGX BSDF, Russian roulette.
     // Uses VK_KHR_ray_query for hardware-accelerated ray traversal.
-    // Writes to 3 Unity RenderTextures (output + 2 G-buffers) via imageStore.
+    // Writes to 5 Unity RenderTextures (output + G-buffers + 2 albedo) via imageStore.
 
-    /// Initialize PathTrace pipeline (14 bindings: TLAS + 3 images + UBO + 5 SSBOs + 4 tex arrays)
+    /// Initialize PathTrace pipeline (16 bindings: TLAS + 5 images + UBO + 5 SSBOs + 4 tex arrays)
     void InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu);
 
-    /// Dispatch PathTrace shader — writes to 3 Unity RenderTextures
+    /// Dispatch PathTrace shader — writes to 5 Unity RenderTextures
     /// outputPtr/gbuf0Ptr/gbuf1Ptr: Unity RenderTexture native pointers
+    /// diffuseAlbedoPtr/specularAlbedoPtr: DLSS RR albedo G-buffer RT pointers
     /// baseColorPtr/metallicRoughPtr/normalPtr/emissivePtr: Unity Texture2DArray native pointers
     /// width/height: render dimensions
     /// cameraData: camera parameters
@@ -45,6 +46,7 @@ namespace VPTDispatch {
     /// samplesPerPixel: SPP for the path tracing loop
     void DispatchPathTrace(
         void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+        void* diffuseAlbedoPtr, void* specularAlbedoPtr,
         void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
         int32_t width, int32_t height,
         const VPT_CameraData& cameraData,
@@ -70,6 +72,7 @@ namespace VPTDispatch {
     /// Phase 1: Prepare dispatch parameters (call from C# before IssuePluginEvent)
     void PrepareDispatch(
         void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+        void* diffuseAlbedoPtr, void* specularAlbedoPtr,
         void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
         int32_t width, int32_t height,
         const VPT_CameraData& cameraData,

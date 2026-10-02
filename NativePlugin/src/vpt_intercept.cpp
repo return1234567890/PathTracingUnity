@@ -96,7 +96,10 @@ static VkResult VKAPI_CALL InterceptedCreateDevice(
     fprintf(stderr, "[VPT] InterceptedCreateDevice: %u extensions (orig %u), RT features injected\n",
             (uint32_t)extensions.size(), pCreateInfo->enabledExtensionCount);
 
-    // 5. 调用真正的 vkCreateDevice
+    // 5. 调用真正的 vkCreateDevice（打印最终启用的扩展列表，供 NGX 扩展需求对比）
+    fprintf(stderr, "[VPT] Device extensions enabled (%u):\n", (uint32_t)extensions.size());
+    for (const char* ext : extensions)
+        fprintf(stderr, "[VPT]   %s\n", ext);
     return s_RealCreateDevice(physicalDevice, &createInfo, pAllocator, pDevice);
 }
 

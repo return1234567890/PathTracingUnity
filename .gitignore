@@ -24,9 +24,8 @@
 # Qoder IDE
 /.qoder/
 
-# VS Code (如需要可取消注释保留 settings.json)
-#.vscode/*
-#!.vscode/settings.json
+# VS Code
+.vscode/
 
 # ====================
 # Unity 构建产物
@@ -41,6 +40,19 @@
 *.ipa
 # 备份 DLL 不提交
 Assets/Plugins/x86_64/*.dll.old
+Assets/Plugins/x86_64/*.bak
+Assets/Plugins/x86_64/*.bak.meta
+Assets/Plugins/x86_64/*.dev.bak
+Assets/Plugins/x86_64/*.dev.bak.meta
+
+# NGX 运行时日志（NVSDK 生成）
+Assets/Plugins/x86_64/*.log
+Assets/Plugins/x86_64/*.log.meta
+
+# NGX 运行时 DLL 的 meta（DLL 本身被 *.dll 规则忽略，meta 孤立无意义）
+Assets/Plugins/x86_64/nvngx_dlss*.dll.meta
+Assets/Plugins/x86_64/nvngx_dlssd*.dll.meta
+Assets/Plugins/x86_64/nvsdk_ngx*.dll.meta
 
 # ====================
 # 操作系统文件
@@ -54,6 +66,10 @@ Desktop.ini
 # ====================
 NativePlugin/build/
 
+# 临时文件
+NativePlugin/ngx_demo_temp.zip
+sampleLight.diff
+
 # ====================
 # dep/tinybvh 构建产物
 # （该目录是独立 git 仓库，建议作为子模块管理）
@@ -63,3 +79,8 @@ dep/tinybvh/cache/
 dep/tinybvh/external/
 dep/tinybvh/*.bin
 dep/tinybvh/*.bvh
+
+# ====================
+# HDR 环境贴图（大文件，建议用 Git LFS 管理）
+# ====================
+Assets/Textures/hdr/*.hdr

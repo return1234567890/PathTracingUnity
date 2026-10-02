@@ -25,6 +25,9 @@ layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1, rgba16f)  writeonly uniform image2D outputImg;
 layout(set = 0, binding = 2, rgba32f)  writeonly uniform image2D gbufferPosDepth;
 layout(set = 0, binding = 3, rgba16f)  writeonly uniform image2D gbufferNormalRough;
+// DLSS RR albedo G-buffer（主光线首次命中的材质分解，输入分辨率）
+layout(set = 0, binding = 14, rgba16f) writeonly uniform image2D diffuseAlbedoImg;
+layout(set = 0, binding = 15, rgba16f) writeonly uniform image2D specularAlbedoImg;
 
 layout(set = 0, binding = 4, std140, row_major) uniform CameraUBO {
     mat4 viewInv;        // camera-to-world
@@ -650,6 +653,22 @@ HitInfo getHitInfo(rayQueryEXT rq)
 }
 
 // ══════════════════════════════════════════════════════════════
+//  DLSS RR specular albedo：预积分镜面反射率近似
+//  （Ray Tracing Gems Ch.32 / UE4 Karis 移动近似，a = roughness^2）
+//  返回 F0 * scale + bias 形式的环境 BRDF 积分近似
+// ══════════════════════════════════════════════════════════════
+
+vec3 EnvBRDFApprox(vec3 F0, float a, float NoV)
+{
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4( 1.0,  0.0425,  1.04, -0.04);
+    vec4 r = a * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    vec2 AB = vec2(-1.04, 1.04) * a004 + r.zw;
+    return F0 * AB.x + AB.y;
+}
+
+// ══════════════════════════════════════════════════════════════
 //  Main kernel
 // ══════════════════════════════════════════════════════════════
 
@@ -664,8 +683,10 @@ void main()
     uint w = uint(imgSize.x);
     uint h = uint(imgSize.y);
 
-    // ── 1. Camera ray generation ──
-    vec2 uv = (vec2(pixel) + 0.5) / vec2(w, h);
+    // ── 1. Camera ray generation (with subpixel jitter for DLSS) ──
+    // jitterNearFar.xy = Halton jitter in render pixel space [-0.5, 0.5]
+    vec2 jitter = cam.jitterNearFar.xy;
+    vec2 uv = (vec2(pixel) + 0.5 + jitter) / vec2(w, h);
     vec2 ndc = uv * 2.0 - 1.0;
     ndc.y = -ndc.y;
 
@@ -711,6 +732,11 @@ void main()
                 {
                     imageStore(gbufferPosDepth, ivec2(pixel.x, int(h) - 1 - int(pixel.y)), vec4(0.0));
                     imageStore(gbufferNormalRough, ivec2(pixel.x, int(h) - 1 - int(pixel.y)), vec4(0.0));
+                    // sky albedo 填 0.5（RR Guide 明确建议，常见错误是 sky 未清理）
+                    imageStore(diffuseAlbedoImg, ivec2(pixel.x, int(h) - 1 - int(pixel.y)),
+                               vec4(0.5, 0.5, 0.5, 1.0));
+                    imageStore(specularAlbedoImg, ivec2(pixel.x, int(h) - 1 - int(pixel.y)),
+                               vec4(0.5, 0.5, 0.5, 1.0));
                 }
                 radiance += throughput * ambient;
                 break;
@@ -772,10 +798,18 @@ void main()
             // G-buffer output (first hit, first sample)
             if (depth == 0 && s == 0u)
             {
-                imageStore(gbufferPosDepth, ivec2(pixel.x, int(h) - 1 - int(pixel.y)),
-                           vec4(P, hit.hitT));
-                imageStore(gbufferNormalRough, ivec2(pixel.x, int(h) - 1 - int(pixel.y)),
-                           vec4(Ngeo, mat.roughness));
+                ivec2 storeCoord = ivec2(pixel.x, int(h) - 1 - int(pixel.y));
+                imageStore(gbufferPosDepth, storeCoord, vec4(P, hit.hitT));
+                imageStore(gbufferNormalRough, storeCoord, vec4(Ngeo, mat.roughness));
+                // DLSS RR albedo 分解（RR Guide 3.4）：
+                //   Diffuse  = albedo * (1 - metallic)
+                //   Specular = EnvBRDFApprox(F0, roughness^2, NdotV)，N 为扰动后 shading normal
+                float ndv = max(dot(N, -rayDir), 0.0);
+                vec3 F0 = mix(vec3(0.04), mat.albedo.rgb, mat.metallic);
+                imageStore(diffuseAlbedoImg, storeCoord,
+                           vec4(mat.albedo.rgb * (1.0 - mat.metallic), 1.0));
+                imageStore(specularAlbedoImg, storeCoord,
+                           vec4(EnvBRDFApprox(F0, mat.roughness * mat.roughness, ndv), 1.0));
             }
 
             // ── Emissive contribution ──
@@ -791,9 +825,16 @@ void main()
             vec3 T_world = T;
             vec3 B_world = cross(N, T_world) * bitangentSign;
 
-            // ── NEE: random single light sampling ──
-            if (lightCount > 0u)
+            // ── NEE: one-sample MIS（灯 50% / 常数环境 50%）──
+            // 注入逐帧蒙特卡洛噪声使 RR 恢复强累积，消除亮区抖动（根因见
+            // DLSS_RR亮区抖动分析.md）。环境=常数 ambient（无环境贴图的退化；
+            // 有贴图后替换为 importance 采样）。硬币本身在亮区制造「直接光/环境」
+            // 双峰帧间方差 → RR 强累积 → 抖动被时域平均压平。
+            bool sampleLights = (rand(seed) <= 0.5);
+
+            if (sampleLights && lightCount > 0u)
             {
+                // ── 灯采样分支（原逻辑，加 MIS 权重 ×2）──
                 uint li = uint(rand(seed) * float(lightCount)) % lightCount;
                 VPT_Light L = lights[li];
                 vec3 toL; float dist; vec3 Lcolor;
@@ -822,8 +863,51 @@ void main()
                     vec3 shadowOrigin = P + Ngeo * EPS_OFFSET;
                     // ★ Use traceShadowTransmission for transparent-aware shadows
                     vec3 shadowTrans = traceShadowTransmission(shadowOrigin, toL, dist);
+                    // ×lightCount 补偿单灯选取；×2.0 = MIS 权重（1/0.5）
                     radiance += throughput * bsdf_nee * NdotL * Lcolor * shadowTrans
-                             * float(lightCount);
+                             * float(lightCount) * 2.0;
+                }
+            }
+            else
+            {
+                // ── 常数环境光分支：uniform 半球采样方向 ──
+                // pdf = 1/(2π)；MIS 权重 1/0.5=2 → 总乘子 2×2π=4π
+                vec3 envT, envB;
+                createONB(N, envT, envB);
+                float u1 = rand(seed);
+                float u2 = rand(seed);
+                float cosT = u1;                         // [0,1] → uniform 半球
+                float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+                float phi = 2.0 * PI * u2;
+                vec3 toL = normalize(sinT * cos(phi) * envT
+                                  + sinT * sin(phi) * envB
+                                  + cosT * N);
+                float NdotL = dot(N, toL);
+
+                bool lightValid = false;
+                vec3 bsdf_nee = vec3(0.0);
+
+                if (isTransparent && NdotL <= 0.0)
+                {
+                    float absNdotL = abs(NdotL);
+                    bsdf_nee = btdfEval(mat, N, T_world, B_world, V, toL, NdotV, absNdotL);
+                    lightValid = (dot(N_flat, toL) < 0.0 || NdotL > 0.0);
+                    NdotL = absNdotL;
+                }
+                else if (NdotL > 0.0)
+                {
+                    bsdf_nee = evaluateBSDF(mat, N, toL, V, NdotL, NdotV);
+                    lightValid = (dot(N_flat, toL) > 0.0);
+                }
+
+                if (lightValid)
+                {
+                    vec3 shadowOrigin = P + Ngeo * EPS_OFFSET;
+                    // 环境在无穷远；遮挡=环境遮蔽（AO）/半影
+                    vec3 shadowTrans = traceShadowTransmission(shadowOrigin, toL, 1e34);
+                    // ×4π = MIS 权重 2 × 1/pdf(2π)
+                    radiance += throughput * bsdf_nee * NdotL * ambient * shadowTrans
+                             * 4.0 * PI;
                 }
             }
 

@@ -8,6 +8,7 @@
 #include "vpt_internal.h"
 #include "vpt_scene.h"
 #include "vpt_dispatch.h"
+#include "vpt_dlss.h"
 
 #include <cstdio>
 
@@ -75,7 +76,9 @@ VPT_Initialize()
         eventCfg.flags                  = kUnityVulkanEventConfigFlag_EnsurePreviousFrameSubmission
                                        | kUnityVulkanEventConfigFlag_ModifiesCommandBuffersState;
         vulkan->ConfigureEvent(VPTDispatch::EVENT_PATHTRACE, &eventCfg);
-        fprintf(stderr, "[VPT] ConfigureEvent: PATHTRACE event configured (EnsureOutside + QueueAccess_DontCare).\n");
+        // DLSS event uses the same config
+        vulkan->ConfigureEvent(EVENT_DLSS, &eventCfg);
+        fprintf(stderr, "[VPT] ConfigureEvent: PATHTRACE + DLSS events configured (EnsureOutside + QueueAccess_DontCare).\n");
     }
 
     fprintf(stderr, "[VPT] VPT_Initialize succeeded. Device ready for RayQuery.\n");
@@ -92,6 +95,7 @@ VPT_Destroy()
 
     VPTDispatch::DestroyPathTracePipeline(VPT_GetInstance().device);
     VPTDispatch::DestroyPipeline(VPT_GetInstance().device);
+    VPT_DLSS_Destroy_Internal();
     VPTScene::DestroyResources();
     VPT_SetInitialized(false);
     fprintf(stderr, "[VPT] VPT_Destroy: resources released.\n");
@@ -111,12 +115,14 @@ VPT_UpdateScene(const VPT_SceneUpdate* sceneUpdate)
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 VPT_DispatchPathTrace(
     void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
     void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
     int32_t width, int32_t height,
     const VPT_CameraData* cameraData,
     int32_t lightCount, int32_t samplesPerPixel)
 {
-    if (!VPT_IsInitialized() || !cameraData || !outputPtr || !gbuf0Ptr || !gbuf1Ptr)
+    if (!VPT_IsInitialized() || !cameraData || !outputPtr || !gbuf0Ptr || !gbuf1Ptr
+        || !diffuseAlbedoPtr || !specularAlbedoPtr)
         return;
     if (!VPTDispatch::IsPathTraceReady())
         VPTDispatch::InitPathTracePipeline(VPT_GetInstance().device, VPT_GetInstance().physicalDevice);
@@ -126,6 +132,7 @@ VPT_DispatchPathTrace(
         return;
     }
     VPTDispatch::DispatchPathTrace(outputPtr, gbuf0Ptr, gbuf1Ptr,
+        diffuseAlbedoPtr, specularAlbedoPtr,
         baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
         width, height, *cameraData,
         (uint32_t)lightCount, (uint32_t)samplesPerPixel);
@@ -161,12 +168,14 @@ VPT_QueryRayQuerySupport()
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 VPT_PrepareDispatch(
     void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
     void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
     int32_t width, int32_t height,
     const VPT_CameraData* cameraData,
     int32_t lightCount, int32_t samplesPerPixel)
 {
-    if (!VPT_IsInitialized() || !cameraData || !outputPtr || !gbuf0Ptr || !gbuf1Ptr)
+    if (!VPT_IsInitialized() || !cameraData || !outputPtr || !gbuf0Ptr || !gbuf1Ptr
+        || !diffuseAlbedoPtr || !specularAlbedoPtr)
         return;
     if (!VPTDispatch::IsPathTraceReady())
         VPTDispatch::InitPathTracePipeline(VPT_GetInstance().device, VPT_GetInstance().physicalDevice);
@@ -176,6 +185,7 @@ VPT_PrepareDispatch(
         return;
     }
     VPTDispatch::PrepareDispatch(outputPtr, gbuf0Ptr, gbuf1Ptr,
+        diffuseAlbedoPtr, specularAlbedoPtr,
         baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
         width, height, *cameraData,
         (uint32_t)lightCount, (uint32_t)samplesPerPixel);
@@ -184,6 +194,12 @@ VPT_PrepareDispatch(
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 VPT_RenderCallback(int32_t eventID)
 {
+    // 通过 eventID 区分路径追踪 vs DLSS dispatch
+    if (eventID == EVENT_DLSS)
+    {
+        VPT_DLSS_RenderCallback();
+        return;
+    }
     VPTDispatch::RenderCallback(eventID);
 }
 
@@ -191,4 +207,46 @@ extern "C" UNITY_INTERFACE_EXPORT void* UNITY_INTERFACE_API
 VPT_GetRenderCallback()
 {
     return (void*)&VPT_RenderCallback;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  DLSS NGX 导出接口（阶段3 SR + 阶段4 RR）
+// ══════════════════════════════════════════════════════════════
+
+extern "C" UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API
+VPT_DLSS_Init(int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
+              int32_t qualityMode, int32_t mode)
+{
+    return VPT_DLSS_Init_Internal(renderW, renderH, outputW, outputH, qualityMode, mode);
+}
+
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_DLSS_Destroy()
+{
+    VPT_DLSS_Destroy_Internal();
+}
+
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_DLSS_PrepareDispatch(
+    void* colorLowPtr, void* motionLowPtr, void* depthLowPtr, void* outputHighPtr,
+    int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
+    float jitterX, float jitterY, int32_t reset)
+{
+    VPT_DLSS_PrepareDispatch_Internal(colorLowPtr, motionLowPtr, depthLowPtr, outputHighPtr,
+        renderW, renderH, outputW, outputH, jitterX, jitterY, reset);
+}
+
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_DLSS_PrepareRRDispatch(
+    void* colorLowPtr, void* motionLowPtr, void* linearDepthPtr, void* outputHighPtr,
+    void* normalRoughPtr,
+    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+    int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
+    float jitterX, float jitterY, int32_t reset,
+    const float* viewMatrix, const float* projMatrix)
+{
+    VPT_DLSS_PrepareRRDispatch_Internal(colorLowPtr, motionLowPtr, linearDepthPtr, outputHighPtr,
+        normalRoughPtr, diffuseAlbedoPtr, specularAlbedoPtr,
+        renderW, renderH, outputW, outputH,
+        jitterX, jitterY, reset, viewMatrix, projMatrix);
 }

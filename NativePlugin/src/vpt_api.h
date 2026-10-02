@@ -26,6 +26,7 @@ extern "C" {
 
     /// 执行路径追踪 dispatch（阶段4）
     /// outputPtr/gbuf0Ptr/gbuf1Ptr: Unity RenderTexture 的原生指针（输出/G-Buffer）
+    /// diffuseAlbedoPtr/specularAlbedoPtr: DLSS RR albedo G-buffer RT 指针
     /// baseColorPtr/metallicRoughPtr/normalPtr/emissivePtr: Unity Texture2DArray 的原生指针
     /// width/height: 渲染尺寸
     /// cameraData: 指向 VPT_CameraData 结构的指针
@@ -33,6 +34,7 @@ extern "C" {
     /// samplesPerPixel: 每帧采样数（SPP）
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_DispatchPathTrace(
         void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+        void* diffuseAlbedoPtr, void* specularAlbedoPtr,
         void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
         int32_t width, int32_t height,
         const VPT_CameraData* cameraData,
@@ -57,6 +59,7 @@ extern "C" {
     /// 访问 Unity 纹理、填充 UBO、更新描述符集，不提交命令缓冲
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_PrepareDispatch(
         void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+        void* diffuseAlbedoPtr, void* specularAlbedoPtr,
         void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
         int32_t width, int32_t height,
         const VPT_CameraData* cameraData,
@@ -68,6 +71,35 @@ extern "C" {
 
     /// 获取渲染回调函数指针（供 C# IssuePluginEvent 使用）
     UNITY_INTERFACE_EXPORT void* UNITY_INTERFACE_API VPT_GetRenderCallback();
+
+    // ── DLSS NGX 接口（阶段3 SR + 阶段4 RR） ──────────────
+
+    /// 初始化 NGX DLSS feature（SR 或 RR）
+    /// renderW/H: 渲染尺寸; outputW/H: 输出尺寸; qualityMode: 0=Q 1=B 2=P 3=UP
+    /// mode: 0=SR(超分), 1=RR(光线重建)
+    /// 返回: 0=成功, -1=不可用, -2=RR不支持
+    UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_DLSS_Init(
+        int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
+        int32_t qualityMode, int32_t mode);
+
+    /// 销毁 NGX DLSS feature
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_DLSS_Destroy();
+
+    /// Phase 1: 准备 DLSS SR Evaluate dispatch
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_DLSS_PrepareDispatch(
+        void* colorLowPtr, void* motionLowPtr, void* depthLowPtr, void* outputHighPtr,
+        int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
+        float jitterX, float jitterY, int32_t reset);
+
+    /// Phase 1: 准备 DLSS RR Evaluate dispatch
+    /// 额外绑定 normalRoughPtr (GBuffer1) + 线性深度 + albedo G-buffer + 视图/投影矩阵
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_DLSS_PrepareRRDispatch(
+        void* colorLowPtr, void* motionLowPtr, void* linearDepthPtr, void* outputHighPtr,
+        void* normalRoughPtr,
+        void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+        int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
+        float jitterX, float jitterY, int32_t reset,
+        const float* viewMatrix, const float* projMatrix);
 
 #ifdef __cplusplus
 }

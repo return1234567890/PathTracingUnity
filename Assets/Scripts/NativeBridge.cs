@@ -54,6 +54,8 @@ public static class NativeBridge
     /// <param name="outputPtr">输出 RT 原生指针</param>
     /// <param name="gbuf0Ptr">G-Buffer0 (pos+depth) RT 原生指针</param>
     /// <param name="gbuf1Ptr">G-Buffer1 (normal+rough) RT 原生指针</param>
+    /// <param name="diffuseAlbedoPtr">Diffuse Albedo RT 原生指针（RR 材质分解）</param>
+    /// <param name="specularAlbedoPtr">Specular Albedo RT 原生指针（RR 材质分解）</param>
     /// <param name="baseColorPtr">BaseColor Texture2DArray 原生指针</param>
     /// <param name="metallicRoughPtr">MetallicSmooth Texture2DArray 原生指针</param>
     /// <param name="normalPtr">Normal Texture2DArray 原生指针</param>
@@ -66,6 +68,7 @@ public static class NativeBridge
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_DispatchPathTrace(
         IntPtr outputPtr, IntPtr gbuf0Ptr, IntPtr gbuf1Ptr,
+        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr,
         IntPtr baseColorPtr, IntPtr metallicRoughPtr, IntPtr normalPtr, IntPtr emissivePtr,
         int width, int height,
         IntPtr cameraData,
@@ -81,6 +84,9 @@ public static class NativeBridge
     /// <summary>渲染事件 ID：路径追踪 dispatch</summary>
     public const int EventPathTrace = 1;
 
+    /// <summary>渲染事件 ID：DLSS Evaluate dispatch</summary>
+    public const int EventDlss = 2;
+
     /// <summary>
     /// Phase 1: 准备路径追踪 dispatch（在 IssuePluginEvent 之前调用）。
     /// 访问 Unity 纹理、填充 UBO、更新描述符集，不提交命令缓冲。
@@ -89,6 +95,7 @@ public static class NativeBridge
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_PrepareDispatch(
         IntPtr outputPtr, IntPtr gbuf0Ptr, IntPtr gbuf1Ptr,
+        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr,
         IntPtr baseColorPtr, IntPtr metallicRoughPtr, IntPtr normalPtr, IntPtr emissivePtr,
         int width, int height,
         IntPtr cameraData,
@@ -104,13 +111,15 @@ public static class NativeBridge
     // ── 便捷方法 ──────────────────────────────────────────
 
     /// <summary>
-    /// 执行路径追踪 dispatch，直接写入 3 张 Unity RenderTexture 的 VkImage。
+    /// 执行路径追踪 dispatch，直接写入 5 张 Unity RenderTexture 的 VkImage。
     /// 同时绑定 4 张 Texture2DArray 供 shader 采样。
     /// 无 CPU 回读 — compute shader 通过 imageStore 直接写入 GPU 显存。
     /// </summary>
     /// <param name="outputRT">输出 RT（ARGBHalf）</param>
     /// <param name="gbuf0RT">G-Buffer0 RT（ARGBFloat, pos+depth）</param>
     /// <param name="gbuf1RT">G-Buffer1 RT（ARGBHalf, normal+rough）</param>
+    /// <param name="diffuseAlbedoRT">Diffuse Albedo RT（ARGBHalf, albedo*(1-metallic)）</param>
+    /// <param name="specularAlbedoRT">Specular Albedo RT（ARGBHalf, EnvBRDFApprox）</param>
     /// <param name="baseColorArr">BaseColor Texture2DArray</param>
     /// <param name="metallicRoughArr">MetallicSmooth Texture2DArray</param>
     /// <param name="normalArr">Normal Texture2DArray</param>
@@ -122,6 +131,7 @@ public static class NativeBridge
     /// <param name="samplesPerPixel">每帧采样数（SPP）</param>
     public static void DispatchPathTrace(
         UnityEngine.RenderTexture outputRT, UnityEngine.RenderTexture gbuf0RT, UnityEngine.RenderTexture gbuf1RT,
+        UnityEngine.RenderTexture diffuseAlbedoRT, UnityEngine.RenderTexture specularAlbedoRT,
         UnityEngine.Texture2DArray baseColorArr, UnityEngine.Texture2DArray metallicRoughArr,
         UnityEngine.Texture2DArray normalArr, UnityEngine.Texture2DArray emissiveArr,
         int width, int height, ref VPT_CameraData cameraData,
@@ -130,6 +140,8 @@ public static class NativeBridge
         IntPtr outputPtr = outputRT.GetNativeTexturePtr();
         IntPtr gbuf0Ptr  = gbuf0RT.GetNativeTexturePtr();
         IntPtr gbuf1Ptr  = gbuf1RT.GetNativeTexturePtr();
+        IntPtr diffuseAlbedoPtr  = diffuseAlbedoRT.GetNativeTexturePtr();
+        IntPtr specularAlbedoPtr = specularAlbedoRT.GetNativeTexturePtr();
 
         IntPtr baseColorPtr    = baseColorArr    != null ? baseColorArr.GetNativeTexturePtr()    : IntPtr.Zero;
         IntPtr metallicRoughPtr = metallicRoughArr != null ? metallicRoughArr.GetNativeTexturePtr() : IntPtr.Zero;
@@ -142,6 +154,7 @@ public static class NativeBridge
         {
             Marshal.StructureToPtr(cameraData, camPtr, false);
             VPT_DispatchPathTrace(outputPtr, gbuf0Ptr, gbuf1Ptr,
+                diffuseAlbedoPtr, specularAlbedoPtr,
                 baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
                 width, height, camPtr, lightCount, samplesPerPixel);
         }
@@ -159,6 +172,7 @@ public static class NativeBridge
     /// <returns>渲染回调函数指针，传给 CommandBuffer.IssuePluginEvent</returns>
     public static IntPtr PrepareDispatch(
         UnityEngine.RenderTexture outputRT, UnityEngine.RenderTexture gbuf0RT, UnityEngine.RenderTexture gbuf1RT,
+        UnityEngine.RenderTexture diffuseAlbedoRT, UnityEngine.RenderTexture specularAlbedoRT,
         UnityEngine.Texture2DArray baseColorArr, UnityEngine.Texture2DArray metallicRoughArr,
         UnityEngine.Texture2DArray normalArr, UnityEngine.Texture2DArray emissiveArr,
         int width, int height, ref VPT_CameraData cameraData,
@@ -167,6 +181,8 @@ public static class NativeBridge
         IntPtr outputPtr = outputRT.GetNativeTexturePtr();
         IntPtr gbuf0Ptr  = gbuf0RT.GetNativeTexturePtr();
         IntPtr gbuf1Ptr  = gbuf1RT.GetNativeTexturePtr();
+        IntPtr diffuseAlbedoPtr  = diffuseAlbedoRT.GetNativeTexturePtr();
+        IntPtr specularAlbedoPtr = specularAlbedoRT.GetNativeTexturePtr();
 
         IntPtr baseColorPtr    = baseColorArr    != null ? baseColorArr.GetNativeTexturePtr()    : IntPtr.Zero;
         IntPtr metallicRoughPtr = metallicRoughArr != null ? metallicRoughArr.GetNativeTexturePtr() : IntPtr.Zero;
@@ -179,12 +195,127 @@ public static class NativeBridge
         {
             Marshal.StructureToPtr(cameraData, camPtr, false);
             VPT_PrepareDispatch(outputPtr, gbuf0Ptr, gbuf1Ptr,
+                diffuseAlbedoPtr, specularAlbedoPtr,
                 baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
                 width, height, camPtr, lightCount, samplesPerPixel);
         }
         finally
         {
             Marshal.FreeHGlobal(camPtr);
+        }
+
+        return VPT_GetRenderCallback();
+    }
+
+    // ── DLSS 模式枚举（与 native VPT_DLSS_MODE_* 对齐） ──
+    public const int DLSS_MODE_SR = 0; // Super Resolution
+    public const int DLSS_MODE_RR = 1; // Ray Reconstruction
+
+    // ── DLSS NGX 接口 ──────────────────────────────────────
+
+    /// <summary>初始化 NGX DLSS feature（SR 或 RR）</summary>
+    /// <param name="renderW">渲染（低分）宽度</param>
+    /// <param name="renderH">渲染（低分）高度</param>
+    /// <param name="outputW">输出（全分）宽度</param>
+    /// <param name="outputH">输出（全分）高度</param>
+    /// <param name="qualityMode">0=Quality 1=Balanced 2=Performance 3=UltraPerf</param>
+    /// <param name="mode">0=SR(超分), 1=RR(光线重建)</param>
+    /// <returns>0=成功, -1=NGX不可用, -2=RR不支持(可降级SR)</returns>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern int VPT_DLSS_Init(
+        int renderW, int renderH, int outputW, int outputH,
+        int qualityMode, int mode);
+
+    /// <summary>销毁 NGX DLSS feature</summary>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_DLSS_Destroy();
+
+    /// <summary>
+    /// Phase 1: 准备 DLSS SR Evaluate dispatch。
+    /// 访问 Unity 纹理、包装 NGX 资源、填充参数，不提交命令缓冲。
+    /// </summary>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_DLSS_PrepareDispatch(
+        IntPtr colorLowPtr, IntPtr motionLowPtr, IntPtr depthLowPtr, IntPtr outputHighPtr,
+        int renderW, int renderH, int outputW, int outputH,
+        float jitterX, float jitterY, int reset);
+
+    /// <summary>
+    /// Phase 1: 准备 DLSS RR Evaluate dispatch。
+    /// 额外绑定 normalRough (GBuffer1) + 线性深度 + albedo G-buffer + 视图/投影矩阵。
+    /// </summary>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_DLSS_PrepareRRDispatch(
+        IntPtr colorLowPtr, IntPtr motionLowPtr, IntPtr linearDepthPtr, IntPtr outputHighPtr,
+        IntPtr normalRoughPtr,
+        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr,
+        int renderW, int renderH, int outputW, int outputH,
+        float jitterX, float jitterY, int reset,
+        IntPtr viewMatrix, IntPtr projMatrix);
+
+    /// <summary>
+    /// Phase 2: DLSS 渲染回调（由 IssuePluginEvent 在命令缓冲执行期间触发）。
+    /// 复用与路径追踪相同的 VPT_RenderCallback，通过 eventID 区分。
+    /// </summary>
+
+    /// <summary>
+    /// 便捷方法：准备 DLSS SR dispatch 并返回回调指针。
+    /// 调用方随后使用 cmd.IssuePluginEvent(ptr, EventDlss)。
+    /// </summary>
+    public static IntPtr PrepareDLSSDispatch(
+        UnityEngine.RenderTexture colorLowRT, UnityEngine.RenderTexture motionLowRT,
+        UnityEngine.RenderTexture depthLowRT, UnityEngine.RenderTexture outputHighRT,
+        int renderW, int renderH, int outputW, int outputH,
+        float jitterX, float jitterY, int reset)
+    {
+        IntPtr colorPtr  = colorLowRT.GetNativeTexturePtr();
+        IntPtr motionPtr = motionLowRT.GetNativeTexturePtr();
+        IntPtr depthPtr  = depthLowRT.GetNativeTexturePtr();
+        IntPtr outputPtr = outputHighRT.GetNativeTexturePtr();
+
+        VPT_DLSS_PrepareDispatch(colorPtr, motionPtr, depthPtr, outputPtr,
+            renderW, renderH, outputW, outputH, jitterX, jitterY, reset);
+
+        return VPT_GetRenderCallback();
+    }
+
+    /// <summary>
+    /// 便捷方法：准备 DLSS RR dispatch 并返回回调指针。
+    /// 额外传入 normalRough RT（GBuffer1）、线性深度 RT、albedo RT、视图与投影矩阵。
+    /// 矩阵为 float[16] 行主序（不含 jitter），通过 GCHandle.Pinned 传入指针。
+    /// </summary>
+    public static IntPtr PrepareDLSSRRDispatch(
+        UnityEngine.RenderTexture colorLowRT, UnityEngine.RenderTexture motionLowRT,
+        UnityEngine.RenderTexture linearDepthRT, UnityEngine.RenderTexture outputHighRT,
+        UnityEngine.RenderTexture normalRoughRT,
+        UnityEngine.RenderTexture diffuseAlbedoRT, UnityEngine.RenderTexture specularAlbedoRT,
+        int renderW, int renderH, int outputW, int outputH,
+        float jitterX, float jitterY, int reset,
+        float[] viewMatrix, float[] projMatrix)
+    {
+        IntPtr colorPtr  = colorLowRT.GetNativeTexturePtr();
+        IntPtr motionPtr = motionLowRT.GetNativeTexturePtr();
+        IntPtr depthPtr  = linearDepthRT.GetNativeTexturePtr();
+        IntPtr outputPtr = outputHighRT.GetNativeTexturePtr();
+        IntPtr normalPtr = normalRoughRT.GetNativeTexturePtr();
+        IntPtr diffuseAlbedoPtr = diffuseAlbedoRT.GetNativeTexturePtr();
+        IntPtr specularAlbedoPtr = specularAlbedoRT.GetNativeTexturePtr();
+
+        // 将 float[16] 矩阵 pin 到非托管内存
+        GCHandle viewPin = GCHandle.Alloc(viewMatrix, GCHandleType.Pinned);
+        GCHandle projPin = GCHandle.Alloc(projMatrix, GCHandleType.Pinned);
+        try
+        {
+            VPT_DLSS_PrepareRRDispatch(colorPtr, motionPtr, depthPtr, outputPtr,
+                normalPtr, diffuseAlbedoPtr, specularAlbedoPtr,
+                renderW, renderH, outputW, outputH,
+                jitterX, jitterY, reset,
+                viewPin.AddrOfPinnedObject(), projPin.AddrOfPinnedObject());
+        }
+        finally
+        {
+            viewPin.Free();
+            projPin.Free();
         }
 
         return VPT_GetRenderCallback();

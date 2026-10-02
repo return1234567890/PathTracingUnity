@@ -50,12 +50,13 @@ static VkDeviceMemory s_PathUBOMemory  = VK_NULL_HANDLE;
 static void*          s_PathUBOMapped  = nullptr;
 static bool s_PathReady = false;
 
-// Cached ImageViews for 3 output textures (recreated when VkImage changes)
+// Cached ImageViews for 5 output textures (recreated when VkImage changes)
 struct ImageViewCache {
     VkImageView view = VK_NULL_HANDLE;
     VkImage     image = VK_NULL_HANDLE;
 };
-static ImageViewCache s_OutputViews[3]; // [0]=output, [1]=gbuffer0, [2]=gbuffer1
+// [0]=output, [1]=gbuffer0, [2]=gbuffer1, [3]=diffuseAlbedo(RR), [4]=specularAlbedo(RR)
+static ImageViewCache s_OutputViews[5];
 
 // Cached ImageViews for 4 texture arrays (Phase 4)
 static ImageViewCache s_TexViews[4]; // [0]=baseColor, [1]=metallicRough, [2]=normal, [3]=emissive
@@ -487,8 +488,8 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
 {
     if (s_PathReady) return;
 
-    // 1. Descriptor set layout: 14 bindings (10 + 4 texture arrays)
-    VkDescriptorSetLayoutBinding bindings[14] = {};
+    // 1. Descriptor set layout: 16 bindings (10 + 2 albedo images + 4 texture arrays)
+    VkDescriptorSetLayoutBinding bindings[16] = {};
     bindings[0].binding = 0; bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; bindings[0].descriptorCount = 1; bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     bindings[1].binding = 1; bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bindings[1].descriptorCount = 1; bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     bindings[2].binding = 2; bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bindings[2].descriptorCount = 1; bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -503,9 +504,12 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
     bindings[11].binding = 11; bindings[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; bindings[11].descriptorCount = 1; bindings[11].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     bindings[12].binding = 12; bindings[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; bindings[12].descriptorCount = 1; bindings[12].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     bindings[13].binding = 13; bindings[13].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; bindings[13].descriptorCount = 1; bindings[13].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    // DLSS RR albedo G-buffers（pathtrace.glsl binding 14/15，rgba16f）
+    bindings[14].binding = 14; bindings[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bindings[14].descriptorCount = 1; bindings[14].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[15].binding = 15; bindings[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bindings[15].descriptorCount = 1; bindings[15].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo dslCI{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dslCI.bindingCount = 14;
+    dslCI.bindingCount = 16;
     dslCI.pBindings    = bindings;
     VkResult res = vkCreateDescriptorSetLayout(device, &dslCI, nullptr, &s_PathDSLayout);
     if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] Path: vkCreateDescriptorSetLayout failed: %d\n", res); return; }
@@ -539,7 +543,7 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
     // 5. Descriptor pool + set
     VkDescriptorPoolSize poolSizes[5] = {};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; poolSizes[0].descriptorCount = 1;
-    poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              poolSizes[1].descriptorCount = 3;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              poolSizes[1].descriptorCount = 5;
     poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;             poolSizes[2].descriptorCount = 1;
     poolSizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 5;
     poolSizes[4].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;     poolSizes[4].descriptorCount = 4;
@@ -577,7 +581,7 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
     if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] Path: vkCreateSampler failed: %d\n", res); return; }
 
     s_PathReady = true;
-    fprintf(stderr, "[VPT] PathTrace pipeline initialized (14 bindings).\n");
+    fprintf(stderr, "[VPT] PathTrace pipeline initialized (16 bindings).\n");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -682,12 +686,14 @@ static bool EnsureTextureArrayView(
 
 void VPTDispatch::DispatchPathTrace(
     void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
     void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
     int32_t width, int32_t height,
     const VPT_CameraData& cameraData,
     uint32_t lightCount, uint32_t samplesPerPixel)
 {
-    if (!s_PathReady || !outputPtr || !gbuf0Ptr || !gbuf1Ptr || width <= 0 || height <= 0)
+    if (!s_PathReady || !outputPtr || !gbuf0Ptr || !gbuf1Ptr || !diffuseAlbedoPtr || !specularAlbedoPtr
+        || width <= 0 || height <= 0)
         return;
 
     const UnityVulkanInstance& inst = VPT_GetInstance();
@@ -701,10 +707,12 @@ void VPTDispatch::DispatchPathTrace(
         return;
     }
 
-    // ── Access 3 Unity RenderTextures as VkImages (write) ──
+    // ── Access 5 Unity RenderTextures as VkImages (write) ──
     if (!EnsureImageView(vulkan, device, outputPtr, 0)) return;
     if (!EnsureImageView(vulkan, device, gbuf0Ptr,  1)) return;
     if (!EnsureImageView(vulkan, device, gbuf1Ptr,  2)) return;
+    if (!EnsureImageView(vulkan, device, diffuseAlbedoPtr,  3)) return;
+    if (!EnsureImageView(vulkan, device, specularAlbedoPtr, 4)) return;
 
     // ── Access 4 Unity Texture2DArrays as VkImages (read) ──
     if (baseColorPtr)    EnsureTextureArrayView(vulkan, device, baseColorPtr,    0);
@@ -747,8 +755,8 @@ void VPTDispatch::DispatchPathTrace(
     asInfo.accelerationStructureCount = 1;
     asInfo.pAccelerationStructures = &tlas;
 
-    VkDescriptorImageInfo imgInfos[3] = {};
-    for (int i = 0; i < 3; i++)
+    VkDescriptorImageInfo imgInfos[5] = {};
+    for (int i = 0; i < 5; i++)
     {
         imgInfos[i].sampler     = VK_NULL_HANDLE;
         imgInfos[i].imageView   = s_OutputViews[i].view;
@@ -784,7 +792,7 @@ void VPTDispatch::DispatchPathTrace(
         texInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
-    VkWriteDescriptorSet writes[14] = {};
+    VkWriteDescriptorSet writes[16] = {};
     // binding 0: TLAS
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].pNext = &asInfo;
@@ -794,7 +802,7 @@ void VPTDispatch::DispatchPathTrace(
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 
     // bindings 1-3: storage images
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 5; i++)
     {
         writes[1 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[1 + i].dstSet = s_PathDescSet;
@@ -834,7 +842,18 @@ void VPTDispatch::DispatchPathTrace(
         writes[10 + i].pImageInfo = &texInfos[i];
     }
 
-    vkUpdateDescriptorSets(device, 14, writes, 0, nullptr);
+    // bindings 14-15: DLSS RR albedo G-buffers (storage images)
+    for (int i = 0; i < 2; i++)
+    {
+        writes[14 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[14 + i].dstSet = s_PathDescSet;
+        writes[14 + i].dstBinding = 14 + i;
+        writes[14 + i].descriptorCount = 1;
+        writes[14 + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[14 + i].pImageInfo = &imgInfos[3 + i];
+    }
+
+    vkUpdateDescriptorSets(device, 16, writes, 0, nullptr);
 
     // ── Command buffer ──
     VkCommandBufferAllocateInfo allocCI{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
@@ -859,8 +878,8 @@ void VPTDispatch::DispatchPathTrace(
     uboBarrier.size = sizeof(PathTraceCameraUBO);
 
     // Barrier 2: 3 images UNDEFINED → GENERAL
-    VkImageMemoryBarrier imgBarriers[3] = {};
-    for (int i = 0; i < 3; i++)
+    VkImageMemoryBarrier imgBarriers[5] = {};
+    for (int i = 0; i < 5; i++)
     {
         imgBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         imgBarriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -880,7 +899,7 @@ void VPTDispatch::DispatchPathTrace(
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 1, &uboBarrier, 3, imgBarriers);
+        0, 0, nullptr, 1, &uboBarrier, 5, imgBarriers);
 
     // Dispatch
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_PathPipeline);
@@ -892,7 +911,7 @@ void VPTDispatch::DispatchPathTrace(
     vkCmdDispatch(cmd, gx, gy, 1);
 
     // Barrier 3: 3 images GENERAL → SHADER_READ_ONLY_OPTIMAL
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 5; i++)
     {
         imgBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
         imgBarriers[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -903,7 +922,7 @@ void VPTDispatch::DispatchPathTrace(
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 3, imgBarriers);
+        0, 0, nullptr, 0, nullptr, 5, imgBarriers);
 
     vkEndCommandBuffer(cmd);
 
@@ -936,21 +955,25 @@ static bool     s_DispatchPending = false;
 
 void VPTDispatch::PrepareDispatch(
     void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
+    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
     void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
     int32_t width, int32_t height,
     const VPT_CameraData& cameraData,
     uint32_t lightCount, uint32_t samplesPerPixel)
 {
-    if (!s_PathReady || !outputPtr || !gbuf0Ptr || !gbuf1Ptr || width <= 0 || height <= 0)
+    if (!s_PathReady || !outputPtr || !gbuf0Ptr || !gbuf1Ptr || !diffuseAlbedoPtr || !specularAlbedoPtr
+        || width <= 0 || height <= 0)
         return;
 
     IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
     VkDevice device = VPT_GetInstance().device;
 
-    // ── Access 3 Unity RenderTextures as VkImages (ObserveOnly: query handles only) ──
+    // ── Access 5 Unity RenderTextures as VkImages (ObserveOnly: query handles only) ──
     if (!EnsureImageView(vulkan, device, outputPtr, 0)) return;
     if (!EnsureImageView(vulkan, device, gbuf0Ptr,  1)) return;
     if (!EnsureImageView(vulkan, device, gbuf1Ptr,  2)) return;
+    if (!EnsureImageView(vulkan, device, diffuseAlbedoPtr,  3)) return;
+    if (!EnsureImageView(vulkan, device, specularAlbedoPtr, 4)) return;
 
     // ── Access 4 Unity Texture2DArrays as VkImages (read) ──
     if (baseColorPtr)    EnsureTextureArrayView(vulkan, device, baseColorPtr,    0);
@@ -996,8 +1019,8 @@ void VPTDispatch::PrepareDispatch(
     asInfo.accelerationStructureCount = 1;
     asInfo.pAccelerationStructures = &tlas;
 
-    VkDescriptorImageInfo imgInfos[3] = {};
-    for (int i = 0; i < 3; i++)
+    VkDescriptorImageInfo imgInfos[5] = {};
+    for (int i = 0; i < 5; i++)
     {
         imgInfos[i].sampler     = VK_NULL_HANDLE;
         imgInfos[i].imageView   = s_OutputViews[i].view;
@@ -1032,7 +1055,7 @@ void VPTDispatch::PrepareDispatch(
         texInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
-    VkWriteDescriptorSet writes[14] = {};
+    VkWriteDescriptorSet writes[16] = {};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].pNext = &asInfo;
     writes[0].dstSet = s_PathDescSet;
@@ -1040,7 +1063,7 @@ void VPTDispatch::PrepareDispatch(
     writes[0].descriptorCount = 1;
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 5; i++)
     {
         writes[1 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[1 + i].dstSet = s_PathDescSet;
@@ -1077,7 +1100,18 @@ void VPTDispatch::PrepareDispatch(
         writes[10 + i].pImageInfo = &texInfos[i];
     }
 
-    vkUpdateDescriptorSets(device, 14, writes, 0, nullptr);
+    // bindings 14-15: DLSS RR albedo G-buffers (storage images)
+    for (int i = 0; i < 2; i++)
+    {
+        writes[14 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[14 + i].dstSet = s_PathDescSet;
+        writes[14 + i].dstBinding = 14 + i;
+        writes[14 + i].descriptorCount = 1;
+        writes[14 + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[14 + i].pImageInfo = &imgInfos[3 + i];
+    }
+
+    vkUpdateDescriptorSets(device, 16, writes, 0, nullptr);
 
     // ── Store pending dispatch dimensions for RenderCallback ──
     s_PendingWidth    = width;
@@ -1133,8 +1167,8 @@ void VPTDispatch::RenderCallback(int eventID)
     uboBarrier.offset = 0;
     uboBarrier.size = sizeof(PathTraceCameraUBO);
 
-    VkImageMemoryBarrier imgBarriers[3] = {};
-    for (int i = 0; i < 3; i++)
+    VkImageMemoryBarrier imgBarriers[5] = {};
+    for (int i = 0; i < 5; i++)
     {
         imgBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         imgBarriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1154,7 +1188,7 @@ void VPTDispatch::RenderCallback(int eventID)
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 1, &uboBarrier, 3, imgBarriers);
+        0, 0, nullptr, 1, &uboBarrier, 5, imgBarriers);
 
     // ── Dispatch ──
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_PathPipeline);
@@ -1166,7 +1200,7 @@ void VPTDispatch::RenderCallback(int eventID)
     vkCmdDispatch(cmd, gx, gy, 1);
 
     // ── Barrier 2: 3 images GENERAL → SHADER_READ_ONLY (for Unity compute reads) ──
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 5; i++)
     {
         imgBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
         imgBarriers[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1177,7 +1211,7 @@ void VPTDispatch::RenderCallback(int eventID)
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 3, imgBarriers);
+        0, 0, nullptr, 0, nullptr, 5, imgBarriers);
 }
 
 bool VPTDispatch::IsDispatchPending() { return s_DispatchPending; }
@@ -1191,7 +1225,7 @@ void VPTDispatch::DestroyPathTracePipeline(VkDevice device)
     if (!s_PathReady) return;
     vkDeviceWaitIdle(device);
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 5; i++)
     {
         if (s_OutputViews[i].view) { vkDestroyImageView(device, s_OutputViews[i].view, nullptr); s_OutputViews[i].view = VK_NULL_HANDLE; }
         s_OutputViews[i].image = VK_NULL_HANDLE;

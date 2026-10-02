@@ -18,6 +18,7 @@
 #pragma kernel TemporalAccumulate
 #pragma kernel SpatialFilter
 #pragma kernel AntiFirefly
+#pragma kernel MotionVector
 
 // ── ReSTIR GI 5-kernel 管线 ──
 #pragma kernel ReSTIR_PrimaryRay
@@ -178,6 +179,14 @@ RWTexture2D<float4> GBufferNormalRough;
 //   miss 时写 (MISS_INDEX, 0, 0, 0) 哨兵；K2/K5 在 depth<=0 已 early-return 不会读取
 RWTexture2D<float4> GBufferHitInfo;
 
+// ── DLSS RR albedo G-buffer（主光线首次命中的材质分解，输入分辨率 RGBA16F）──
+// 仅 RR 模式消费；由 PathTrace / ReSTIR_PrimaryRay 在首命中时写入
+// ★ D3D11 pitfall：全局 RWTexture2D 必须绑定到每个引用 kernel
+RWTexture2D<float4> DiffuseAlbedoOut;   // rgb = albedo * (1 - metallic)
+RWTexture2D<float4> SpecularAlbedoOut;  // rgb = EnvBRDFApprox(F0, roughness^2, NdotV)
+// sky 像素 albedo 常量（RR Guide 建议非零中灰，常见集成错误是 sky 未清理）
+#define SKY_ALBEDO float4(0.5, 0.5, 0.5, 1.0)
+
 // ── 常量缓冲（由渲染器注入） ──
 cbuffer PathTraceCB
 {
@@ -209,6 +218,12 @@ cbuffer TemporalCB
 //  NRD 移植参数（全局 uniform，由 C# SetComputeXxxParam 注入）
 //  与 PassIndex 同级声明，各 kernel 按需读取
 // ══════════════════════════════════════════════════════
+
+// ── DLSS Jitter 偏移（渲染像素空间 [-0.5,0.5]，仅 MotionVector kernel 使用） ──
+float4 JitterOffset;            // xy = Halton jitter, zw = unused
+
+// ── 当前帧 ViewProj（world -> clip），仅 MotionVector kernel 用于计算 NDC 深度 ──
+float4x4 CurViewProj;          // Unity reversed-Z: near=1, far=0
 
 // ── TemporalAccumulate 参数 ──
 float  DisocclusionThreshold;   // 遮挡检测基础阈值（默认0.02）
@@ -737,6 +752,19 @@ float3 F_Schlick(float3 F0, float cosTheta)
 float3 specularF0(float3 albedo, float metallic)
 {
     return lerp(float3(0.04, 0.04, 0.04), albedo, metallic);
+}
+
+// ── DLSS RR specular albedo：预积分镜面反射率近似 ──
+// （Ray Tracing Gems Ch.32 / UE4 Karis 移动近似，a = roughness^2）
+// 返回 F0 * scale + bias 形式的环境 BRDF 积分近似，供 RR G-buffer 分解使用
+float3 EnvBRDFApprox(float3 F0, float a, float NoV)
+{
+    const float4 c0 = float4(-1.0, -0.0275, -0.572, 0.022);
+    const float4 c1 = float4( 1.0,  0.0425,  1.04, -0.04);
+    float4 r = a * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    float2 AB = float2(-1.04, 1.04) * a004 + r.zw;
+    return F0 * AB.x + AB.y;
 }
 
 // ── 评估 BSDF（用于 NEE 直接光照，返回 BSDF 值，不含 NdotL） ──
@@ -1281,6 +1309,8 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
             {
                 GBufferPosDepth[id.xy]   = float4(0.0, 0.0, 0.0, 0.0);
                 GBufferNormalRough[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+                DiffuseAlbedoOut[id.xy]  = SKY_ALBEDO;
+                SpecularAlbedoOut[id.xy] = SKY_ALBEDO;
             }
             radiance += throughput * AmbientColor;
             break;
@@ -1340,6 +1370,13 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
         {
             GBufferPosDepth[id.xy]   = float4(P, hit.t);
             GBufferNormalRough[id.xy] = float4(Ngeo, mat.roughness);
+            // DLSS RR albedo 分解（RR Guide 3.4）：
+            //   Diffuse  = albedo * (1 - metallic)
+            //   Specular = EnvBRDFApprox(F0, roughness^2, NdotV)，N 为扰动后 shading normal
+            float ndv = max(dot(N, -ray.direction), 0.0);
+            float3 F0 = lerp(float3(0.04, 0.04, 0.04), mat.albedo.rgb, mat.metallic);
+            DiffuseAlbedoOut[id.xy]  = float4(mat.albedo.rgb * (1.0 - mat.metallic), 1.0);
+            SpecularAlbedoOut[id.xy] = float4(EnvBRDFApprox(F0, mat.roughness * mat.roughness, ndv), 1.0);
         }
 
         // ── 调试：只输出阴影可视化（白=无阴影，黑=完全阴影） ──
@@ -1659,6 +1696,80 @@ void TemporalAccumulate(uint3 id : SV_DispatchThreadID)
 }
 
 // ══════════════════════════════════════════════════════
+//  Kernel: MotionVector（DLSS 阶段2：运动矢量 + 深度输出）
+//  读当前帧 GBufferPosDepth（worldPos + depth），用 PrevViewProj
+//  重投影到上一帧屏幕坐标，输出 prevUV - curUV（低分辨率 RG16F）。
+//  未命中/天空像素输出 (0,0)。
+//  复用 TemporalAccumulate 的反投影逻辑，但无历史缓冲依赖。
+//
+//  双深度输出：
+//    DepthOut      → NDC 深度 (curClip.z/curClip.w)，供 DLSS SR 使用
+//    LinearDepthOut → 视空间线性距离 (curClip.w)，供 DLSS RR 使用
+//  SR 模式仅消费 DepthOut；RR 模式仅消费 LinearDepthOut。
+// ══════════════════════════════════════════════════════
+
+RWTexture2D<float2> MotionVectorOut;  // 低分辨率 RG16F
+RWTexture2D<float>  DepthOut;          // 低分辨率 R16F，NDC 深度（SR 用）
+RWTexture2D<float>  LinearDepthOut;    // 低分辨率 R32F，视空间线性距离（RR 用）
+
+[numthreads(8, 8, 1)]
+void MotionVector(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    float4 gpd = GBufferPosDepth[id.xy];
+    float  depth = gpd.a;
+
+    // 天空像素（miss）：NDC 远=0（reversed-Z），线性远=FarPlane，无运动矢量
+    if (depth <= 0.0)
+    {
+        DepthOut[id.xy] = 0.0;
+        LinearDepthOut[id.xy] = FarPlane;
+        MotionVectorOut[id.xy] = float2(0.0, 0.0);
+        return;
+    }
+
+    float3 worldPos = gpd.rgb;
+
+    // 计算当前帧 clip 坐标（Unity reversed-Z: near=1, far=0）
+    float4 curClip = mul(CurViewProj, float4(worldPos, 1.0));
+    // SR: NDC 深度 = clip.z / clip.w，范围 [0,1]
+    DepthOut[id.xy] = curClip.z / curClip.w;
+    // RR: 视空间线性距离 = clip.w（透视投影中 clip.w = -viewSpaceZ > 0）
+    LinearDepthOut[id.xy] = curClip.w;
+
+    // 重投影：worldPos -> 上一帧屏幕坐标
+    float4 prevClip = mul(PrevViewProj, float4(worldPos, 1.0));
+    if (prevClip.w <= 0.0)
+    {
+        MotionVectorOut[id.xy] = float2(0.0, 0.0);
+        return;
+    }
+
+    float2 prevNdc = prevClip.xy / prevClip.w;
+    float2 prevUV = prevNdc * 0.5 + 0.5;
+
+    // 超出屏幕边界：无有效运动矢量
+    if (any(prevUV < 0.0) || any(prevUV > 1.0))
+    {
+        MotionVectorOut[id.xy] = float2(0.0, 0.0);
+        return;
+    }
+
+    // 当前帧屏幕位置：同样通过投影 worldPos 得到（与 prevUV 对称）
+    // worldPos 由 jittered 光线命中，用未 jitter 的 CurViewProj 投影后
+    // 与用 PrevViewProj 投影的结果在静态相机时完全一致 → MV = 0。
+    // 不能用像素中心 (id+0.5)/resolution，因为 jittered 光线命中的 worldPos
+    // 投影后 ≈ (pixel+0.5+jitter)/resolution，与像素中心差一个 jitter → 静止抖动。
+    float2 curNdc = curClip.xy / curClip.w;
+    float2 curUV  = curNdc * 0.5 + 0.5;
+
+    // 运动矢量 = 上一帧位置 - 当前帧位置（DLSS 约定：MV = dst - src）
+    // DLSS 的 MV 表示「该像素从上一帧哪里来」，即 prevUV - curUV
+    MotionVectorOut[id.xy] = prevUV - curUV;
+}
+
+// ══════════════════════════════════════════════════════
 //  Kernel: SpatialFilter（NRD 移植版 G-buffer 引导空域滤波）
 //  Poisson 采样 + 旋转（8/16 tap），步长 = 1<<PassIndex
 //  边缘权重：法线角度 × 平面距离 × 粗糙度 × 方差驱动亮度 × 高斯空间
@@ -1910,6 +2021,8 @@ void ReSTIR_PrimaryRay(uint3 id : SV_DispatchThreadID)
         GBufferPosDepth[id.xy]   = float4(0.0, 0.0, 0.0, 0.0);
         GBufferNormalRough[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
         GBufferHitInfo[id.xy]    = float4(float(MISS_INDEX), 0.0, 0.0, 0.0);
+        DiffuseAlbedoOut[id.xy]  = SKY_ALBEDO;
+        SpecularAlbedoOut[id.xy] = SKY_ALBEDO;
         ReSTIR_DirectLighting[id.xy] = float4(AmbientColor, 1.0);
         return;
     }
@@ -1946,6 +2059,13 @@ void ReSTIR_PrimaryRay(uint3 id : SV_DispatchThreadID)
     GBufferPosDepth[id.xy]   = float4(P, hit.t);
     GBufferNormalRough[id.xy] = float4(Ngeo, storedRough);
     GBufferHitInfo[id.xy]    = float4(float(hit.instIndex), float(hit.triIndex), hit.u, hit.v);
+    // DLSS RR albedo 分解（与 PathTrace kernel 一致；V 在此为 -ray.direction）
+    {
+        float ndv = max(dot(N, -ray.direction), 0.0);
+        float3 F0 = lerp(float3(0.04, 0.04, 0.04), mat.albedo.rgb, mat.metallic);
+        DiffuseAlbedoOut[id.xy]  = float4(mat.albedo.rgb * (1.0 - mat.metallic), 1.0);
+        SpecularAlbedoOut[id.xy] = float4(EnvBRDFApprox(F0, mat.roughness * mat.roughness, ndv), 1.0);
+    }
 
     // ── 5. 直接光照 NEE + 自发光 ──
     float3 V = -ray.direction;
