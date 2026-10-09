@@ -114,6 +114,8 @@ struct VPT_CameraData
     int32_t  maxDepth;        // 最大弹射深度
     float    ambientColor[3]; // 环境光颜色
     float    pad;             // 对齐填充
+    float    envIntensity;    // HDR 环境光强度倍率
+    float    envRotation;     // HDR 环境贴图绕 Y 轴旋转（弧度）
 };
 
 // ═══════════════════════════════════════════════════════════

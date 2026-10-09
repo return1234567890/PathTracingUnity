@@ -32,4 +32,8 @@ namespace VPTScene {
     VkBuffer GetMaterialBuffer();
     VkBuffer GetLightBuffer();
 
+    // ── 供其他模块复用的工具函数 ──
+    /// 查找匹配 typeFilter + 属性的内存类型索引
+    uint32_t FindMemoryType(VkPhysicalDevice gpu, uint32_t typeFilter, VkMemoryPropertyFlags props);
+
 } // namespace VPTScene

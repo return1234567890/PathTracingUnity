@@ -122,6 +122,9 @@ MonoBehaviour:
   maxDepth: 8
   samplesPerPixel: 1
   ambientColor: {r: 0.019607844, g: 0.019607844, b: 0.019607844, a: 1}
+  hdrEnvironment: {fileID: 2800000, guid: 835de5cc79ea58e4bbd6eb3977eb3ee8, type: 3}
+  envIntensity: 1
+  envRotation: 0
   denoisingEnabled: 1
   temporalEnabled: 0
   spatialEnabled: 1

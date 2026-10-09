@@ -628,6 +628,12 @@ VkAccelerationStructureKHR VPTScene::GetTLAS() { return s_TLAS.handle; }
 bool VPTScene::IsReady() { return s_Ready; }
 bool VPTScene::AreExtensionsReady() { return s_ExtensionsReady; }
 
+// ── 公开工具函数（委托到文件内 static 实现）──
+uint32_t VPTScene::FindMemoryType(VkPhysicalDevice gpu, uint32_t typeFilter, VkMemoryPropertyFlags props)
+{
+    return ::FindMemoryType(gpu, typeFilter, props);
+}
+
 // ── Getter（供 dispatch 绑定 SSBO）──
 VkBuffer VPTScene::GetUnifiedVertexBuffer() { return s_UnifiedVertexBuffer.buffer; }
 VkBuffer VPTScene::GetUnifiedIndexBuffer() { return s_UnifiedIndexBuffer.buffer; }

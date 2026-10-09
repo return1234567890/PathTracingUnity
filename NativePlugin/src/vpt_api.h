@@ -53,6 +53,13 @@ extern "C" {
     /// 返回: 1=支持 VK_KHR_ray_query, 0=不支持
     UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_QueryRayQuerySupport();
 
+    /// 设置 HDR 环境光贴图
+    /// pixels: RGBA32F 数据（每像素 4 float，width*height 个像素）
+    /// width/height: equirect 贴图尺寸
+    /// 在原生侧创建 VkImage + alias-method importance 采样表（SSBO）
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+    VPT_SetEnvironmentMap(const float* pixels, int32_t width, int32_t height);
+
     // ── Plan B: Two-phase dispatch (eliminates vkQueueWaitIdle) ──────────
 
     /// Phase 1: 准备路径追踪 dispatch（在 IssuePluginEvent 之前调用）

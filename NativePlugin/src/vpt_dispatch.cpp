@@ -7,6 +7,7 @@
 #include "vpt_dispatch.h"
 #include "vpt_internal.h"
 #include "vpt_scene.h"
+#include "vpt_env.h"
 #include "debug_depth_spv.h"
 #include "pathtrace_spv.h"
 
@@ -142,8 +143,8 @@ struct PathTraceCameraUBO
     float    ambientPad[4];     // 16B (xyz=ambientColor, w=pad)
     uint32_t lightCount;         // 4B
     uint32_t samplesPerPixel;    // 4B
-    uint32_t uboPad0;            // 4B
-    uint32_t uboPad1;            // 4B
+    float    envIntensity;       // 4B (HDR env intensity multiplier)
+    float    envRotation;        // 4B (HDR env rotation in radians)
     // Total: 208B
 };
 
@@ -488,8 +489,8 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
 {
     if (s_PathReady) return;
 
-    // 1. Descriptor set layout: 16 bindings (10 + 2 albedo images + 4 texture arrays)
-    VkDescriptorSetLayoutBinding bindings[16] = {};
+    // 1. Descriptor set layout: 18 bindings (16 original + 2 HDR env)
+    VkDescriptorSetLayoutBinding bindings[18] = {};
     bindings[0].binding = 0; bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; bindings[0].descriptorCount = 1; bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     bindings[1].binding = 1; bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bindings[1].descriptorCount = 1; bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     bindings[2].binding = 2; bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bindings[2].descriptorCount = 1; bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -507,9 +508,12 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
     // DLSS RR albedo G-buffers（pathtrace.glsl binding 14/15，rgba16f）
     bindings[14].binding = 14; bindings[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bindings[14].descriptorCount = 1; bindings[14].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     bindings[15].binding = 15; bindings[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bindings[15].descriptorCount = 1; bindings[15].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    // HDR 环境贴图（binding 16 = combined image sampler, binding 17 = EnvAccel SSBO）
+    bindings[16].binding = 16; bindings[16].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; bindings[16].descriptorCount = 1; bindings[16].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[17].binding = 17; bindings[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bindings[17].descriptorCount = 1; bindings[17].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo dslCI{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dslCI.bindingCount = 16;
+    dslCI.bindingCount = 18;
     dslCI.pBindings    = bindings;
     VkResult res = vkCreateDescriptorSetLayout(device, &dslCI, nullptr, &s_PathDSLayout);
     if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] Path: vkCreateDescriptorSetLayout failed: %d\n", res); return; }
@@ -545,8 +549,8 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; poolSizes[0].descriptorCount = 1;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              poolSizes[1].descriptorCount = 5;
     poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;             poolSizes[2].descriptorCount = 1;
-    poolSizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 5;
-    poolSizes[4].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;     poolSizes[4].descriptorCount = 4;
+    poolSizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 6;  // 5 SSBOs + 1 EnvAccel
+    poolSizes[4].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;     poolSizes[4].descriptorCount = 5;  // 4 tex arrays + 1 HDR env
 
     VkDescriptorPoolCreateInfo dpCI{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     dpCI.maxSets       = 1;
@@ -581,7 +585,7 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
     if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] Path: vkCreateSampler failed: %d\n", res); return; }
 
     s_PathReady = true;
-    fprintf(stderr, "[VPT] PathTrace pipeline initialized (16 bindings).\n");
+    fprintf(stderr, "[VPT] PathTrace pipeline initialized (18 bindings).\n");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -744,6 +748,8 @@ void VPTDispatch::DispatchPathTrace(
     // Actually VPT_CameraData doesn't have lightCount/SPP, so we get from scene or use defaults
     ubo.lightCount = lightCount;
     ubo.samplesPerPixel = samplesPerPixel;
+    ubo.envIntensity = cameraData.envIntensity;
+    ubo.envRotation  = cameraData.envRotation;
     // Safety: if light SSBO was never created (e.g. lights not pushed during scene update),
     // force lightCount to 0 so the shader doesn't read from an invalid SSBO
     if (VPTScene::GetLightBuffer() == VK_NULL_HANDLE)
@@ -792,7 +798,18 @@ void VPTDispatch::DispatchPathTrace(
         texInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
-    VkWriteDescriptorSet writes[16] = {};
+    // ── HDR env descriptor info (binding 16/17) ──
+    VkDescriptorImageInfo envImgInfo{};
+    envImgInfo.sampler     = VPTEnv::GetEnvSampler();
+    envImgInfo.imageView   = VPTEnv::GetEnvImageView();
+    envImgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkDescriptorBufferInfo envAccelInfo{};
+    envAccelInfo.buffer = VPTEnv::GetEnvAccelBuffer();
+    envAccelInfo.offset = 0;
+    envAccelInfo.range  = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet writes[18] = {};
     // binding 0: TLAS
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].pNext = &asInfo;
@@ -853,7 +870,28 @@ void VPTDispatch::DispatchPathTrace(
         writes[14 + i].pImageInfo = &imgInfos[3 + i];
     }
 
-    vkUpdateDescriptorSets(device, 16, writes, 0, nullptr);
+    // binding 16/17: HDR env texture + EnvAccel SSBO（仅当 env 就绪时写入，避免 null 句柄崩溃）
+    uint32_t writeCount = 16;
+    if (VPTEnv::IsReady())
+    {
+        writes[16].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[16].dstSet = s_PathDescSet;
+        writes[16].dstBinding = 16;
+        writes[16].descriptorCount = 1;
+        writes[16].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[16].pImageInfo = &envImgInfo;
+
+        writes[17].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[17].dstSet = s_PathDescSet;
+        writes[17].dstBinding = 17;
+        writes[17].descriptorCount = 1;
+        writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[17].pBufferInfo = &envAccelInfo;
+
+        writeCount = 18;
+    }
+
+    vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);
 
     // ── Command buffer ──
     VkCommandBufferAllocateInfo allocCI{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
@@ -1003,6 +1041,8 @@ void VPTDispatch::PrepareDispatch(
     ubo.ambientPad[3] = cameraData.pad;
     ubo.lightCount = lightCount;
     ubo.samplesPerPixel = samplesPerPixel;
+    ubo.envIntensity = cameraData.envIntensity;
+    ubo.envRotation  = cameraData.envRotation;
     if (VPTScene::GetLightBuffer() == VK_NULL_HANDLE)
         ubo.lightCount = 0;
     memcpy(s_PathUBOMapped, &ubo, sizeof(PathTraceCameraUBO));
@@ -1055,7 +1095,18 @@ void VPTDispatch::PrepareDispatch(
         texInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
-    VkWriteDescriptorSet writes[16] = {};
+    // ── HDR env descriptor info (binding 16/17) ──
+    VkDescriptorImageInfo envImgInfo{};
+    envImgInfo.sampler     = VPTEnv::GetEnvSampler();
+    envImgInfo.imageView   = VPTEnv::GetEnvImageView();
+    envImgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkDescriptorBufferInfo envAccelInfo{};
+    envAccelInfo.buffer = VPTEnv::GetEnvAccelBuffer();
+    envAccelInfo.offset = 0;
+    envAccelInfo.range  = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet writes[18] = {};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].pNext = &asInfo;
     writes[0].dstSet = s_PathDescSet;
@@ -1111,7 +1162,28 @@ void VPTDispatch::PrepareDispatch(
         writes[14 + i].pImageInfo = &imgInfos[3 + i];
     }
 
-    vkUpdateDescriptorSets(device, 16, writes, 0, nullptr);
+    // binding 16/17: HDR env texture + EnvAccel SSBO（仅当 env 就绪时写入，避免 null 句柄崩溃）
+    uint32_t writeCount = 16;
+    if (VPTEnv::IsReady())
+    {
+        writes[16].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[16].dstSet = s_PathDescSet;
+        writes[16].dstBinding = 16;
+        writes[16].descriptorCount = 1;
+        writes[16].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[16].pImageInfo = &envImgInfo;
+
+        writes[17].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[17].dstSet = s_PathDescSet;
+        writes[17].dstBinding = 17;
+        writes[17].descriptorCount = 1;
+        writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[17].pBufferInfo = &envAccelInfo;
+
+        writeCount = 18;
+    }
+
+    vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);
 
     // ── Store pending dispatch dimensions for RenderCallback ──
     s_PendingWidth    = width;

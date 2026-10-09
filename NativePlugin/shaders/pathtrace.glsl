@@ -38,8 +38,8 @@ layout(set = 0, binding = 4, std140, row_major) uniform CameraUBO {
     vec4 ambientPad;     // xyz = ambient color, w = pad
     uint lightCount;
     uint samplesPerPixel;
-    uint _uboPad0;
-    uint _uboPad1;
+    float envIntensity;   // HDR env intensity multiplier
+    float envRotation;    // HDR env rotation in radians
 } cam;
 
 // ── SSBOs ─────────────────────────────────────────────────────
@@ -107,6 +107,13 @@ layout(set = 0, binding = 10) uniform sampler2DArray baseColorTex;
 layout(set = 0, binding = 11) uniform sampler2DArray metallicRoughTex;
 layout(set = 0, binding = 12) uniform sampler2DArray normalTex;
 layout(set = 0, binding = 13) uniform sampler2DArray emissiveTex;
+
+// ── HDR 环境贴图 (binding 16/17) ────────────────────────────
+layout(set = 0, binding = 16) uniform sampler2D envHdrTex;
+struct EnvAccel { uint alias; float q; };
+layout(set = 0, binding = 17, std430) readonly buffer EnvAccelBuffer {
+    EnvAccel envAccel[];
+};
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -669,6 +676,90 @@ vec3 EnvBRDFApprox(vec3 F0, float a, float NoV)
 }
 
 // ══════════════════════════════════════════════════════════════
+//  HDR 环境光 importance 采样（移植自 nvpro hdr_env_sampling.h.slang）
+//  alias method：rand3 → 选纹素/alias → 球面方向 + vec4(radiance, pdf)
+// ══════════════════════════════════════════════════════════════
+
+vec4 environmentSample(sampler2D hdrTex, vec3 randVal, out vec3 toLight)
+{
+    float xi_x = randVal.x;
+    float xi_y = randVal.y;
+    float xi_z = randVal.z;
+
+    ivec2 tsize = textureSize(hdrTex, 0);
+    uint width  = uint(tsize.x);
+    uint height = uint(tsize.y);
+    uint size   = width * height;
+
+    // Uniformly pick a texel index
+    uint idx = min(uint(xi_x * float(size)), size - 1u);
+
+    // Fetch alias table data for that texel
+    EnvAccel sampleData = envAccel[idx];
+    uint envIdx;
+
+    if (xi_y < sampleData.q)
+    {
+        envIdx = idx;
+        xi_y /= sampleData.q;
+    }
+    else
+    {
+        envIdx = sampleData.alias;
+        xi_y = (xi_y - sampleData.q) / (1.0 - sampleData.q);
+    }
+
+    // 2D integer coordinates of the texel
+    uint px = envIdx % width;
+    uint py = envIdx / width;
+
+    // Uniformly sample the solid angle subtended by the texel
+    float u       = float(px + xi_y) / float(width);
+    float phi     = u * 2.0 * PI - PI;
+    float sinPhi = sin(phi);
+    float cosPhi = cos(phi);
+
+    float stepTheta = PI / float(height);
+    float theta0    = float(py) * stepTheta;
+    float cosTheta  = cos(theta0) * (1.0 - xi_z) + cos(theta0 + stepTheta) * xi_z;
+    float theta     = acos(clamp(cosTheta, -1.0, 1.0));
+    float sinTheta  = sin(theta);
+    float v         = theta / PI;
+
+    // Direction in Cartesian coordinates
+    toLight = vec3(cosPhi * sinTheta, cosTheta, sinPhi * sinTheta);
+
+    // Apply envRotation (rotate around Y axis)
+    if (abs(cam.envRotation) > 1e-6)
+    {
+        float cr = cos(cam.envRotation);
+        float sr = sin(cam.envRotation);
+        toLight = vec3(cr * toLight.x + sr * toLight.z, toLight.y,
+                       -sr * toLight.x + cr * toLight.z);
+    }
+
+    // Lookup the environment value (returns rgb=pixel color, a=pdf)
+    vec4 texel = texture(hdrTex, vec2(u, v));
+    vec3 radiance = texel.rgb * cam.envIntensity;
+    float pdf = texel.a;  // PDF stored in alpha channel by alias builder
+
+    return vec4(radiance, pdf);
+}
+
+// ══════════════════════════════════════════════════════════════
+//  方向 → equirect UV（用于 miss 分支 HDR 查找）
+// ══════════════════════════════════════════════════════════════
+vec2 sphericalUV(vec3 dir)
+{
+    float phi = atan(dir.z, dir.x);
+    // Apply envRotation
+    phi += cam.envRotation;
+    float u = (phi + PI) / (2.0 * PI);
+    float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
+    return vec2(u, v);
+}
+
+// ══════════════════════════════════════════════════════════════
 //  Main kernel
 // ══════════════════════════════════════════════════════════════
 
@@ -725,7 +816,7 @@ void main()
             bool committed = rayQueryGetIntersectionTypeEXT(rq, true)
                            != gl_RayQueryCommittedIntersectionNoneEXT;
 
-            // ── Miss: ambient color ──
+            // ── Miss: HDR 环境贴图查找（或常数 ambient fallback）──
             if (!committed)
             {
                 if (depth == 0 && s == 0u)
@@ -738,7 +829,9 @@ void main()
                     imageStore(specularAlbedoImg, ivec2(pixel.x, int(h) - 1 - int(pixel.y)),
                                vec4(0.5, 0.5, 0.5, 1.0));
                 }
-                radiance += throughput * ambient;
+                // HDR env lookup via sphericalUV；若 envHdrTex 未绑定则回退常数 ambient
+                vec3 envColor = texture(envHdrTex, sphericalUV(rayDir)).rgb * cam.envIntensity;
+                radiance += throughput * envColor;
                 break;
             }
 
@@ -825,10 +918,11 @@ void main()
             vec3 T_world = T;
             vec3 B_world = cross(N, T_world) * bitangentSign;
 
-            // ── NEE: one-sample MIS（灯 50% / 常数环境 50%）──
+            // ── NEE: one-sample MIS（灯 50% / HDR 环境 50%）──
             // 注入逐帧蒙特卡洛噪声使 RR 恢复强累积，消除亮区抖动（根因见
-            // DLSS_RR亮区抖动分析.md）。环境=常数 ambient（无环境贴图的退化；
-            // 有贴图后替换为 importance 采样）。硬币本身在亮区制造「直接光/环境」
+            // DLSS_RR亮区抖动分析.md）。环境=HDR importance 采样（alias method），
+            // 变量辐亮度在不同方向返回不同值 → 方差显著大于常数 ambient →
+            // RR 累积更强 → 残余抖动消除。硬币在亮区制造「直接光/环境」
             // 双峰帧间方差 → RR 强累积 → 抖动被时域平均压平。
             bool sampleLights = (rand(seed) <= 0.5);
 
@@ -870,18 +964,15 @@ void main()
             }
             else
             {
-                // ── 常数环境光分支：uniform 半球采样方向 ──
-                // pdf = 1/(2π)；MIS 权重 1/0.5=2 → 总乘子 2×2π=4π
-                vec3 envT, envB;
-                createONB(N, envT, envB);
-                float u1 = rand(seed);
-                float u2 = rand(seed);
-                float cosT = u1;                         // [0,1] → uniform 半球
-                float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
-                float phi = 2.0 * PI * u2;
-                vec3 toL = normalize(sinT * cos(phi) * envT
-                                  + sinT * sin(phi) * envB
-                                  + cosT * N);
+                // ── HDR 环境光分支：importance 采样（alias method）──
+                // 用 environmentSample 取代 uniform 半球 + 常数 ambient。
+                // 返回 vec4(radiance, pdf)，radiance 已含 envIntensity，方向含 envRotation。
+                // 贡献: bsdf × NdotL × (radiance/pdf) × shadowTrans × 2.0（coin weight 1/0.5）
+                vec3 envRand = vec3(rand(seed), rand(seed), rand(seed));
+                vec3 toL;
+                vec4 envSample = environmentSample(envHdrTex, envRand, toL);
+                vec3 envRadiance = envSample.rgb;
+                float envPdf = max(envSample.w, 1e-6);
                 float NdotL = dot(N, toL);
 
                 bool lightValid = false;
@@ -905,9 +996,9 @@ void main()
                     vec3 shadowOrigin = P + Ngeo * EPS_OFFSET;
                     // 环境在无穷远；遮挡=环境遮蔽（AO）/半影
                     vec3 shadowTrans = traceShadowTransmission(shadowOrigin, toL, 1e34);
-                    // ×4π = MIS 权重 2 × 1/pdf(2π)
-                    radiance += throughput * bsdf_nee * NdotL * ambient * shadowTrans
-                             * 4.0 * PI;
+                    // ×2.0 = MIS coin weight（1/0.5）；radiance/pdf 为 importance 采样估计
+                    radiance += throughput * bsdf_nee * NdotL * (envRadiance / envPdf)
+                             * shadowTrans * 2.0;
                 }
             }
 

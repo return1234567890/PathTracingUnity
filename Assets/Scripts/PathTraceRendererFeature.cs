@@ -43,6 +43,20 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
              "但暗区会被该值点亮，需在「抖动消失」与「不过曝暗区」间平衡。")]
     public Color ambientColor = new Color(0.05f, 0.10f, 0.20f, 1f);
 
+    [Tooltip("HDR 环境光贴图（equirectangular）。赋值后原生插件创建 RGBA32F VkImage +" +
+             " 构建 alias-method importance 采样表，NEE 环境分支用 importance 采样替代常数 ambient。" +
+             " 消除 RR 亮区残余抖动，同时获得真实天空照明/IBL 反射/软阴影半影。" +
+             " 空时回退到常数 ambientColor。")]
+    public Texture2D hdrEnvironment;
+
+    [Tooltip("HDR 环境光整体强度倍率")]
+    [Range(0f, 8f)] public float envIntensity = 1.0f;
+
+    [Tooltip("HDR 环境贴图绕 Y 轴旋转角度（0-360）")]
+    [Range(0f, 360f)] public float envRotation = 0f;
+
+    private bool _envMapPushed = false;
+
     [Header("降噪总开关")]
     [Tooltip("关闭后跳过时域累积与空域滤波，直接输出原始路径追踪结果（1 spp 噪点）")]
     public bool denoisingEnabled = true;
@@ -198,6 +212,34 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
             ModelManager.Instance.PushToNative();
         }
 
+        // 推送 HDR 环境贴图（一次性，插件就绪且贴图赋值且未推送时）
+        if (_nativeInitialized && hdrEnvironment != null && !_envMapPushed)
+        {
+            // 确保贴图已读取像素（Read/Write enabled）
+            if (!hdrEnvironment.isReadable)
+            {
+                Debug.LogWarning("[PathTrace] hdrEnvironment is not Read/Write enabled in import settings. " +
+                                  "HDR env map upload will fail. Enable Read/Write in the texture import settings.");
+            }
+            else
+            {
+                bool ok = NativeBridge.SetEnvironmentMap(hdrEnvironment);
+                if (ok)
+                {
+                    Debug.Log("[PathTrace] HDR environment map uploaded to native plugin.");
+                    _envMapPushed = true;
+                }
+                else
+                {
+                    Debug.LogWarning("[PathTrace] HDR environment map upload failed. Check import format (need uncompressed RGBA float).");
+                }
+            }
+        }
+        else if (hdrEnvironment == null)
+        {
+            _envMapPushed = false;  // 贴图被清空时重置标志，允许重新赋值后重新推送
+        }
+
         _pass.Renderer = renderer;
         renderer.EnqueuePass(_pass);
     }
@@ -209,6 +251,7 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
         {
             NativeBridge.VPT_Destroy();
             _nativeInitialized = false;
+            _envMapPushed = false;
         }
     }
 }
@@ -639,7 +682,9 @@ public class PathTraceRenderPass : ScriptableRenderPass
                         _feature.ambientColor.g,
                         _feature.ambientColor.b
                     },
-                    pad = 0f
+                    pad = 0f,
+                    envIntensity = _feature.envIntensity,
+                    envRotation = _feature.envRotation * Mathf.Deg2Rad
                 };
 
                 // Plan B: 两阶段 dispatch（消除 vkQueueWaitIdle）

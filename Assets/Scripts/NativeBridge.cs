@@ -382,6 +382,50 @@ public static class NativeBridge
         }
     }
 
+    /// <summary>
+    /// 设置 HDR 环境光贴图：把 Unity 导入的 HDR Texture2D 像素传给原生插件，
+    /// 原生侧创建 RGBA32F VkImage + 构建 alias-method importance 采样表（SSBO）。
+    /// 一次性调用（场景加载后），之后每帧 pathtrace.glsl 通过 binding 16/17 采样。
+    /// </summary>
+    /// <param name="pixels">RGBA32F 像素（每像素 4 float，从 Texture2D.GetPixels 获取）</param>
+    /// <param name="width">贴图宽度</param>
+    /// <param name="height">贴图高度</param>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_SetEnvironmentMap(IntPtr pixels, int width, int height);
+
+    /// <summary>
+    /// 便捷方法：从 Unity Texture2D 读取 HDR 像素并推送到原生插件。
+    /// 使用 GetPixels 获取线性 RGBA 浮点数据（Unity 导入 .hdr 时自动 RGBE→float 解码）。
+    /// 调用方需确保贴图为 uncompressed HDR 格式（检查 import settings）。
+    /// </summary>
+    /// <param name="hdr">Unity 导入的 HDR Texture2D（equirectangular）</param>
+    /// <returns>true=成功上传</returns>
+    public static bool SetEnvironmentMap(UnityEngine.Texture2D hdr)
+    {
+        if (hdr == null) return false;
+
+        // 读取线性 HDR 像素（Color = 4 float RGBA，Unity 导入 .hdr 时自动解码）
+        UnityEngine.Color[] colors = hdr.GetPixels();
+        if (colors == null || colors.Length == 0)
+        {
+            Debug.LogError("[NativeBridge] SetEnvironmentMap: GetPixels returned empty. " +
+                           "Ensure HDR texture import format is uncompressed (check .meta TextureCompression=None).");
+            return false;
+        }
+
+        // Color 是 4 float struct，直接 pin 数组传指针
+        GCHandle pin = GCHandle.Alloc(colors, GCHandleType.Pinned);
+        try
+        {
+            VPT_SetEnvironmentMap(pin.AddrOfPinnedObject(), hdr.width, hdr.height);
+            return true;
+        }
+        finally
+        {
+            pin.Free();
+        }
+    }
+
     /// <summary>检查 GPU 是否支持硬件光线追踪</summary>
     public static bool IsRayQuerySupported()
     {
@@ -457,6 +501,8 @@ public static class NativeBridge
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
         public float[] ambientColor;
         public float pad;
+        public float envIntensity;
+        public float envRotation;
     }
 
     // ── 便捷方法: 场景数据推送 ──────────────────────────

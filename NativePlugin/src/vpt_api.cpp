@@ -8,6 +8,7 @@
 #include "vpt_internal.h"
 #include "vpt_scene.h"
 #include "vpt_dispatch.h"
+#include "vpt_env.h"
 #include "vpt_dlss.h"
 
 #include <cstdio>
@@ -97,6 +98,7 @@ VPT_Destroy()
     VPTDispatch::DestroyPipeline(VPT_GetInstance().device);
     VPT_DLSS_Destroy_Internal();
     VPTScene::DestroyResources();
+    VPTEnv::DestroyResources();
     VPT_SetInitialized(false);
     fprintf(stderr, "[VPT] VPT_Destroy: resources released.\n");
 }
@@ -161,6 +163,15 @@ extern "C" UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API
 VPT_QueryRayQuerySupport()
 {
     return VPT_IsRayQuerySupported() ? 1 : 0;
+}
+
+// ── VPT_SetEnvironmentMap ────────────────────────────────
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_SetEnvironmentMap(const float* pixels, int32_t width, int32_t height)
+{
+    if (!VPT_IsInitialized() || !pixels || width <= 0 || height <= 0)
+        return;
+    VPTEnv::SetEnvironmentMap(pixels, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
 }
 
 // ── Plan B: Two-phase dispatch exports ─────────────────────
