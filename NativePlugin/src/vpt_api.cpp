@@ -113,6 +113,16 @@ VPT_UpdateScene(const VPT_SceneUpdate* sceneUpdate)
     VPTScene::UpdateScene(*sceneUpdate);
 }
 
+// ── VPT_UpdateInstances ──────────────────────────────
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_UpdateInstances(const VPT_InstanceData* instances, int32_t instanceCount)
+{
+    if (!VPT_IsInitialized() || !instances || instanceCount <= 0)
+        return;
+
+    VPTScene::UpdateInstances(instances, instanceCount);
+}
+
 // ── VPT_DispatchPathTrace（阶段3实现）─────────────────────
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 VPT_DispatchPathTrace(

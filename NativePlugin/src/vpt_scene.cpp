@@ -65,12 +65,38 @@ static BufferResource  s_UnifiedIndexBuffer;
 static BufferResource  s_MaterialBuffer;
 static BufferResource  s_LightBuffer;
 static std::vector<BLASResource>    s_BLASes;
-static BufferResource  s_InstanceBuffer;   // TLAS instance data
-static BufferResource  s_InstanceInfoBuffer; // Per-instance metadata for shader
 static std::vector<uint32_t> s_MeshVertexOffsets; // per-mesh vertex offset
 static std::vector<uint32_t> s_MeshIndexOffsets;  // per-mesh index offset
-static BLASResource    s_TLAS;
 static bool            s_Ready = false;
+
+// ═════════════════════════════════════════════════════════
+//  动态场景：TLAS 环形资源（帧在飞行安全）
+//
+//  每帧重建 TLAS 时，在飞行中的历史帧仍在读旧 TLAS/InstanceInfo，
+//  故用 kTLASRingSize 个槽位轮转：CPU 写入槽位 N，GPU 构建槽位 N，
+//  dispatch 读槽位 N，而历史帧读槽位 N-1 / N-2。BLAS 静态不动。
+// ═════════════════════════════════════════════════════════
+
+static constexpr uint32_t kTLASRingSize = 4; // 覆盖 Unity 渲染线程最多 3 帧在飞行（与 UBO 同样未加 fence，实用上限）
+
+static BLASResource    s_TLASRing[kTLASRingSize];   // 每槽位：AS handle + 存储 buffer
+static BufferResource  s_TLASScratch;               // 共享 scratch（同队列串行构建，可共享）
+
+// VkAccelerationStructureInstanceKHR 数组，host-visible 常驻映射，按槽位偏移轮转
+// （仅 TLAS 构建时读一次，带宽微置，host-visible 换零拷贝零分配）
+static BufferResource  s_InstanceHost;
+static void*            s_InstanceHostMapped = nullptr;
+
+// InstanceInfo（shader 每次命中都读，高频随机访问）→ device-local，
+// 每帧从常驻映射的 staging 槽位 vkCmdCopyBuffer 上去
+static BufferResource  s_InstanceInfoStaging;   // host-visible 常驻映射
+static void*            s_InstanceInfoStagingMapped = nullptr;
+static BufferResource  s_InstanceInfoDevice;   // device-local，binding 7 SSBO 绑定它
+
+static uint32_t s_InstanceCapacity = 0;  // 每槽位最大实例数
+static uint32_t s_CurrentRing      = 0;  // 当前写入/构建/读取的槽位
+static uint32_t s_PendingCount     = 0;  // 待构建的实例数
+static bool     s_TLASPending      = false; // UpdateInstances 已写主机数据，待 build
 
 // ═══════════════════════════════════════════════════════════
 //  工具函数
@@ -388,72 +414,46 @@ static void BuildBLAS(VkCommandBuffer cmd, VkDevice device, VkPhysicalDevice gpu
 }
 
 // ═══════════════════════════════════════════════════════════
-//  TLAS 构建 + InstanceInfo 缓冲
+//  TLAS 环形资源管理 + 每帧重建（动态场景）
 // ═══════════════════════════════════════════════════════════
 
-static void BuildTLAS(VkCommandBuffer cmd, VkDevice device, VkPhysicalDevice gpu,
-                      const VPT_InstanceData* instances, int32_t instanceCount)
+// 销毁 TLAS 环形资源（调用前 GPU 必须 idle）
+static void DestroyTLASRingResources(VkDevice device)
 {
-    // ── 构建 VkAccelerationStructureInstanceKHR 数组 ──
-    std::vector<VkAccelerationStructureInstanceKHR> vkInstances(instanceCount);
-    std::vector<InstanceInfo> infoData(instanceCount);
+    for (uint32_t i = 0; i < kTLASRingSize; i++)
+        DestroyBLASResource(device, s_TLASRing[i]);
+    DestroyBufferResource(device, s_TLASScratch);
 
-    for (int32_t i = 0; i < instanceCount; i++)
-    {
-        const VPT_InstanceData& src = instances[i];
-        VkAccelerationStructureInstanceKHR& dst = vkInstances[i];
+    if (s_InstanceHostMapped) { vkUnmapMemory(device, s_InstanceHost.memory); s_InstanceHostMapped = nullptr; }
+    DestroyBufferResource(device, s_InstanceHost);
 
-        VkAccelerationStructureDeviceAddressInfoKHR addrInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR };
-        addrInfo.accelerationStructure = s_BLASes[src.blasID].handle;
-        dst.accelerationStructureReference = pfn_vkGetAccelerationStructureDeviceAddressKHR(device, &addrInfo);
+    if (s_InstanceInfoStagingMapped) { vkUnmapMemory(device, s_InstanceInfoStaging.memory); s_InstanceInfoStagingMapped = nullptr; }
+    DestroyBufferResource(device, s_InstanceInfoStaging);
+    DestroyBufferResource(device, s_InstanceInfoDevice);
 
-        memcpy(&dst.transform, src.transform, sizeof(float) * 12);
-        dst.instanceCustomIndex = src.materialID;
-        dst.mask = 0xFF;
-        dst.instanceShaderBindingTableRecordOffset = 0;
-        dst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR
-                  | VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+    s_InstanceCapacity = 0;
+    s_TLASPending = false;
+}
 
-        // 填充 InstanceInfo（供 shader 读取顶点属性用）
-        memcpy(infoData[i].transformRow0, &src.transform[0], sizeof(float) * 4);
-        memcpy(infoData[i].transformRow1, &src.transform[4], sizeof(float) * 4);
-        memcpy(infoData[i].transformRow2, &src.transform[8], sizeof(float) * 4);
-        infoData[i].vertexOffset = s_MeshVertexOffsets[src.blasID];
-        infoData[i].indexOffset  = s_MeshIndexOffsets[src.blasID];
-        infoData[i].materialID   = src.materialID;
-        infoData[i].pad          = 0;
-    }
+// （重新）分配 TLAS 环形资源，容量 >= capacity。扩容时调用前 GPU 必须 idle。
+static bool EnsureTLASResources(VkDevice device, VkPhysicalDevice gpu, uint32_t capacity)
+{
+    if (capacity == 0) capacity = 1;
+    if (capacity <= s_InstanceCapacity && s_InstanceCapacity > 0)
+        return true;
 
-    // ── 创建 InstanceInfo SSBO（shader 可读）──
-    VkDeviceSize infoSize = instanceCount * sizeof(InstanceInfo);
-    CreateBufferResource(device, gpu, infoSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        s_InstanceInfoBuffer);
-    void* infoMapped = nullptr;
-    vkMapMemory(device, s_InstanceInfoBuffer.memory, 0, infoSize, 0, &infoMapped);
-    memcpy(infoMapped, infoData.data(), infoSize);
-    vkUnmapMemory(device, s_InstanceInfoBuffer.memory);
+    if (s_InstanceCapacity > 0)
+        DestroyTLASRingResources(device);
 
-    // ── 创建 TLAS instance buffer ──
-    VkDeviceSize bufSize = vkInstances.size() * sizeof(VkAccelerationStructureInstanceKHR);
-    CreateBufferResource(device, gpu, bufSize,
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, s_InstanceBuffer);
-
-    void* mapped = nullptr;
-    vkMapMemory(device, s_InstanceBuffer.memory, 0, bufSize, 0, &mapped);
-    memcpy(mapped, vkInstances.data(), bufSize);
-    vkUnmapMemory(device, s_InstanceBuffer.memory);
-
+    // ── 查询容量对应的构建尺寸（instance 数据地址不影响尺寸，填 0 即可）──
     VkAccelerationStructureGeometryInstancesDataKHR instData{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR };
-    instData.data.deviceAddress = s_InstanceBuffer.address;
+    instData.data.deviceAddress = 0;
 
     VkAccelerationStructureGeometryKHR geom{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
     geom.geometryType     = VK_GEOMETRY_TYPE_INSTANCES_KHR;
     geom.geometry.instances = instData;
 
-    uint32_t primCount = instanceCount;
+    uint32_t primCount = capacity;
     VkAccelerationStructureBuildGeometryInfoKHR buildInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
     buildInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
     buildInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
@@ -463,32 +463,171 @@ static void BuildTLAS(VkCommandBuffer cmd, VkDevice device, VkPhysicalDevice gpu
     VkAccelerationStructureBuildSizesInfoKHR sizeInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
     pfn_vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &primCount, &sizeInfo);
 
-    VkResult r1 = CreateBufferResource(device, gpu, sizeInfo.accelerationStructureSize,
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s_TLAS.asBuffer);
-    if (r1 != VK_SUCCESS) { fprintf(stderr, "[VPT] TLAS AS buffer alloc FAILED: %d\n", r1); return; }
+    // ── 每槽位 TLAS 存储 buffer + handle ──
+    for (uint32_t i = 0; i < kTLASRingSize; i++)
+    {
+        BLASResource& slot = s_TLASRing[i];
+        VkResult r1 = CreateBufferResource(device, gpu, sizeInfo.accelerationStructureSize,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, slot.asBuffer);
+        if (r1 != VK_SUCCESS) {
+            fprintf(stderr, "[VPT] TLAS ring[%u] AS buffer alloc FAILED: %d\n", i, r1);
+            return false;
+        }
 
-    VkResult r2 = CreateBufferResource(device, gpu, std::max(sizeInfo.buildScratchSize, (VkDeviceSize)1),
+        VkAccelerationStructureCreateInfoKHR asci{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR };
+        asci.buffer = slot.asBuffer.buffer;
+        asci.size   = sizeInfo.accelerationStructureSize;
+        asci.type   = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+        VkResult r2 = pfn_vkCreateAccelerationStructureKHR(device, &asci, nullptr, &slot.handle);
+        if (r2 != VK_SUCCESS) {
+            fprintf(stderr, "[VPT] TLAS ring[%u] vkCreateAccelerationStructure FAILED: %d\n", i, r2);
+            return false;
+        }
+    }
+
+    // ── 共享 scratch（同队列构建串行执行，单个 scratch 即可）──
+    VkResult r3 = CreateBufferResource(device, gpu, std::max(sizeInfo.buildScratchSize, (VkDeviceSize)1),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s_TLAS.scratchBuffer);
-    if (r2 != VK_SUCCESS) { fprintf(stderr, "[VPT] TLAS scratch buffer alloc FAILED: %d\n", r2); return; }
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s_TLASScratch);
+    if (r3 != VK_SUCCESS) {
+        fprintf(stderr, "[VPT] TLAS scratch buffer alloc FAILED: %d\n", r3);
+        return false;
+    }
 
-    VkAccelerationStructureCreateInfoKHR asci{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR };
-    asci.buffer = s_TLAS.asBuffer.buffer;
-    asci.size   = sizeInfo.accelerationStructureSize;
-    asci.type   = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-    VkResult r3 = pfn_vkCreateAccelerationStructureKHR(device, &asci, nullptr, &s_TLAS.handle);
-    if (r3 != VK_SUCCESS) { fprintf(stderr, "[VPT] TLAS vkCreateAccelerationStructure FAILED: %d\n", r3); return; }
+    // ── 实例数组：host-visible 常驻映射（仅 TLAS 构建时读一次，带宽微量）──
+    VkDeviceSize instSize = (VkDeviceSize)kTLASRingSize * capacity * sizeof(VkAccelerationStructureInstanceKHR);
+    r3 = CreateBufferResource(device, gpu, instSize,
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, s_InstanceHost);
+    if (r3 != VK_SUCCESS || vkMapMemory(device, s_InstanceHost.memory, 0, instSize, 0, &s_InstanceHostMapped) != VK_SUCCESS) {
+        fprintf(stderr, "[VPT] Instance host buffer alloc FAILED: %d\n", r3);
+        return false;
+    }
 
-    buildInfo.dstAccelerationStructure = s_TLAS.handle;
-    buildInfo.scratchData.deviceAddress = s_TLAS.scratchBuffer.address;
+    // ── InstanceInfo：staging（host-visible 映射）→ device（高频 shader 读）──
+    VkDeviceSize infoSize = (VkDeviceSize)kTLASRingSize * capacity * sizeof(InstanceInfo);
+    r3 = CreateBufferResource(device, gpu, infoSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, s_InstanceInfoStaging);
+    if (r3 != VK_SUCCESS || vkMapMemory(device, s_InstanceInfoStaging.memory, 0, infoSize, 0, &s_InstanceInfoStagingMapped) != VK_SUCCESS) {
+        fprintf(stderr, "[VPT] InstanceInfo staging alloc FAILED: %d\n", r3);
+        return false;
+    }
+    r3 = CreateBufferResource(device, gpu, infoSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, s_InstanceInfoDevice);
+    if (r3 != VK_SUCCESS) {
+        fprintf(stderr, "[VPT] InstanceInfo device buffer alloc FAILED: %d\n", r3);
+        return false;
+    }
+
+    s_InstanceCapacity = capacity;
+    s_CurrentRing      = 0;
+    s_TLASPending      = false;
+    fprintf(stderr, "[VPT] TLAS ring allocated: %u slots x %u instances\n", kTLASRingSize, capacity);
+    return true;
+}
+
+// CPU 侧：把实例数据写入指定槽位的 host 映射内存（零分配、零同步）
+static void WriteInstanceData(const VPT_InstanceData* instances, int32_t instanceCount, uint32_t ringIdx)
+{
+    VkDeviceSize instOff = (VkDeviceSize)ringIdx * s_InstanceCapacity * sizeof(VkAccelerationStructureInstanceKHR);
+    VkDeviceSize infoOff = (VkDeviceSize)ringIdx * s_InstanceCapacity * sizeof(InstanceInfo);
+
+    auto* vkInstances = reinterpret_cast<VkAccelerationStructureInstanceKHR*>(
+        (uint8_t*)s_InstanceHostMapped + instOff);
+    auto* infoData = reinterpret_cast<InstanceInfo*>(
+        (uint8_t*)s_InstanceInfoStagingMapped + infoOff);
+
+    for (int32_t i = 0; i < instanceCount; i++)
+    {
+        const VPT_InstanceData& src = instances[i];
+        VkAccelerationStructureInstanceKHR& dst = vkInstances[i];
+
+        VkAccelerationStructureDeviceAddressInfoKHR addrInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR };
+        addrInfo.accelerationStructure = s_BLASes[src.blasID].handle;
+        dst.accelerationStructureReference = pfn_vkGetAccelerationStructureDeviceAddressKHR(s_Device, &addrInfo);
+
+        memcpy(&dst.transform, src.transform, sizeof(float) * 12);
+        dst.instanceCustomIndex = src.materialID;
+        dst.mask = 0xFF;
+        dst.instanceShaderBindingTableRecordOffset = 0;
+        dst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR
+                  | VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+
+        // 填充 InstanceInfo（供 shader 读取顶点属性用；下标必须与 TLAS 实例数组一致）
+        memcpy(infoData[i].transformRow0, &src.transform[0], sizeof(float) * 4);
+        memcpy(infoData[i].transformRow1, &src.transform[4], sizeof(float) * 4);
+        memcpy(infoData[i].transformRow2, &src.transform[8], sizeof(float) * 4);
+        infoData[i].vertexOffset = s_MeshVertexOffsets[src.blasID];
+        infoData[i].indexOffset  = s_MeshIndexOffsets[src.blasID];
+        infoData[i].materialID   = src.materialID;
+        infoData[i].pad          = 0;
+    }
+}
+
+// GPU 侧：向 cmd 录制 InstanceInfo 上传 + TLAS 重建（目标槽位 ringIdx）
+static void RecordTLASBuild(VkCommandBuffer cmd, VkDevice device, uint32_t ringIdx, uint32_t instanceCount)
+{
+    if (instanceCount == 0) return;
+
+    VkDeviceSize instOff = (VkDeviceSize)ringIdx * s_InstanceCapacity * sizeof(VkAccelerationStructureInstanceKHR);
+    VkDeviceSize infoOff = (VkDeviceSize)ringIdx * s_InstanceCapacity * sizeof(InstanceInfo);
+
+    // Barrier A: host 写 staging → transfer 读
+    VkMemoryBarrier hostToTransfer{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    hostToTransfer.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    hostToTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &hostToTransfer, 0, nullptr, 0, nullptr);
+
+    // InstanceInfo staging → device-local（本槽位切片）
+    VkBufferCopy infoCopy{};
+    infoCopy.srcOffset = infoOff;
+    infoCopy.dstOffset = infoOff;
+    infoCopy.size      = (VkDeviceSize)instanceCount * sizeof(InstanceInfo);
+    vkCmdCopyBuffer(cmd, s_InstanceInfoStaging.buffer, s_InstanceInfoDevice.buffer, 1, &infoCopy);
+
+    // Barrier B: host 写实例数组 + transfer 写 InstanceInfo → AS 构建/着色器读
+    VkMemoryBarrier preBuild{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    preBuild.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    preBuild.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &preBuild, 0, nullptr, 0, nullptr);
+
+    // ── TLAS 重建（每帧全量 rebuild；instance 数少成本极低，且无 refit 退化问题）──
+    VkAccelerationStructureGeometryInstancesDataKHR instData{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR };
+    instData.data.deviceAddress = s_InstanceHost.address + instOff;
+
+    VkAccelerationStructureGeometryKHR geom{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
+    geom.geometryType     = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    geom.geometry.instances = instData;
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
+    buildInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    buildInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries   = &geom;
+    buildInfo.dstAccelerationStructure = s_TLASRing[ringIdx].handle;
+    buildInfo.scratchData.deviceAddress = s_TLASScratch.address;
 
     VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
-    rangeInfo.primitiveCount = primCount;
+    rangeInfo.primitiveCount = instanceCount;
     const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfo = &rangeInfo;
     pfn_vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &pRangeInfo);
 
-    fprintf(stderr, "[VPT] TLAS: %d instances built\n", instanceCount);
+    // Barrier C: TLAS 构建写 → 本帧 dispatch 读
+    VkMemoryBarrier postBuild{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    postBuild.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    postBuild.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &postBuild, 0, nullptr, 0, nullptr);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -574,7 +713,17 @@ void VPTScene::UpdateScene(const VPT_SceneUpdate& su)
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
         0, 1, &blasBarrier, 0, nullptr, 0, nullptr);
 
-    BuildTLAS(cmd, device, gpu, su.instances, su.instanceCount);
+    // ── TLAS 环形资源分配（静态拓扑变化时一次性）+ 首次构建（槽位 0）──
+    if (EnsureTLASResources(device, gpu, (uint32_t)(su.instanceCount > 0 ? su.instanceCount : 1)))
+    {
+        s_CurrentRing = 0;
+        WriteInstanceData(su.instances, su.instanceCount, 0);
+        RecordTLASBuild(cmd, device, 0, (uint32_t)su.instanceCount);
+    }
+    else
+    {
+        fprintf(stderr, "[VPT] TLAS ring allocation FAILED\n");
+    }
 
     vkEndCommandBuffer(cmd);
 
@@ -615,16 +764,50 @@ void VPTScene::DestroyResources()
     DestroyBufferResource(s_Device, s_UnifiedIndexBuffer);
     DestroyBufferResource(s_Device, s_MaterialBuffer);
     DestroyBufferResource(s_Device, s_LightBuffer);
-    DestroyBufferResource(s_Device, s_InstanceBuffer);
-    DestroyBufferResource(s_Device, s_InstanceInfoBuffer);
-    DestroyBLASResource(s_Device, s_TLAS);
+    DestroyTLASRingResources(s_Device);
     s_MeshVertexOffsets.clear();
     s_MeshIndexOffsets.clear();
 
     s_Ready = false;
 }
 
-VkAccelerationStructureKHR VPTScene::GetTLAS() { return s_TLAS.handle; }
+// ═══════════════════════════════════════════════════════════
+//  动态场景：每帧实例更新（仅刚体 Transform，BLAS 不动）
+// ═══════════════════════════════════════════════════════════
+
+void VPTScene::UpdateInstances(const VPT_InstanceData* instances, int32_t instanceCount)
+{
+    if (!s_ExtensionsReady || !instances || instanceCount <= 0 || s_BLASes.empty())
+        return;
+
+    // 扩容（实例数超过预分配容量，低频路径）：需 GPU idle 后重建环形资源
+    if ((uint32_t)instanceCount > s_InstanceCapacity)
+    {
+        const UnityVulkanInstance& inst = VPT_GetInstance();
+        vkDeviceWaitIdle(inst.device);
+        if (!EnsureTLASResources(inst.device, inst.physicalDevice, (uint32_t)instanceCount))
+            return;
+        // 扩容后所有槽位均未构建，当前帧必须重建（s_TLASPending 由下方统一置位）
+    }
+
+    // 轮转槽位：历史在飞行帧仍在读旧槽位，写入新槽位避免覆盖
+    s_CurrentRing = (s_CurrentRing + 1) % kTLASRingSize;
+    WriteInstanceData(instances, instanceCount, s_CurrentRing);
+
+    s_PendingCount = (uint32_t)instanceCount;
+    s_TLASPending  = true;
+}
+
+void VPTScene::RecordTLASUpdateIfNeeded(VkCommandBuffer cmd)
+{
+    if (!s_TLASPending || cmd == VK_NULL_HANDLE)
+        return;
+
+    RecordTLASBuild(cmd, s_Device, s_CurrentRing, s_PendingCount);
+    s_TLASPending = false;
+}
+
+VkAccelerationStructureKHR VPTScene::GetTLAS() { return s_TLASRing[s_CurrentRing].handle; }
 bool VPTScene::IsReady() { return s_Ready; }
 bool VPTScene::AreExtensionsReady() { return s_ExtensionsReady; }
 
@@ -637,6 +820,10 @@ uint32_t VPTScene::FindMemoryType(VkPhysicalDevice gpu, uint32_t typeFilter, VkM
 // ── Getter（供 dispatch 绑定 SSBO）──
 VkBuffer VPTScene::GetUnifiedVertexBuffer() { return s_UnifiedVertexBuffer.buffer; }
 VkBuffer VPTScene::GetUnifiedIndexBuffer() { return s_UnifiedIndexBuffer.buffer; }
-VkBuffer VPTScene::GetInstanceInfoBuffer() { return s_InstanceInfoBuffer.buffer; }
+VkBuffer VPTScene::GetInstanceInfoBuffer() { return s_InstanceInfoDevice.buffer; }
+VkDeviceSize VPTScene::GetInstanceInfoOffset()
+{
+    return (VkDeviceSize)s_CurrentRing * s_InstanceCapacity * sizeof(InstanceInfo);
+}
 VkBuffer VPTScene::GetMaterialBuffer() { return s_MaterialBuffer.buffer; }
 VkBuffer VPTScene::GetLightBuffer() { return s_LightBuffer.buffer; }

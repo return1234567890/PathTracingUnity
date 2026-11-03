@@ -24,6 +24,13 @@ extern "C" {
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_UpdateScene(
         const VPT_SceneUpdate* sceneUpdate);
 
+    /// 动态场景：仅更新实例变换（每帧调用，刚体运动，BLAS 不动）
+    /// 写入常驻 host 缓冲并标记 TLAS 待重建，实际 build 在下一次 dispatch 前录制
+    /// instances: 指向 VPT_InstanceData 数组（顺序必须与 VPT_UpdateScene 一致）
+    /// instanceCount: 实例数（可小于初始容量，超出时内部扩容）
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_UpdateInstances(
+        const VPT_InstanceData* instances, int32_t instanceCount);
+
     /// 执行路径追踪 dispatch（阶段4）
     /// outputPtr/gbuf0Ptr/gbuf1Ptr: Unity RenderTexture 的原生指针（输出/G-Buffer）
     /// diffuseAlbedoPtr/specularAlbedoPtr: DLSS RR albedo G-buffer RT 指针

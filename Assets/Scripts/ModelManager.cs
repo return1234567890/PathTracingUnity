@@ -190,6 +190,7 @@ public class ModelManager : MonoBehaviour
         var meshToBlas   = new Dictionary<Mesh, int>();
         var meshToVertBase = new Dictionary<Mesh, int>();
         var meshToTriBase  = new Dictionary<Mesh, int>();
+        _instanceTracker.Clear();
 
         // 1. 收集场景中的 MeshFilter
         MeshFilter[] filters = FindObjectsOfType<MeshFilter>();
@@ -275,6 +276,14 @@ public class ModelManager : MonoBehaviour
             // —— 1c. 添加实例（object→world 变换由 TinyScene 处理）——
             Scene.AddInstance(blasId, go.transform, materialId);
             collectedInstanceCount++;
+
+            // 动态场景：登记追踪表，供每帧 SyncInstancesNative 重读 Transform
+            _instanceTracker.Add(new NativeInstanceTracker
+            {
+                transform  = go.transform,
+                materialID = (uint)materialId,
+                blasID     = (uint)blasId
+            });
         }
 
         // 2. 构建 TLAS + 组装全局 BLAS 数据
@@ -501,6 +510,19 @@ public class ModelManager : MonoBehaviour
     // 非托管内存分配列表（场景重建前 FreeHGlobal）
     private System.Collections.Generic.List<IntPtr> _nativeAllocs = new();
 
+    // ── 动态场景：实例追踪表（BuildScene 收集，每帧重读 Transform 推送 native）──
+    private struct NativeInstanceTracker
+    {
+        public Transform transform;  // 物体世界变换（刚体运动）
+        public uint materialID;
+        public uint blasID;
+    }
+    private readonly List<NativeInstanceTracker> _instanceTracker = new();
+    // 每帧复用的非托管实例数组缓冲（56B/元素，避免逐帧分配/封送）
+    private IntPtr _instanceNativeBuffer = IntPtr.Zero;
+    private int _instanceNativeCapacity = 0;
+    private readonly float[] _transformScratch = new float[12]; // 3x4 行主序
+
     /// <summary>是否有待推送的场景数据（插件未就绪时延迟）。</summary>
     public bool NativePushPending => _nativePushPending;
 
@@ -649,11 +671,76 @@ public class ModelManager : MonoBehaviour
                   $"{vptInstances.Length} instances");
     }
 
+    // ═════════════════════════════════════════════════════════
+    //  动态场景：每帧实例同步（刚体运动，仅重建 TLAS，BLAS 不动）
+    //  由 PathTraceRendererFeature 在 PrepareDispatch 之前调用。
+    //  时域累积交由 DLSS RR 处理，无需额外重置逻辑。
+    // ═════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// 把追踪表内活跃实例的当前 localToWorldMatrix 写入复用缓冲，
+    /// 调用 VPT_UpdateInstances 触发 native 侧下一帧 TLAS 重建。
+    /// 隐藏（activeInHierarchy=false）的实例跳过；实例顺序保持稳定。
+    /// </summary>
+    public void SyncInstancesNative()
+    {
+        if (_instanceTracker.Count == 0)
+            return;
+        if (!NativeBridge.TryInitialize())
+            return;
+
+        EnsureInstanceNativeBuffer(_instanceTracker.Count);
+
+        int stride = Marshal.SizeOf<NativeBridge.VPT_InstanceData>(); // 56B，与 native 布局一致
+        int written = 0;
+        for (int i = 0; i < _instanceTracker.Count; i++)
+        {
+            Transform t = _instanceTracker[i].transform;
+            if (t == null || !t.gameObject.activeInHierarchy)
+                continue;
+
+            // 4x4 行主序取前 3 行 → 3x4（与 VkAccelerationStructureInstanceKHR 兼容）
+            Matrix4x4 m = t.localToWorldMatrix;
+            for (int row = 0; row < 3; row++)
+                for (int col = 0; col < 4; col++)
+                    _transformScratch[row * 4 + col] = m[row, col];
+
+            IntPtr dst = _instanceNativeBuffer + written * stride;
+            Marshal.WriteInt32(dst, 0, (int)_instanceTracker[i].materialID);
+            Marshal.WriteInt32(dst, 4, (int)_instanceTracker[i].blasID);
+            Marshal.Copy(_transformScratch, 0, dst + 8, 12);
+            written++;
+        }
+
+        if (written > 0)
+            NativeBridge.VPT_UpdateInstances(_instanceNativeBuffer, written);
+    }
+
+    /// <summary>确保实例非托管缓冲容量（只增不减，避免逐帧分配）</summary>
+    private void EnsureInstanceNativeBuffer(int capacity)
+    {
+        if (capacity <= _instanceNativeCapacity && _instanceNativeBuffer != IntPtr.Zero)
+            return;
+
+        int newCapacity = Mathf.Max(capacity, _instanceNativeCapacity * 2);
+        int stride = Marshal.SizeOf<NativeBridge.VPT_InstanceData>();
+        if (_instanceNativeBuffer != IntPtr.Zero)
+            Marshal.FreeHGlobal(_instanceNativeBuffer);
+        _instanceNativeBuffer = Marshal.AllocHGlobal(newCapacity * stride);
+        _instanceNativeCapacity = newCapacity;
+    }
+
     private void OnDestroyNative()
     {
         foreach (var h in _nativePins) if (h.IsAllocated) h.Free();
         _nativePins.Clear();
         foreach (var p in _nativeAllocs) Marshal.FreeHGlobal(p);
         _nativeAllocs.Clear();
+        if (_instanceNativeBuffer != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(_instanceNativeBuffer);
+            _instanceNativeBuffer = IntPtr.Zero;
+            _instanceNativeCapacity = 0;
+        }
     }
 }

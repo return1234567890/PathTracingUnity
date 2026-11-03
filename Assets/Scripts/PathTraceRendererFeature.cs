@@ -659,6 +659,10 @@ public class PathTraceRenderPass : ScriptableRenderPass
             // ═══ PathTrace ═══
             if (_feature.IsNativeReady)
             {
+                // ── 动态场景：同步实例变换 → native 每帧重建 TLAS（必须在 PrepareDispatch 之前，
+                //    使 descriptor 指向本帧槽位）──
+                mm.SyncInstancesNative();
+
                 // Vulkan RayQuery 硬件加速路径追踪
                 var camData = new NativeBridge.VPT_CameraData
                 {
@@ -988,6 +992,10 @@ public class PathTraceRenderPass : ScriptableRenderPass
     {
         if (!_feature.IsNativeReady)
             return;
+
+        // ── 动态场景：同步实例变换 → native 每帧重建 TLAS ──
+        if (ModelManager.Instance != null)
+            ModelManager.Instance.SyncInstancesNative();
 
         Camera camera = renderingData.cameraData.camera;
         int w = _feature.debugDepthResolution;

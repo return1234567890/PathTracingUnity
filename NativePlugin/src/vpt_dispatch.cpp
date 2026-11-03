@@ -378,6 +378,9 @@ void VPTDispatch::DispatchDebugDepth(
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
+    // ── 动态场景：每帧 TLAS 重建（若本帧有实例更新，优先于 dispatch 录制）──
+    VPTScene::RecordTLASUpdateIfNeeded(cmd);
+
     // Barrier 1: UBO host write → compute shader read
     VkBufferMemoryBarrier uboBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
     uboBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
@@ -788,6 +791,8 @@ void VPTDispatch::DispatchPathTrace(
         ssboInfos[i].offset = 0;
         ssboInfos[i].range  = VK_WHOLE_SIZE;
     }
+    // InstanceInfo 绑定当前 TLAS 环形槽位切片（动态场景每帧变化）
+    ssboInfos[2].offset = VPTScene::GetInstanceInfoOffset();
 
     // ── Texture array descriptor info (4 combined image samplers) ──
     VkDescriptorImageInfo texInfos[4] = {};
@@ -904,6 +909,9 @@ void VPTDispatch::DispatchPathTrace(
     VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
+
+    // ── 动态场景：每帧 TLAS 重建（若本帧有实例更新，优先于 dispatch 录制）──
+    VPTScene::RecordTLASUpdateIfNeeded(cmd);
 
     // Barrier 1: UBO host write → compute read
     VkBufferMemoryBarrier uboBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
@@ -1086,6 +1094,8 @@ void VPTDispatch::PrepareDispatch(
         ssboInfos[i].offset = 0;
         ssboInfos[i].range  = VK_WHOLE_SIZE;
     }
+    // InstanceInfo 绑定当前 TLAS 环形槽位切片（动态场景每帧变化）
+    ssboInfos[2].offset = VPTScene::GetInstanceInfoOffset();
 
     VkDescriptorImageInfo texInfos[4] = {};
     for (int i = 0; i < 4; i++)
@@ -1228,6 +1238,9 @@ void VPTDispatch::RenderCallback(int eventID)
     }
 
     VkDevice device = VPT_GetInstance().device;
+
+    // ── 动态场景：每帧 TLAS 重建（若本帧有实例更新，优先于 dispatch 录制）──
+    VPTScene::RecordTLASUpdateIfNeeded(cmd);
 
     // ── Barrier 1: UBO host write → compute read + 3 images → GENERAL ──
     VkBufferMemoryBarrier uboBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };

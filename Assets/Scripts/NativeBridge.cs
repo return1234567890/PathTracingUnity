@@ -50,6 +50,16 @@ public static class NativeBridge
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_UpdateScene(IntPtr sceneUpdate);
 
+    /// <summary>
+    /// 动态场景：仅更新实例变换（每帧调用）。
+    /// 实例顺序必须与 VPT_UpdateScene 时一致（shader 按实例数组下标索引）。
+    /// 实例数可小于初始容量，超出时 native 侧扩容（低频，会触发一次 vkDeviceWaitIdle）。
+    /// </summary>
+    /// <param name="instances">指向 VPT_InstanceData 数组（56B/元素）</param>
+    /// <param name="instanceCount">实例数</param>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_UpdateInstances(IntPtr instances, int instanceCount);
+
     /// <summary>执行路径追踪 dispatch（阶段4）</summary>
     /// <param name="outputPtr">输出 RT 原生指针</param>
     /// <param name="gbuf0Ptr">G-Buffer0 (pos+depth) RT 原生指针</param>
