@@ -80,6 +80,9 @@ static_assert(sizeof(VPT_Light) == 32, "VPT_Light must be 32 bytes");
 //  P/Invoke 传输结构（C# → Native 的数据描述）
 // ═══════════════════════════════════════════════════════════
 
+/// VPT_MeshData.flags 位掩码
+constexpr uint32_t VPT_MESH_FLAG_DEFORMABLE = 1u; // bit0: 支持变形（BLAS 加 ALLOW_UPDATE，可 refit）
+
 /// 网格数据描述（C# 侧 GCHandle.Pinned 后传入指针）
 struct VPT_MeshData
 {
@@ -88,6 +91,7 @@ struct VPT_MeshData
     const uint32_t*   indices;     // 索引数据指针
     uint32_t          indexCount;  // 索引数量（=三角形数*3）
     uint32_t          materialID;  // 材质 ID
+    uint32_t          flags;       // VPT_MESH_FLAG_*（deformable 等）
 };
 
 /// 实例数据（Transform 矩阵 + BLAS/Material 关联）

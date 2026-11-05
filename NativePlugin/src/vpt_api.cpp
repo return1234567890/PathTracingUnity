@@ -123,6 +123,49 @@ VPT_UpdateInstances(const VPT_InstanceData* instances, int32_t instanceCount)
     VPTScene::UpdateInstances(instances, instanceCount);
 }
 
+// ── VPT_UpdateMeshVertices（骨骼动画：阶段1 CPU 验证路径）──
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_UpdateMeshVertices(uint32_t blasID, const VPT_Vertex* vertices, uint32_t vertexCount)
+{
+    if (!VPT_IsInitialized() || !vertices || vertexCount == 0)
+        return;
+
+    VPTScene::UpdateMeshVertices(blasID, vertices, vertexCount);
+}
+
+// ── VPT_RegisterSkinnedMesh（骨骼动画：阶段2 GPU 蒙皮静态数据注册）──
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_RegisterSkinnedMesh(uint32_t blasID, const float* weights, const int32_t* joints,
+                         int32_t vertexCount, int32_t jointCount)
+{
+    if (!VPT_IsInitialized() || !weights || !joints
+        || vertexCount <= 0 || jointCount <= 0)
+        return;
+
+    VPTScene::RegisterSkinnedMesh(blasID, weights, joints,
+        (uint32_t)vertexCount, (uint32_t)jointCount);
+}
+
+// ── VPT_UpdateSkinning（骨骼动画：阶段2 每帧关节矩阵）──
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_UpdateSkinning(uint32_t blasID, const float* jointMatrices, int32_t jointCount)
+{
+    if (!VPT_IsInitialized() || !jointMatrices || jointCount <= 0)
+        return;
+
+    VPTScene::UpdateSkinning(blasID, jointMatrices, (uint32_t)jointCount);
+}
+
+// ── VPT_SetDeformableRebuildInterval（骨骼动画：阶段3 refit 质量衰减对策）──
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_SetDeformableRebuildInterval(uint32_t interval)
+{
+    if (!VPT_IsInitialized())
+        return;
+
+    VPTScene::SetDeformableRebuildInterval(interval);
+}
+
 // ── VPT_DispatchPathTrace（阶段3实现）─────────────────────
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 VPT_DispatchPathTrace(

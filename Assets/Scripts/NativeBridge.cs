@@ -60,6 +60,55 @@ public static class NativeBridge
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_UpdateInstances(IntPtr instances, int instanceCount);
 
+    /// <summary>
+    /// 骨骼动画（阶段1 CPU 验证路径）：更新指定 BLAS 的变形顶点（每帧调用）。
+    /// 顶点为 BakeMesh(useRotation:false) 得到的 SMR 局部空间数据，
+    /// native 侧写入常驻 staging 环形槽位，dispatch 前 staged 上传 + BLAS 原地 refit。
+    /// blasID 对应的 mesh 须以 flags.deformable=1 上传（否则 native 侧忽略并告警）。
+    /// </summary>
+    /// <param name="blasID">BLAS 索引（与 VPT_UpdateScene 时的 mesh 顺序一致）</param>
+    /// <param name="vertices">指向 VertexGpuData 数组（80B/顶点，pinned）</param>
+    /// <param name="vertexCount">顶点数（须与首次上传一致）</param>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_UpdateMeshVertices(uint blasID, IntPtr vertices, uint vertexCount);
+
+    /// <summary>
+    /// 骨骼动画（阶段2 GPU 蒙皮）：注册蒙皮 mesh 静态数据（一次性；场景重建后须重新注册）。
+    /// native 侧自统一顶点缓冲复制 bind-pose base 副本（蒙皮 compute 读 base 写统一缓冲，
+    /// 避免在已变形数据上反复蒙皮），上传权重/关节索引，分配关节矩阵环形缓冲。
+    /// bindposes 不上传：由 C# 每帧折算进关节矩阵（worldToLocal * bone.localToWorld * bindpose）。
+    /// blasID 须以 flags.deformable=1 上传，vertexCount 须与首次上传一致。
+    /// </summary>
+    /// <param name="blasID">BLAS 索引（与 VPT_UpdateScene 时的 mesh 顺序一致）</param>
+    /// <param name="weights">vec4/顶点权重数组（boneWeights 展开，pinned）</param>
+    /// <param name="joints">ivec4/顶点骨骼索引数组（pinned）</param>
+    /// <param name="vertexCount">顶点数（须与首次上传一致）</param>
+    /// <param name="jointCount">关节数（smr.bones.Length）</param>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_RegisterSkinnedMesh(
+        uint blasID, IntPtr weights, IntPtr joints, int vertexCount, int jointCount);
+
+    /// <summary>
+    /// 骨骼动画（阶段2 GPU 蒙皮）：每帧上传关节矩阵（jointCount 个 mat4，行主序）。
+    /// 写入 host-visible 环形槽位，dispatch 前 native 录制蒙皮 compute + BLAS refit +
+    /// TLAS 重建。须先 VPT_RegisterSkinnedMesh，否则 native 侧忽略并告警。
+    /// </summary>
+    /// <param name="blasID">BLAS 索引</param>
+    /// <param name="jointMatrices">jointCount*16 个 float（行主序，pinned）</param>
+    /// <param name="jointCount">关节数（须与注册时一致）</param>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_UpdateSkinning(uint blasID, IntPtr jointMatrices, int jointCount);
+
+    /// <summary>
+    /// 骨骼动画（阶段3 refit 质量衰减对策）：设置变形 BLAS 全量 rebuild 间隔。
+    /// refit 是原地包络微调，大幅变形多帧后 BVH 遍历效率下降；某 BLAS 累计 interval 次
+    /// refit 后 native 侧改走一次 mode=BUILD 全量重建（复用 dstAS/scratch），随后计数清零。
+    /// 0=禁用（始终 refit）。
+    /// </summary>
+    /// <param name="interval">refit 间隔次数（0=禁用）</param>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_SetDeformableRebuildInterval(uint interval);
+
     /// <summary>执行路径追踪 dispatch（阶段4）</summary>
     /// <param name="outputPtr">输出 RT 原生指针</param>
     /// <param name="gbuf0Ptr">G-Buffer0 (pos+depth) RT 原生指针</param>
@@ -475,7 +524,11 @@ public static class NativeBridge
         public IntPtr indices;       // 指向 uint32 索引数组
         public uint   indexCount;
         public uint   materialID;
+        public uint   flags;         // VPT_MESH_FLAG_*：bit0=deformable（骨骼动画 refit）
     }
+
+    /// <summary>VPT_MeshData.flags 位掩码（与 vpt_types.h 对齐）</summary>
+    public const uint VPT_MESH_FLAG_DEFORMABLE = 1u;
 
     /// <summary>场景更新打包结构（P/Invoke 传输用）</summary>
     [StructLayout(LayoutKind.Sequential)]

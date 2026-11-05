@@ -21,6 +21,51 @@ namespace VPTScene {
     /// 由 dispatch 路径（RenderCallback / 遗留 dispatch / debug depth）在绑定管线前调用。
     void RecordTLASUpdateIfNeeded(VkCommandBuffer cmd);
 
+    /// 骨骼动画（阶段1 CPU 验证路径）：更新指定 BLAS 的变形顶点。
+    /// 顶点写入常驻 host-visible staging 环形槽位，标记 BLAS 待 refit，
+    /// 实际 上传+refit 在下一次 dispatch 前由 RecordBLASRefitIfNeeded 录制。
+    /// vertices: VPT_Vertex 数组（80B/顶点），必须与该 BLAS 首次上传的顶点数一致。
+    void UpdateMeshVertices(uint32_t blasID, const VPT_Vertex* vertices, uint32_t vertexCount);
+
+    /// 若本帧有变形顶点更新，向命令缓冲录制：staging→统一顶点缓冲拷贝 +
+    /// BLAS 原地 refit（mode=UPDATE）+ barrier 链。
+    /// 必须在 RecordTLASUpdateIfNeeded 之前调用（TLAS 引用 BLAS 内容时 refit 需先行）。
+    void RecordBLASRefitIfNeeded(VkCommandBuffer cmd);
+
+    // ── 骨骼动画（阶段2 GPU 蒙皮，对齐参考项目 AnimationVk）──
+
+    /// 注册蒙皮 mesh 的静态数据（一次性；场景重建后须重新注册）。
+    /// 从统一顶点缓冲复制 bind-pose base 副本（蒙皮 compute 读 base 写统一缓冲，
+    /// 避免在已变形数据上反复蒙皮），上传权重/关节索引，分配关节矩阵环形缓冲。
+    /// blasID 须以 VPT_MESH_FLAG_DEFORMABLE 上传，vertexCount 须与首次上传一致。
+    /// bindposes 不上传：C# 每帧折算进关节矩阵（worldToLocal * bone.localToWorld * bindpose）。
+    /// weights: vec4/顶点；joints: ivec4/顶点。
+    void RegisterSkinnedMesh(uint32_t blasID,
+                             const float* weights, const int32_t* joints,
+                             uint32_t vertexCount, uint32_t jointCount);
+
+    /// 每帧上传关节矩阵（jointCount 个 mat4，行主序 vec4 行）。
+    /// 写入常驻 host-visible 环形槽位，标记待蒙皮；dispatch 前由
+    /// RecordGPUSkinningIfNeeded 录制 compute dispatch，BLAS refit 由
+    /// RecordBLASRefitIfNeeded 统一处理。
+    /// 须先 RegisterSkinnedMesh，否则忽略并告警。
+    void UpdateSkinning(uint32_t blasID, const float* jointMatrices, uint32_t jointCount);
+
+    /// 若本帧有关节矩阵更新，向命令缓冲录制：host barrier + 蒙皮 compute dispatch +
+    /// compute 写→AS build 读 barrier。必须在 RecordBLASRefitIfNeeded 之前调用
+    /// （refit 引用蒙皮后的新顶点），dispatch 点须以
+    /// RecordGPUSkinningIfNeeded → RecordBLASRefitIfNeeded → RecordTLASUpdateIfNeeded 顺序调用。
+    void RecordGPUSkinningIfNeeded(VkCommandBuffer cmd);
+
+    // ── 骨骼动画（阶段3 refit 质量衰减对策）──
+
+    /// 设置变形 BLAS 全量 rebuild 间隔（C# Inspector 暴露，随参数变化调用）。
+    /// refit 是原地包络微调，大幅变形多帧后 BVH 遍历效率下降；某变形 BLAS
+    /// 累计 refit 达到 interval 次后，下一次改走 mode=BUILD 全量重建（复用
+    /// dstAS/scratch），随后计数清零继续 refit。interval=0 禁用（始终 refit）。
+    /// 计数在 RecordBLASRefitIfNeeded 中按 BLAS 累计，场景重建时随资源一起清零。
+    void SetDeformableRebuildInterval(uint32_t interval);
+
     /// 销毁所有场景资源（VkBuffer/VkDeviceMemory/VkAccelerationStructureKHR）
     void DestroyResources();
 

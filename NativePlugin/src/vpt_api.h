@@ -31,6 +31,36 @@ extern "C" {
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_UpdateInstances(
         const VPT_InstanceData* instances, int32_t instanceCount);
 
+    /// 骨骼动画（阶段1 CPU 验证路径）：更新指定 BLAS 的变形顶点（每帧调用）
+    /// 把 BakeMesh 得到的变形顶点写入常驻 staging 环形槽位，标记 BLAS 待 refit，
+    /// 实际 上传+refit 在下一次 dispatch 前录制
+    /// blasID: VPT_UpdateScene 时的 mesh 索引（须以 VPT_MESH_FLAG_DEFORMABLE 上传）
+    /// vertices: VPT_Vertex 数组（80B/顶点），顶点数须与首次上传一致
+    /// vertexCount: 顶点数
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_UpdateMeshVertices(
+        uint32_t blasID, const VPT_Vertex* vertices, uint32_t vertexCount);
+
+    /// 骨骼动画（阶段2 GPU 蒙皮）：注册蒙皮 mesh 静态数据（一次性；场景重建后须重新注册）
+    /// native 侧自统一顶点缓冲复制 bind-pose base 副本，上传权重/关节索引，
+    /// 分配关节矩阵环形缓冲。blasID 须以 VPT_MESH_FLAG_DEFORMABLE 上传，
+    /// vertexCount 须与首次上传一致；bindposes 不上传（C# 每帧折算进关节矩阵）。
+    /// weights: vec4/顶点（boneWeights 权重）；joints: ivec4/顶点（骨骼索引）
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_RegisterSkinnedMesh(
+        uint32_t blasID, const float* weights, const int32_t* joints,
+        int32_t vertexCount, int32_t jointCount);
+
+    /// 骨骼动画（阶段2 GPU 蒙皮）：每帧上传关节矩阵（jointCount 个 mat4，行主序）
+    /// 写入 host-visible 环形槽位，dispatch 前 native 录制蒙皮 compute + BLAS refit。
+    /// 须先 VPT_RegisterSkinnedMesh，否则忽略并告警。
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_UpdateSkinning(
+        uint32_t blasID, const float* jointMatrices, int32_t jointCount);
+
+    /// 骨骼动画（阶段3 refit 质量衰减对策）：设置变形 BLAS 全量 rebuild 间隔。
+    /// 某 BLAS 累计 interval 次 refit 后改走一次 mode=BUILD 全量重建（恢复 BVH
+    /// 遍历效率），随后计数清零；0=禁用（始终 refit）。
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_SetDeformableRebuildInterval(
+        uint32_t interval);
+
     /// 执行路径追踪 dispatch（阶段4）
     /// outputPtr/gbuf0Ptr/gbuf1Ptr: Unity RenderTexture 的原生指针（输出/G-Buffer）
     /// diffuseAlbedoPtr/specularAlbedoPtr: DLSS RR albedo G-buffer RT 指针

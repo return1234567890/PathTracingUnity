@@ -663,6 +663,17 @@ public class PathTraceRenderPass : ScriptableRenderPass
                 //    使 descriptor 指向本帧槽位）──
                 mm.SyncInstancesNative();
 
+                // ── 骨骼动画：BakeMesh 变形顶点 → native staging 上传 + BLAS refit（同样必须
+                //    先于 PrepareDispatch，refit/TLAS 重建均在该帧命令流内录制）──
+                bool skinnedUpdated = mm.SyncSkinnedMeshesNative();
+                if (skinnedUpdated)
+                {
+                    // 几何变形期间历史帧像素不再对应同一几何，重置自研时域累积
+                    // （DLSS RR 路径不走自研累积，此 uniform 仅 TemporalAccumulate 使用）
+                    _accumFrame = 0;
+                    cmd.SetComputeIntParam(cs, "AccumFrame", 0);
+                }
+
                 // Vulkan RayQuery 硬件加速路径追踪
                 var camData = new NativeBridge.VPT_CameraData
                 {
@@ -994,8 +1005,12 @@ public class PathTraceRenderPass : ScriptableRenderPass
             return;
 
         // ── 动态场景：同步实例变换 → native 每帧重建 TLAS ──
+        // ── 骨骼动画：同步变形顶点 → BLAS refit（阶段1验证，debug depth 模式同样需要）──
         if (ModelManager.Instance != null)
+        {
             ModelManager.Instance.SyncInstancesNative();
+            ModelManager.Instance.SyncSkinnedMeshesNative();
+        }
 
         Camera camera = renderingData.cameraData.camera;
         int w = _feature.debugDepthResolution;

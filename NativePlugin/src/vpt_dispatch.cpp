@@ -378,6 +378,12 @@ void VPTDispatch::DispatchDebugDepth(
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
+    // ── 骨骼动画：GPU 蒙皮 dispatch（若有更新，须先于 refit/TLAS，蒙皮 compute 就地写统一顶点缓冲）──
+    VPTScene::RecordGPUSkinningIfNeeded(cmd);
+
+    // ── 骨骼动画：变形顶点上传 + BLAS refit（若有更新，需先于 TLAS 重建）──
+    VPTScene::RecordBLASRefitIfNeeded(cmd);
+
     // ── 动态场景：每帧 TLAS 重建（若本帧有实例更新，优先于 dispatch 录制）──
     VPTScene::RecordTLASUpdateIfNeeded(cmd);
 
@@ -910,6 +916,12 @@ void VPTDispatch::DispatchPathTrace(
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
+    // ── 骨骼动画：GPU 蒙皮 dispatch（若有更新，须先于 refit/TLAS，蒙皮 compute 就地写统一顶点缓冲）──
+    VPTScene::RecordGPUSkinningIfNeeded(cmd);
+
+    // ── 骨骼动画：变形顶点上传 + BLAS refit（若有更新，需先于 TLAS 重建）──
+    VPTScene::RecordBLASRefitIfNeeded(cmd);
+
     // ── 动态场景：每帧 TLAS 重建（若本帧有实例更新，优先于 dispatch 录制）──
     VPTScene::RecordTLASUpdateIfNeeded(cmd);
 
@@ -1238,6 +1250,12 @@ void VPTDispatch::RenderCallback(int eventID)
     }
 
     VkDevice device = VPT_GetInstance().device;
+
+    // ── 骨骼动画：GPU 蒙皮 dispatch（若有更新，须先于 refit/TLAS，蒙皮 compute 就地写统一顶点缓冲）──
+    VPTScene::RecordGPUSkinningIfNeeded(cmd);
+
+    // ── 骨骼动画：变形顶点上传 + BLAS refit（若有更新，需先于 TLAS 重建）──
+    VPTScene::RecordBLASRefitIfNeeded(cmd);
 
     // ── 动态场景：每帧 TLAS 重建（若本帧有实例更新，优先于 dispatch 录制）──
     VPTScene::RecordTLASUpdateIfNeeded(cmd);

@@ -125,9 +125,9 @@ MonoBehaviour:
   hdrEnvironment: {fileID: 2800000, guid: 835de5cc79ea58e4bbd6eb3977eb3ee8, type: 3}
   envIntensity: 1
   envRotation: 0
-  denoisingEnabled: 1
+  denoisingEnabled: 0
   temporalEnabled: 0
-  spatialEnabled: 1
+  spatialEnabled: 0
   spatialPasses: 0
   disocclusionThreshold: 0.02
   normalWeightParam: 0
