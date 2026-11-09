@@ -31,15 +31,6 @@ extern "C" {
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_UpdateInstances(
         const VPT_InstanceData* instances, int32_t instanceCount);
 
-    /// 骨骼动画（阶段1 CPU 验证路径）：更新指定 BLAS 的变形顶点（每帧调用）
-    /// 把 BakeMesh 得到的变形顶点写入常驻 staging 环形槽位，标记 BLAS 待 refit，
-    /// 实际 上传+refit 在下一次 dispatch 前录制
-    /// blasID: VPT_UpdateScene 时的 mesh 索引（须以 VPT_MESH_FLAG_DEFORMABLE 上传）
-    /// vertices: VPT_Vertex 数组（80B/顶点），顶点数须与首次上传一致
-    /// vertexCount: 顶点数
-    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_UpdateMeshVertices(
-        uint32_t blasID, const VPT_Vertex* vertices, uint32_t vertexCount);
-
     /// 骨骼动画（阶段2 GPU 蒙皮）：注册蒙皮 mesh 静态数据（一次性；场景重建后须重新注册）
     /// native 侧自统一顶点缓冲复制 bind-pose base 副本，上传权重/关节索引，
     /// 分配关节矩阵环形缓冲。blasID 须以 VPT_MESH_FLAG_DEFORMABLE 上传，

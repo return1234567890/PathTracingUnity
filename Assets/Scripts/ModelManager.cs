@@ -108,13 +108,9 @@ public class ModelManager : MonoBehaviour
     public bool logBuildStats = true;
 
     [Header("骨骼动画")]
-    [Tooltip("GPU 蒙皮（阶段2）：每帧只传关节矩阵，native compute 就地写统一顶点缓冲；\n"
-            + "关闭时回退阶段1 CPU 路径（每帧 BakeMesh 全量顶点上传，验证/低配 fallback）")]
-    public bool useComputeAnimation = true;
-
     [Tooltip("refit 质量衰减对策（阶段3）：refit 是原地包络微调，大幅变形多帧后 BVH 遍历效率下降；\n"
             + "该 BLAS 每累计 N 次 refit 后改走一次全量 rebuild（mode=BUILD）恢复质量，随后计数清零。\n"
-            + "0=禁用（始终 refit）。仅 useComputeAnimation 开启时生效（CPU BakeMesh 路径不应用）")]
+            + "0=禁用（始终 refit）")]
     [Range(0, 10000)]
     public int blasRebuildInterval = 60;
 
@@ -262,10 +258,11 @@ public class ModelManager : MonoBehaviour
             });
         }
 
-        // —— 1.5 收集 SkinnedMeshRenderer（骨骼动画，阶段1：CPU BakeMesh 验证链路）——
-        // 与静态 mesh 管线同构：bind-pose 几何建 BLAS，实例 transform 用 SMR 世界矩阵；
-        // 每帧 BakeMesh(useRotation:false) 得到 SMR 局部空间变形顶点 → VPT_UpdateMeshVertices。
-        // 蒙皮 mesh 的 BLAS 独占（不做去重），避免多个 SMR 互相覆盖同一顶点区段。
+        // —— 1.5 收集 SkinnedMeshRenderer（骨骼动画：GPU 蒙皮）——
+        // 多材质支持：Vulkan RT 的材质为 per-instance（instanceCustomIndex 携带 materialID），
+        // 故每个 subMesh（材质槽）拆为独立 BLAS + 同 transform 实例；
+        // 顶点按 subMesh 重映射为连续区段，统一顶点缓冲不膨胀、蒙皮计算不重复。
+        // 关节矩阵 scratch 由同一 SMR 的所有 subMesh tracker 共享（每帧只计算一次）。
         int skinnedInstanceCount = 0;
         foreach (SkinnedMeshRenderer smr in FindObjectsOfType<SkinnedMeshRenderer>())
         {
@@ -287,59 +284,134 @@ public class ModelManager : MonoBehaviour
                 continue;
             }
 
-            int vertBase = globalVerts.Count;
-
-            // bind-pose 几何建 BLAS（与静态路径一致）
-            int skinnedBlasId = Scene.AddBLASIndexed(mesh.vertices, mesh.triangles, vertBase);
-            AppendVertices(globalVerts, mesh);
-            AppendTriangles(globalTris, mesh);
-
-            // —— 材质（去重，单材质约束，同静态路径）——
-            Material mat = smr.sharedMaterial;
-            if (mat == null) mat = smr.material;
-            if (!matToId.TryGetValue(mat, out int skinnedMaterialId))
-            {
-                skinnedMaterialId = materials.Count;
-                matToId[mat] = skinnedMaterialId;
-                materials.Add(GetMaterial(mat, TextureArrays));
-            }
-
-            // —— 实例：transform 用 SMR 自身（BakeMesh useRotation:false 输出在 SMR 局部空间）——
-            Scene.AddInstance(skinnedBlasId, smr.transform, skinnedMaterialId);
-            collectedInstanceCount++;
-
-            _instanceTracker.Add(new NativeInstanceTracker
-            {
-                transform  = smr.transform, // SMR 刚体运动（移动/旋转）仍走现有 TLAS 重建路径
-                materialID = (uint)skinnedMaterialId,
-                blasID     = (uint)skinnedBlasId
-            });
-
-            // 骨骼动画追踪：80B 顶点缓存（UV/颜色恒定只写一次）+ 每帧推送目标
-            //（GPU 蒙皮路径：bones/bindposes/关节矩阵 scratch；CPU 路径：BakeMesh）
+            // —— 几何/蒙皮属性一次性读取（各 subMesh 重映射共用）——
+            Vector3[] verts  = mesh.vertices;
+            Vector3[] norms  = mesh.normals;
+            Vector4[] tangs  = mesh.tangents;
+            Vector2[] uvs    = mesh.uv;
+            Color[]   colors = mesh.colors;
+            bool hasNormal  = norms  != null && norms.Length  == verts.Length;
+            bool hasTangent = tangs  != null && tangs.Length  == verts.Length;
+            bool hasUv      = uvs    != null && uvs.Length     == verts.Length;
+            bool hasColor   = colors != null && colors.Length == verts.Length;
             Transform[] bones = smr.bones;
             Matrix4x4[] bindposes = mesh.bindposes;
             int jointCount = Mathf.Min(bones != null ? bones.Length : 0,
                                        bindposes != null ? bindposes.Length : 0);
-            var tracker = new NativeSkinnedTracker
+            Material[] smrMats = smr.sharedMaterials;
+
+            // 关节矩阵共享 scratch（同一 SMR 的 subMesh tracker 复用，首个 tracker 持有 pin）
+            var jointScratch = new float[Mathf.Max(jointCount, 1) * 16];
+            var jointPin = GCHandle.Alloc(jointScratch, GCHandleType.Pinned);
+            bool jointPinOwned = false;
+
+            for (int s = 0; s < mesh.subMeshCount; s++)
             {
-                smr         = smr,
-                mesh        = mesh,
-                blasID      = (uint)skinnedBlasId,
-                vertexCount = mesh.vertexCount,
-                bakedMesh   = new Mesh(),
-                vertexCache = BuildVertexCache(mesh),
-                bones       = bones,
-                bindposes   = bindposes,
-                jointCount  = jointCount,
-                // 至少 1 个关节避免零长数组（jointCount=0 的 mesh 不会注册/同步）
-                jointMatrixScratch = new float[Mathf.Max(jointCount, 1) * 16]
-            };
-            tracker.pin = GCHandle.Alloc(tracker.vertexCache, GCHandleType.Pinned);
-            tracker.jointMatPin = GCHandle.Alloc(tracker.jointMatrixScratch, GCHandleType.Pinned);
-            _skinnedTracker.Add(tracker);
-            _skinnedBlasIds.Add((uint)skinnedBlasId);
-            skinnedInstanceCount++;
+                int[] subTris = mesh.GetTriangles(s);
+                if (subTris == null || subTris.Length < 3) continue;
+
+                // —— 顶点重映射：subMesh 引用的顶点压缩为连续局部索引 ——
+                var remap = new Dictionary<int, int>(subTris.Length);
+                var remappedTris = new int[subTris.Length];
+                int next = 0;
+                for (int i = 0; i < subTris.Length; i++)
+                {
+                    int old = subTris[i];
+                    if (!remap.TryGetValue(old, out int local))
+                    {
+                        local = next++;
+                        remap[old] = local;
+                    }
+                    remappedTris[i] = local;
+                }
+                int subVertCount = next;
+
+                // 局部顶点数据（object/bind-pose 空间）+ 原顶点索引表（蒙皮权重重映射用）
+                var origIndices = new int[subVertCount];
+                var posArr = new Vector3[subVertCount];
+                var cache  = new RenderBufferManager.VertexGpuData[subVertCount];
+                foreach (var kv in remap)
+                {
+                    int old = kv.Key, local = kv.Value;
+                    origIndices[local] = old;
+                    posArr[local] = verts[old];
+                    cache[local] = new RenderBufferManager.VertexGpuData
+                    {
+                        pos     = verts[old],
+                        normal  = hasNormal  ? norms[old]  : Vector3.zero,
+                        tangent = hasTangent ? tangs[old]  : Vector4.zero,
+                        uv      = hasUv      ? uvs[old]    : Vector2.zero,
+                        color   = hasColor   ? colors[old] : Color.white
+                    };
+                }
+
+                // —— bind-pose 几何建 BLAS + 全局顶点/三角形数组追加 ——
+                int vertBase = globalVerts.Count;
+                int skinnedBlasId = Scene.AddBLASIndexed(posArr, remappedTris, vertBase);
+                for (int i = 0; i < subVertCount; i++)
+                    globalVerts.Add(new PathVertex
+                    {
+                        pos     = cache[i].pos,
+                        normal  = cache[i].normal,
+                        tangent = cache[i].tangent,
+                        uv      = cache[i].uv,
+                        color   = cache[i].color
+                    });
+                for (int i = 0; i < remappedTris.Length; i += 3)
+                    globalTris.Add(new PathTriangle
+                    {
+                        v0 = (uint)remappedTris[i],
+                        v1 = (uint)remappedTris[i + 1],
+                        v2 = (uint)remappedTris[i + 2]
+                    });
+
+                // —— 材质（per-subMesh 材质槽，去重；槽位缺失时回退首材质）——
+                Material mat = s < smrMats.Length ? smrMats[s] : null;
+                if (mat == null) mat = smr.sharedMaterial;
+                if (mat == null) mat = smr.material;
+                if (!matToId.TryGetValue(mat, out int skinnedMaterialId))
+                {
+                    skinnedMaterialId = materials.Count;
+                    matToId[mat] = skinnedMaterialId;
+                    materials.Add(GetMaterial(mat, TextureArrays));
+                }
+
+                // —— 实例：transform 用 SMR 自身（蒙皮关节矩阵把顶点拉回 SMR 局部空间）——
+                Scene.AddInstance(skinnedBlasId, smr.transform, skinnedMaterialId);
+                collectedInstanceCount++;
+
+                _instanceTracker.Add(new NativeInstanceTracker
+                {
+                    transform  = smr.transform, // SMR 刚体运动（移动/旋转）仍走现有 TLAS 重建路径
+                    materialID = (uint)skinnedMaterialId,
+                    blasID     = (uint)skinnedBlasId
+                });
+
+                // 骨骼动画追踪（GPU 蒙皮：每帧只推送关节矩阵）
+                var tracker = new NativeSkinnedTracker
+                {
+                    smr         = smr,
+                    mesh        = mesh,
+                    blasID      = (uint)skinnedBlasId,
+                    vertexCount = subVertCount,
+                    origVertexIndices = origIndices,
+                    bones       = bones,
+                    bindposes   = bindposes,
+                    jointCount  = jointCount,
+                    // 至少 1 个关节避免零长数组（jointCount=0 的 mesh 不会注册/同步）
+                    jointMatrixScratch = jointScratch,
+                    jointMatPin = jointPin,
+                    // 同一 SMR 多 subMesh 共享关节矩阵 scratch：首个 tracker 持有 pin（Cleanup 只 free 一次）
+                    ownsJointMatrices = !jointPinOwned
+                };
+                if (!jointPinOwned) jointPinOwned = true;
+                _skinnedTracker.Add(tracker);
+                _skinnedBlasIds.Add((uint)skinnedBlasId);
+                skinnedInstanceCount++;
+            }
+
+            // 未成功添加任何 subMesh tracker（subMesh 全空等）→ 释放共享 pin
+            if (!jointPinOwned && jointPin.IsAllocated) jointPin.Free();
         }
 
         // 2. 构建 TLAS + 组装全局 BLAS 数据
@@ -563,37 +635,6 @@ public class ModelManager : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// 构建 80B GPU 顶点缓存（bind-pose，静态/蒙皮共用）。
-    /// 蒙皮路径下 UV/颜色不随骨骼变形，构建时写一次，每帧只更新 pos/normal/tangent。
-    /// </summary>
-    private static RenderBufferManager.VertexGpuData[] BuildVertexCache(Mesh mesh)
-    {
-        Vector3[] verts = mesh.vertices;
-        var cache = new RenderBufferManager.VertexGpuData[verts.Length];
-        Vector3[] norms = mesh.normals;
-        Vector4[] tangs = mesh.tangents;
-        Vector2[] uvs   = mesh.uv;
-        Color[]   colors = mesh.colors;
-        bool hasNormal  = norms  != null && norms.Length  == verts.Length;
-        bool hasTangent = tangs  != null && tangs.Length  == verts.Length;
-        bool hasUv      = uvs    != null && uvs.Length     == verts.Length;
-        bool hasColor   = colors != null && colors.Length == verts.Length;
-
-        for (int i = 0; i < verts.Length; i++)
-        {
-            cache[i] = new RenderBufferManager.VertexGpuData
-            {
-                pos     = verts[i],
-                normal  = hasNormal  ? norms[i]  : Vector3.zero,
-                tangent = hasTangent ? tangs[i]  : Vector4.zero,
-                uv      = hasUv      ? uvs[i]    : Vector2.zero,
-                color   = hasColor   ? colors[i] : Color.white
-            };
-        }
-        return cache;
-    }
-
     // ── 原生指针 → 托管数组 拷贝工具 ────────────────────
 
     private static BVHNode32[] CopyBVHNodes(IntPtr ptr, int count)
@@ -655,9 +696,7 @@ public class ModelManager : MonoBehaviour
     private readonly float[] _transformScratch = new float[12]; // 3x4 行主序
 
     // ── 骨骼动画：蒙皮 mesh 追踪（BuildScene 收集，每帧推送 native）──
-    // 阶段1 CPU 验证链路：每帧 BakeMesh(useRotation:false) 得到 SMR 局部空间变形顶点，
-    // 打包为 80B VertexGpuData 后调 VPT_UpdateMeshVertices，native 侧 staged 上传 + BLAS refit。
-    // 阶段2 GPU 蒙皮：每帧只计算关节矩阵 worldToLocal * bone.localToWorld * bindpose
+    // GPU 蒙皮：每帧只计算关节矩阵 worldToLocal * bone.localToWorld * bindpose
     //（拉回 SMR 局部空间，使 TLAS instance transform = SMR 世界矩阵），调 VPT_UpdateSkinning，
     // native compute 读 bind-pose base 副本就地写统一顶点缓冲后 refit（对齐参考项目 AnimationVk）。
     private sealed class NativeSkinnedTracker
@@ -665,17 +704,15 @@ public class ModelManager : MonoBehaviour
         public SkinnedMeshRenderer smr;        // 蒙皮渲染器（变形来源）
         public Mesh mesh;                    // sharedMesh（bind-pose 顶点/骨骼数据来源）
         public uint blasID;                   // 对应 BLAS（独占，未做 mesh 去重）
-        public int  vertexCount;              // bind-pose 顶点数（恒定）
-        public Mesh bakedMesh;                // 每帧 BakeMesh 输出目标（CPU fallback）
-        public RenderBufferManager.VertexGpuData[] vertexCache; // 80B 顶点缓存（UV/颜色恒定只写一次）
-        public GCHandle pin;                  // vertexCache 的 pinned 句柄（常驻，避免逐帧分配）
-        // ── 阶段2 GPU 蒙皮 ──
+        public int  vertexCount;              // subMesh 重映射后的顶点数（恒定）
+        public int[] origVertexIndices;       // subMesh 局部顶点 → 原 mesh 顶点索引（蒙皮权重重映射）
         public Transform[] bones;              // 缓存 smr.bones（避免逐帧访问开销）
         public Matrix4x4[] bindposes;          // 缓存 mesh.bindposes（每帧折算进关节矩阵）
         public int jointCount;                 // 关节数 = min(bones.Length, bindposes.Length)
         public float[] jointMatrixScratch;     // jointCount*16 行主序，常驻 pinned 避免逐帧分配
         public GCHandle jointMatPin;           // jointMatrixScratch 的 pinned 句柄
-        public bool gpuRegistered;             // PushToNative 注册成功标记（失败则自动回退 CPU 路径）
+        public bool ownsJointMatrices;         // 同一 SMR 多 subMesh 共享 scratch：首个 tracker 持有（Cleanup 只 free 一次）
+        public bool gpuRegistered;             // PushToNative 注册成功标记（失败则该 mesh 保持 bind-pose）
     }
     private readonly List<NativeSkinnedTracker> _skinnedTracker = new();
     private readonly HashSet<uint> _skinnedBlasIds = new(); // deformable BLAS 集合（PushToNative 打 flags 用）
@@ -764,7 +801,7 @@ public class ModelManager : MonoBehaviour
                 indices     = idxPin.AddrOfPinnedObject() + (int)desc.triBase * 3 * 4,
                 indexCount  = (uint)(triCount * 3),
                 materialID  = 0,  // materialID 由 instance 携带
-                // 骨骼动画：蒙皮 BLAS 加 ALLOW_UPDATE，供每帧 VPT_UpdateMeshVertices refit
+                // 骨骼动画：蒙皮 BLAS 加 ALLOW_UPDATE，供每帧 GPU 蒙皮后 refit
                 flags       = _skinnedBlasIds.Contains((uint)i)
                               ? NativeBridge.VPT_MESH_FLAG_DEFORMABLE : 0u
             };
@@ -829,40 +866,41 @@ public class ModelManager : MonoBehaviour
 
         NativeBridge.UpdateScene(ref sceneUpdate);
 
-        // 8. 骨骼动画阶段2：GPU 蒙皮静态数据注册（一次性，须在 UpdateScene 之后：
+        // 8. 骨骼动画：GPU 蒙皮静态数据注册（一次性，须在 UpdateScene 之后：
         //    native 侧自统一顶点缓冲复制 bind-pose base 副本）。
-        //    bindposes 不上传——每帧折算进关节矩阵；CPU fallback 路径不依赖注册。
+        //    bindposes 不上传——每帧折算进关节矩阵。
         int skinRegistered = 0;
         foreach (var tr in _skinnedTracker)
         {
             if (tr.jointCount <= 0)
             {
                 Debug.LogWarning($"[ModelManager] SkinnedMesh '{tr.smr?.name}' 无有效骨骼（jointCount=0），"
-                               + "GPU 蒙皮不可用，仅 BakeMesh fallback 可用。", tr.smr);
+                               + "GPU 蒙皮不可用，该 mesh 保持 bind-pose。", tr.smr);
                 continue;
             }
 
             BoneWeight[] bw = tr.mesh.boneWeights;
-            if (bw == null || bw.Length != tr.vertexCount)
+            if (bw == null || bw.Length != tr.mesh.vertexCount)
             {
                 Debug.LogWarning($"[ModelManager] SkinnedMesh '{tr.smr?.name}' boneWeights 数量"
-                               + $"（{bw?.Length ?? 0}）与顶点数（{tr.vertexCount}）不符，跳过 GPU 蒙皮注册。", tr.smr);
+                               + $"（{bw?.Length ?? 0}）与顶点数（{tr.mesh.vertexCount}）不符，跳过 GPU 蒙皮注册。", tr.smr);
                 continue;
             }
 
-            // boneWeights → vec4 权重 + ivec4 关节索引（行主序展开，临时 pin：native 同步拷贝）
+            // boneWeights → vec4 权重 + ivec4 关节索引（按 subMesh 重映射顺序，行主序展开，临时 pin）
             var weights = new float[tr.vertexCount * 4];
             var joints  = new int[tr.vertexCount * 4];
             for (int i = 0; i < tr.vertexCount; i++)
             {
-                weights[i * 4 + 0] = bw[i].weight0;
-                weights[i * 4 + 1] = bw[i].weight1;
-                weights[i * 4 + 2] = bw[i].weight2;
-                weights[i * 4 + 3] = bw[i].weight3;
-                joints[i * 4 + 0] = bw[i].boneIndex0;
-                joints[i * 4 + 1] = bw[i].boneIndex1;
-                joints[i * 4 + 2] = bw[i].boneIndex2;
-                joints[i * 4 + 3] = bw[i].boneIndex3;
+                BoneWeight w = bw[tr.origVertexIndices[i]];
+                weights[i * 4 + 0] = w.weight0;
+                weights[i * 4 + 1] = w.weight1;
+                weights[i * 4 + 2] = w.weight2;
+                weights[i * 4 + 3] = w.weight3;
+                joints[i * 4 + 0] = w.boneIndex0;
+                joints[i * 4 + 1] = w.boneIndex1;
+                joints[i * 4 + 2] = w.boneIndex2;
+                joints[i * 4 + 3] = w.boneIndex3;
             }
             var wPin = GCHandle.Alloc(weights, GCHandleType.Pinned);
             var jPin = GCHandle.Alloc(joints, GCHandleType.Pinned);
@@ -933,18 +971,15 @@ public class ModelManager : MonoBehaviour
     }
 
     // ═════════════════════════════════════════════════════════
-    //  骨骼动画：每帧蒙皮同步（阶段2 GPU 蒙皮主路径 + 阶段1 CPU BakeMesh fallback）
+    //  骨骼动画：每帧蒙皮同步（GPU 蒙皮）
     //  由 PathTraceRendererFeature 在 PrepareDispatch 之前调用（与 SyncInstancesNative 同处）。
     //  时域累积交由 DLSS RR 处理；调用方依据返回值重置自研时域累积。
     // ═════════════════════════════════════════════════════════
 
     /// <summary>
     /// 对每个追踪的 SkinnedMeshRenderer 推送本帧蒙皮状态：
-    /// useComputeAnimation=true（默认，阶段2）：只算 jointCount 个关节矩阵（小数据量，
-    /// 参考项目 AnimationVk 的性能关键），native 蒙皮 compute 读 bind-pose base 副本
-    /// 就地写统一顶点缓冲后 BLAS refit；
-    /// false（fallback）：BakeMesh(useRotation:false) 得到 SMR 局部空间变形顶点，
-    /// 全量上传 VPT_UpdateMeshVertices（阶段1 CPU 验证路径）。
+    /// 只算 jointCount 个关节矩阵（小数据量，参考项目 AnimationVk 的性能关键），
+    /// native 蒙皮 compute 读 bind-pose base 副本就地写统一顶点缓冲后 BLAS refit。
     /// 隐藏（activeInHierarchy=false）或禁用的 SMR 跳过。
     /// 返回 true 表示本帧至少推送了一个蒙皮 mesh（几何变形中，调用方应重置时域累积）。
     /// </summary>
@@ -955,8 +990,8 @@ public class ModelManager : MonoBehaviour
         if (!NativeBridge.TryInitialize())
             return false;
 
-        // 阶段3：推送 refit 全量 rebuild 间隔（仅 GPU 蒙皮路径生效，CPU fallback 固定推 0 禁用）
-        uint rebuildInterval = useComputeAnimation ? (uint)Mathf.Max(0, blasRebuildInterval) : 0u;
+        // 阶段3：推送 refit 全量 rebuild 间隔
+        uint rebuildInterval = (uint)Mathf.Max(0, blasRebuildInterval);
         if (rebuildInterval != _lastPushedRebuildInterval)
         {
             NativeBridge.VPT_SetDeformableRebuildInterval(rebuildInterval);
@@ -971,35 +1006,14 @@ public class ModelManager : MonoBehaviour
             if (smr == null) continue;
             if (!smr.gameObject.activeInHierarchy || !smr.enabled) continue;
 
-            if (useComputeAnimation && tr.gpuRegistered)
+            if (tr.gpuRegistered)
             {
-                // 阶段2：每帧只传关节矩阵（小数据），native compute 就地写顶点 + refit
+                // 每帧只传关节矩阵（小数据），native compute 就地写顶点 + refit
                 PushJointMatrices(tr);
                 NativeBridge.VPT_UpdateSkinning(tr.blasID,
                     tr.jointMatPin.AddrOfPinnedObject(), tr.jointCount);
+                any = true;
             }
-            else
-            {
-                // 阶段1 fallback：CPU 蒙皮——把当前姿态烘到 bakedMesh
-                //（SMR 局部空间，随骨骼变换 pos/normal/tangent）
-                smr.BakeMesh(tr.bakedMesh, false);
-
-                Vector3[] verts = tr.bakedMesh.vertices;
-                Vector3[] norms = tr.bakedMesh.normals;
-                Vector4[] tangs = tr.bakedMesh.tangents;
-                var cache = tr.vertexCache;
-                int n = Mathf.Min(tr.vertexCount, verts.Length);
-                for (int i = 0; i < n; i++)
-                {
-                    cache[i].pos = verts[i];
-                    if (i < norms.Length) cache[i].normal = norms[i];
-                    if (i < tangs.Length) cache[i].tangent = tangs[i];
-                }
-
-                NativeBridge.VPT_UpdateMeshVertices(tr.blasID,
-                    tr.pin.AddrOfPinnedObject(), (uint)tr.vertexCount);
-            }
-            any = true;
         }
         return any;
     }
@@ -1007,11 +1021,14 @@ public class ModelManager : MonoBehaviour
     /// <summary>
     /// 计算并写入本帧关节矩阵（行主序 4×16 float）：
     /// jointMatrix[i] = SMR.worldToLocal * bones[i].localToWorld * bindposes[i]，
-    /// 把 bind-pose 顶点拉到当前姿态的 SMR 局部空间——与 BakeMesh(useRotation:false)
-    /// 输出同空间，故 TLAS instance transform 继续用 SMR 世界矩阵（复用现有 InstanceInfo 逻辑）。
+    /// 把 bind-pose 顶点拉到当前姿态的 SMR 局部空间，
+    /// 故 TLAS instance transform 继续用 SMR 世界矩阵（复用现有 InstanceInfo 逻辑）。
     /// </summary>
     private static void PushJointMatrices(NativeSkinnedTracker tr)
     {
+        // 同一 SMR 多 subMesh 共享 scratch：由首个（owns）tracker 统一计算，其余复用
+        if (!tr.ownsJointMatrices) return;
+
         Matrix4x4 worldToLocal = tr.smr.transform.worldToLocalMatrix;
         var scratch = tr.jointMatrixScratch;
         for (int i = 0; i < tr.jointCount; i++)
@@ -1029,18 +1046,13 @@ public class ModelManager : MonoBehaviour
         }
     }
 
-    /// <summary>释放蒙皮追踪资源（pin/临时 mesh）；BuildScene 重建与 OnDestroy 时调用。</summary>
+    /// <summary>释放蒙皮追踪资源（关节矩阵 pin）；BuildScene 重建与 OnDestroy 时调用。</summary>
     private void CleanupSkinnedTrackers()
     {
         foreach (NativeSkinnedTracker tr in _skinnedTracker)
         {
-            if (tr.pin.IsAllocated) tr.pin.Free();
-            if (tr.jointMatPin.IsAllocated) tr.jointMatPin.Free();
-            if (tr.bakedMesh != null)
-            {
-                if (Application.isPlaying) Destroy(tr.bakedMesh);
-                else DestroyImmediate(tr.bakedMesh);
-            }
+            // 关节矩阵 scratch 同一 SMR 共享：只有持有者释放，避免重复 free
+            if (tr.ownsJointMatrices && tr.jointMatPin.IsAllocated) tr.jointMatPin.Free();
         }
         _skinnedTracker.Clear();
         _skinnedBlasIds.Clear();

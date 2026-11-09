@@ -660,31 +660,14 @@ static void RecordTLASBuild(VkCommandBuffer cmd, VkDevice device, uint32_t ringI
 }
 
 // ═══════════════════════════════════════════════════════════
-//  骨骼动画（阶段1 CPU 验证路径）：变形顶点上传 + BLAS 原地 refit
+//  骨骼动画：BLAS 原地 refit
 //
-//  CPU 侧 BakeMesh 得到 SMR 局部空间变形顶点 → 写入 host-visible
-//  staging 环形槽位（kTLASRingSize 槽，与实例路径同样机制避免在飞帧竞争）
-//  → dispatch 前录制 staging→统一顶点缓冲拷贝 + mode=UPDATE refit。
+//  GPU 蒙皮 compute 就地写统一顶点缓冲后，dispatch 前录制 mode=UPDATE refit。
 //  hit shader 从统一顶点缓冲直接读 VPT_Vertex 插值法线/切线，
 //  顶点就地更新后着色属性自动跟随，无需改 pathtrace.glsl。
 // ═══════════════════════════════════════════════════════════
 
-// 待 refit 的顶点更新（同一帧内可含多个 mesh）
-struct PendingVertexUpdate
-{
-    uint32_t    blasID;        // 目标 BLAS（=统一顶点缓冲区段索引）
-    uint32_t    vertexCount;   // 顶点数（须与首次上传一致）
-    VkDeviceSize stagingOffset; // 在当前槽位内的字节偏移
-};
-
-static BufferResource          s_VertexStaging;        // host-visible 常驻映射（环形 kTLASRingSize 槽）
-static void*                   s_VertexStagingMapped  = nullptr;
-static VkDeviceSize            s_VertexSlotBytes      = 0;   // 每槽字节容量（只增不减）
-static VkDeviceSize            s_VertexSlotUsed       = 0;   // 当前槽已用字节
-static uint32_t                s_VertexRing           = 0;   // 当前写入槽位
 static bool                    s_BlasRefitPending     = false;
-static std::vector<PendingVertexUpdate> s_PendingVertexUpdates;
-static bool                    s_NonDeformableWarned  = false;
 
 // ── 阶段3：refit 质量衰减对策 ──
 // refit 是原地包络微调，大幅变形多帧后 BVH 遍历效率持续下降；
@@ -716,186 +699,26 @@ static bool                         s_SkinPending     = false;
 static uint32_t                     s_JointRing        = 0;   // 当前关节矩阵写入槽位
 static bool                         s_SkinNotRegisteredWarned = false;
 
-// 销毁顶点 staging（GPU idle 后由 DestroyResources 调用）
-static void DestroyVertexStaging(VkDevice device)
-{
-    if (s_VertexStagingMapped) { vkUnmapMemory(device, s_VertexStaging.memory); s_VertexStagingMapped = nullptr; }
-    DestroyBufferResource(device, s_VertexStaging);
-    s_VertexSlotBytes    = 0;
-    s_VertexSlotUsed     = 0;
-    s_VertexRing         = 0;
-    s_BlasRefitPending   = false;
-    s_PendingVertexUpdates.clear();
-}
-
-// 扩容顶点 staging（GPU idle 前提：低频路径；拷贝当前槽已写数据保持 pending 偏移有效）
-static bool GrowVertexStaging(VkDevice device, VkPhysicalDevice gpu, VkDeviceSize requiredBytes)
-{
-    VkDeviceSize newSlotBytes = std::max(s_VertexSlotBytes * 2, s_VertexSlotUsed + requiredBytes);
-    newSlotBytes = std::max(newSlotBytes, (VkDeviceSize)256);
-
-    // 先保存旧映射/旧资源，新缓冲映射成功后才销毁旧缓冲
-    void*       oldMapped  = s_VertexStagingMapped;
-    BufferResource oldRes   = s_VertexStaging;
-    VkDeviceSize oldUsed    = s_VertexSlotUsed;
-
-    BufferResource newStaging{};
-    void* newMapped = nullptr;
-    VkResult r = CreateBufferResource(device, gpu, (VkDeviceSize)kTLASRingSize * newSlotBytes,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, newStaging);
-    if (r != VK_SUCCESS || vkMapMemory(device, newStaging.memory, 0,
-            (VkDeviceSize)kTLASRingSize * newSlotBytes, 0, &newMapped) != VK_SUCCESS)
-    {
-        fprintf(stderr, "[VPT] vertex staging grow to %llu bytes FAILED: %d\n",
-                (unsigned long long)newSlotBytes, r);
-        if (newStaging.buffer || newStaging.memory) DestroyBufferResource(device, newStaging);
-        return false;
-    }
-
-    // 搬迁当前槽已写数据（所有 pending 条目的偏移均相对槽首，搬迁后仍然有效）
-    if (oldMapped && oldUsed > 0)
-        memcpy(newMapped, oldMapped, (size_t)oldUsed);
-
-    if (oldMapped)
-        vkUnmapMemory(device, oldRes.memory);
-    if (oldRes.buffer || oldRes.memory)
-        DestroyBufferResource(device, oldRes);
-
-    s_VertexStaging        = newStaging;
-    s_VertexStagingMapped  = newMapped;
-    s_VertexSlotBytes      = newSlotBytes;
-    s_VertexRing           = 0; // 数据已搬迁到槽 0
-    return true;
-}
-
-// CPU 侧：把变形顶点写入 staging 当前槽位，标记 BLAS 待 refit（零分配、零同步）
-void VPTScene::UpdateMeshVertices(uint32_t blasID, const VPT_Vertex* vertices, uint32_t vertexCount)
-{
-    if (!s_ExtensionsReady || !s_Ready || !vertices || vertexCount == 0)
-        return;
-    if (blasID >= s_BLASes.size())
-    {
-        fprintf(stderr, "[VPT] UpdateMeshVertices: blasID %u out of range (%zu BLASes)\n",
-                blasID, s_BLASes.size());
-        return;
-    }
-    if (!s_BLASes[blasID].allowUpdate)
-    {
-        if (!s_NonDeformableWarned)
-        {
-            fprintf(stderr, "[VPT] UpdateMeshVertices: BLAS[%u] built without ALLOW_UPDATE "
-                            "(VPT_MESH_FLAG_DEFORMABLE not set on upload). Skipped.\n", blasID);
-            s_NonDeformableWarned = true;
-        }
-        return;
-    }
-
-    VkDeviceSize bytes = (VkDeviceSize)vertexCount * sizeof(VPT_Vertex);
-
-    // 同一 BLAS 已有未消费的 pending 条目（同帧重复更新/上帧未被 dispatch 消费）
-    // → 原位覆盖同一 staging 区段，不追加新条目，避免 pending 列表无界增长
-    for (auto& u : s_PendingVertexUpdates)
-    {
-        if (u.blasID == blasID)
-        {
-            if (u.vertexCount != vertexCount)
-            {
-                fprintf(stderr, "[VPT] UpdateMeshVertices: BLAS[%u] vertex count changed "
-                                "(%u -> %u), unsupported on pending entry. Skipped.\n",
-                        blasID, u.vertexCount, vertexCount);
-                return;
-            }
-            memcpy((uint8_t*)s_VertexStagingMapped
-                       + (VkDeviceSize)s_VertexRing * s_VertexSlotBytes + u.stagingOffset,
-                   vertices, (size_t)bytes);
-            s_BlasRefitPending = true;
-            return;
-        }
-    }
-
-    // 容量不足 → GPU idle 后扩容（低频）
-    if (s_VertexSlotUsed + bytes > s_VertexSlotBytes)
-    {
-        const UnityVulkanInstance& inst = VPT_GetInstance();
-        vkDeviceWaitIdle(inst.device);
-        if (!GrowVertexStaging(inst.device, inst.physicalDevice, bytes))
-            return;
-    }
-
-    memcpy((uint8_t*)s_VertexStagingMapped
-               + (VkDeviceSize)s_VertexRing * s_VertexSlotBytes + s_VertexSlotUsed,
-           vertices, (size_t)bytes);
-    s_PendingVertexUpdates.push_back({ blasID, vertexCount, s_VertexSlotUsed });
-    s_VertexSlotUsed  += bytes;
-    s_BlasRefitPending = true;
-}
-
-// GPU 侧：录制 变形顶点上传（CPU 路径）+ BLAS refit + barrier 链。
-// refit 列表 = CPU BakeMesh 顶点更新 ∪ GPU 蒙皮更新（RecordGPUSkinningIfNeeded 已先行
-// 录制蒙皮 compute 并把待 refit 的 blasID 留在 s_PendingSkinUpdates）。
+// GPU 侧：录制 BLAS refit + barrier 链。
+// refit 列表来自 GPU 蒙皮更新（RecordGPUSkinningIfNeeded 已先行录制蒙皮 compute
+// 并把待 refit 的 blasID 留在 s_PendingSkinUpdates）。
 void VPTScene::RecordBLASRefitIfNeeded(VkCommandBuffer cmd)
 {
-    bool hasVertexUpdates = !s_PendingVertexUpdates.empty();
-    bool hasSkinUpdates   = !s_PendingSkinUpdates.empty();
-    if (!s_BlasRefitPending || cmd == VK_NULL_HANDLE || (!hasVertexUpdates && !hasSkinUpdates))
+    if (!s_BlasRefitPending || cmd == VK_NULL_HANDLE || s_PendingSkinUpdates.empty())
     {
-        s_PendingVertexUpdates.clear();
         s_PendingSkinUpdates.clear();
         s_BlasRefitPending = false;
         return;
     }
-
-    if (hasVertexUpdates)
-    {
-        VkDeviceSize slotBase = (VkDeviceSize)s_VertexRing * s_VertexSlotBytes;
-
-        // Barrier A: host 写 staging → transfer 读
-        VkMemoryBarrier hostToTransfer{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-        hostToTransfer.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-        hostToTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 1, &hostToTransfer, 0, nullptr, 0, nullptr);
-
-        // staging → 统一顶点缓冲对应区段
-        for (const auto& u : s_PendingVertexUpdates)
-        {
-            VkBufferCopy region{};
-            region.srcOffset = slotBase + u.stagingOffset;
-            region.dstOffset = (VkDeviceSize)s_MeshVertexOffsets[u.blasID] * sizeof(VPT_Vertex);
-            region.size      = (VkDeviceSize)u.vertexCount * sizeof(VPT_Vertex);
-            vkCmdCopyBuffer(cmd, s_VertexStaging.buffer, s_UnifiedVertexBuffer.buffer, 1, &region);
-        }
-
-        // Barrier B: transfer 写顶点 → AS build 读 + 着色器读
-        VkMemoryBarrier uploadBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-        uploadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        uploadBarrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
-                                    | VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &uploadBarrier, 0, nullptr, 0, nullptr);
-    }
-
-    // ── refit 列表：CPU 顶点更新 ∪ GPU 蒙皮更新（去重）──
-    std::vector<uint32_t> refitBlas;
-    refitBlas.reserve(s_PendingVertexUpdates.size() + s_PendingSkinUpdates.size());
-    for (const auto& u : s_PendingVertexUpdates)
-        refitBlas.push_back(u.blasID);
-    for (uint32_t b : s_PendingSkinUpdates)
-        if (std::find(refitBlas.begin(), refitBlas.end(), b) == refitBlas.end())
-            refitBlas.push_back(b);
 
     // ── BLAS 原地 refit（srcAS = dstAS，mode=UPDATE）──
     // 各 BLAS 独享 scratch，理论上无共享冲突；仍按参考项目在连续 refit 间
     // 插 AS→AS barrier，成本可忽略，规避驱动乱序执行隐患。
     // 阶段3：累计 refit 达到 s_DeformableRebuildInterval 的 BLAS 本帧改走全量 rebuild
     //（dstAS/scratch 复用现有资源，scratch 构建时已按 max(build,update) 分配）
-    for (size_t i = 0; i < refitBlas.size(); i++)
+    for (size_t i = 0; i < s_PendingSkinUpdates.size(); i++)
     {
-        BLASResource& blas = s_BLASes[refitBlas[i]];
+        BLASResource& blas = s_BLASes[s_PendingSkinUpdates[i]];
 
         bool fullRebuild = s_DeformableRebuildInterval > 0
                         && ++blas.refitCount >= s_DeformableRebuildInterval;
@@ -906,7 +729,7 @@ void VPTScene::RecordBLASRefitIfNeeded(VkCommandBuffer cmd)
             {
                 fprintf(stderr, "[VPT] BLAS[%u] deformable refit count reached interval %u, "
                                 "switching to periodic full rebuild (mode=BUILD).\n",
-                        refitBlas[i], s_DeformableRebuildInterval);
+                        s_PendingSkinUpdates[i], s_DeformableRebuildInterval);
                 s_RebuildLogged = true;
             }
         }
@@ -923,7 +746,7 @@ void VPTScene::RecordBLASRefitIfNeeded(VkCommandBuffer cmd)
         const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfo = &rangeInfo;
         pfn_vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &pRangeInfo);
 
-        if (i + 1 < refitBlas.size())
+        if (i + 1 < s_PendingSkinUpdates.size())
         {
             VkMemoryBarrier asToAs{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
             asToAs.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
@@ -944,15 +767,9 @@ void VPTScene::RecordBLASRefitIfNeeded(VkCommandBuffer cmd)
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 1, &postRefit, 0, nullptr, 0, nullptr);
 
-    // 消费完毕：轮转槽位，允许下一帧写入新槽（在飞历史帧仍在读旧槽）
-    s_PendingVertexUpdates.clear();
+    // 消费完毕
     s_PendingSkinUpdates.clear();
     s_BlasRefitPending = false;
-    if (hasVertexUpdates)
-    {
-        s_VertexSlotUsed = 0;
-        s_VertexRing     = (s_VertexRing + 1) % kTLASRingSize;
-    }
 }
 
 // 阶段3：refit 质量衰减对策——设置变形 BLAS 全量 rebuild 间隔（C# Inspector 暴露）。
@@ -971,7 +788,7 @@ void VPTScene::SetDeformableRebuildInterval(uint32_t interval)
 //  权重/关节索引经一次性 staging 上传；每帧只传关节矩阵（host-visible
 //  常驻映射环形槽，参考项目性能关键）。蒙皮 compute 无 descriptor set，
 //  所有缓冲地址经 push constant BDA 指针传入，就地写统一顶点缓冲后
-//  BLAS refit（与 CPU 验证路径共用 RecordBLASRefitIfNeeded）。
+//  BLAS refit（由 RecordBLASRefitIfNeeded 统一录制）。
 // ═════════════════════════════════════════════════════════
 
 // push constant 布局（与 skinning.comp.glsl 一致，48B）
@@ -1466,9 +1283,7 @@ void VPTScene::DestroyResources()
     DestroyBufferResource(s_Device, s_MaterialBuffer);
     DestroyBufferResource(s_Device, s_LightBuffer);
     DestroyTLASRingResources(s_Device);
-    DestroyVertexStaging(s_Device);
     DestroySkinResources(s_Device);
-    s_NonDeformableWarned = false;
     s_SkinNotRegisteredWarned = false;
     s_MeshVertexOffsets.clear();
     s_MeshIndexOffsets.clear();

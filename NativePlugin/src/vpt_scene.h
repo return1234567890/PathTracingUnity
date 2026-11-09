@@ -21,14 +21,7 @@ namespace VPTScene {
     /// 由 dispatch 路径（RenderCallback / 遗留 dispatch / debug depth）在绑定管线前调用。
     void RecordTLASUpdateIfNeeded(VkCommandBuffer cmd);
 
-    /// 骨骼动画（阶段1 CPU 验证路径）：更新指定 BLAS 的变形顶点。
-    /// 顶点写入常驻 host-visible staging 环形槽位，标记 BLAS 待 refit，
-    /// 实际 上传+refit 在下一次 dispatch 前由 RecordBLASRefitIfNeeded 录制。
-    /// vertices: VPT_Vertex 数组（80B/顶点），必须与该 BLAS 首次上传的顶点数一致。
-    void UpdateMeshVertices(uint32_t blasID, const VPT_Vertex* vertices, uint32_t vertexCount);
-
-    /// 若本帧有变形顶点更新，向命令缓冲录制：staging→统一顶点缓冲拷贝 +
-    /// BLAS 原地 refit（mode=UPDATE）+ barrier 链。
+    /// 若本帧有蒙皮更新，向命令缓冲录制：BLAS 原地 refit（mode=UPDATE）+ barrier 链。
     /// 必须在 RecordTLASUpdateIfNeeded 之前调用（TLAS 引用 BLAS 内容时 refit 需先行）。
     void RecordBLASRefitIfNeeded(VkCommandBuffer cmd);
 

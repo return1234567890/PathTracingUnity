@@ -186,9 +186,15 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
 
     public override void Create()
     {
+        // 注入点必须用 AfterRenderingPostProcessing(600) 而非 AfterRendering(1000)：
+        // URP 14 只把 event==AfterRenderingPostProcessing 的 pass 视为"后处理后的 pass"
+        // （hasPassesAfterPostProcessing）。若用 AfterRendering，相机的 Post Processing 开启时
+        // 后处理栈会直接 blit 到屏幕并跳过 FinalBlitPass，本 pass 的 Blit 落在离屏
+        // _CameraColorAttachment 上，永远不会上屏（Game 视图只见光栅）。挂在 600 上：
+        // 后处理(550)写入交换缓冲 → 本 pass blit PT 结果 → FinalBlit(1000+1) 呈现上屏。
         _pass = new PathTraceRenderPass(this)
         {
-            renderPassEvent = RenderPassEvent.AfterRendering
+            renderPassEvent = RenderPassEvent.AfterRenderingPostProcessing
         };
     }
 
@@ -663,7 +669,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
                 //    使 descriptor 指向本帧槽位）──
                 mm.SyncInstancesNative();
 
-                // ── 骨骼动画：BakeMesh 变形顶点 → native staging 上传 + BLAS refit（同样必须
+                // ── 骨骼动画：关节矩阵 → native 蒙皮 compute + BLAS refit（同样必须
                 //    先于 PrepareDispatch，refit/TLAS 重建均在该帧命令流内录制）──
                 bool skinnedUpdated = mm.SyncSkinnedMeshesNative();
                 if (skinnedUpdated)
@@ -1005,7 +1011,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
             return;
 
         // ── 动态场景：同步实例变换 → native 每帧重建 TLAS ──
-        // ── 骨骼动画：同步变形顶点 → BLAS refit（阶段1验证，debug depth 模式同样需要）──
+        // ── 骨骼动画：同步蒙皮状态 → BLAS refit（debug depth 模式同样需要）──
         if (ModelManager.Instance != null)
         {
             ModelManager.Instance.SyncInstancesNative();

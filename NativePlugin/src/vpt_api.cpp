@@ -123,16 +123,6 @@ VPT_UpdateInstances(const VPT_InstanceData* instances, int32_t instanceCount)
     VPTScene::UpdateInstances(instances, instanceCount);
 }
 
-// ── VPT_UpdateMeshVertices（骨骼动画：阶段1 CPU 验证路径）──
-extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
-VPT_UpdateMeshVertices(uint32_t blasID, const VPT_Vertex* vertices, uint32_t vertexCount)
-{
-    if (!VPT_IsInitialized() || !vertices || vertexCount == 0)
-        return;
-
-    VPTScene::UpdateMeshVertices(blasID, vertices, vertexCount);
-}
-
 // ── VPT_RegisterSkinnedMesh（骨骼动画：阶段2 GPU 蒙皮静态数据注册）──
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 VPT_RegisterSkinnedMesh(uint32_t blasID, const float* weights, const int32_t* joints,

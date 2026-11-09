@@ -61,18 +61,6 @@ public static class NativeBridge
     public static extern void VPT_UpdateInstances(IntPtr instances, int instanceCount);
 
     /// <summary>
-    /// 骨骼动画（阶段1 CPU 验证路径）：更新指定 BLAS 的变形顶点（每帧调用）。
-    /// 顶点为 BakeMesh(useRotation:false) 得到的 SMR 局部空间数据，
-    /// native 侧写入常驻 staging 环形槽位，dispatch 前 staged 上传 + BLAS 原地 refit。
-    /// blasID 对应的 mesh 须以 flags.deformable=1 上传（否则 native 侧忽略并告警）。
-    /// </summary>
-    /// <param name="blasID">BLAS 索引（与 VPT_UpdateScene 时的 mesh 顺序一致）</param>
-    /// <param name="vertices">指向 VertexGpuData 数组（80B/顶点，pinned）</param>
-    /// <param name="vertexCount">顶点数（须与首次上传一致）</param>
-    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
-    public static extern void VPT_UpdateMeshVertices(uint blasID, IntPtr vertices, uint vertexCount);
-
-    /// <summary>
     /// 骨骼动画（阶段2 GPU 蒙皮）：注册蒙皮 mesh 静态数据（一次性；场景重建后须重新注册）。
     /// native 侧自统一顶点缓冲复制 bind-pose base 副本（蒙皮 compute 读 base 写统一缓冲，
     /// 避免在已变形数据上反复蒙皮），上传权重/关节索引，分配关节矩阵环形缓冲。
