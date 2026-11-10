@@ -70,6 +70,6 @@ NativePlugin/ngx_demo_temp.zip
 sampleLight.diff
 
 # ====================
-# HDR 环境贴图（大文件，建议用 Git LFS 管理）
+# HDR 环境贴图（大文件，由 Git LFS 管理，规则见 .gitattributes）
+# 不要忽略 Assets/Textures/hdr/*.hdr，否则 .meta 会变成孤立文件
 # ====================
-Assets/Textures/hdr/*.hdr
