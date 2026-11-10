@@ -1412,10 +1412,14 @@ void PathTrace(uint3 id : SV_DispatchThreadID)
         // ── 自发光直接贡献 ──
         if ((mat.flags & MAT_HAS_EMISS) != 0u)
         {
-            float2 uvT = uv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
-            float3 emTex = EmissiveArray.SampleLevel(sampler_EmissiveArray,
-                float3(uvT, float(mat.emissiveTexID)), 0.0).rgb;
-            radiance += throughput * mat.emissionColor.rgb * emTex;
+            float3 em = mat.emissionColor.rgb;
+            if (mat.emissiveTexID != TEX_NONE)
+            {
+                float2 uvT = uv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
+                em *= EmissiveArray.SampleLevel(sampler_EmissiveArray,
+                    float3(uvT, float(mat.emissiveTexID)), 0.0).rgb;
+            }
+            radiance += throughput * em;
         }
 
         float3 V = -ray.direction;
@@ -2075,10 +2079,14 @@ void ReSTIR_PrimaryRay(uint3 id : SV_DispatchThreadID)
     // 自发光
     if ((mat.flags & MAT_HAS_EMISS) != 0u)
     {
-        float2 uvT = huv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
-        float3 emTex = EmissiveArray.SampleLevel(sampler_EmissiveArray,
-            float3(uvT, float(mat.emissiveTexID)), 0.0).rgb;
-        directLight += mat.emissionColor.rgb * emTex;
+        float3 em = mat.emissionColor.rgb;
+        if (mat.emissiveTexID != TEX_NONE)
+        {
+            float2 uvT = huv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
+            em *= EmissiveArray.SampleLevel(sampler_EmissiveArray,
+                float3(uvT, float(mat.emissiveTexID)), 0.0).rgb;
+        }
+        directLight += em;
     }
 
     // NEE 每帧随机采样 1 个光源（乘 LightCount 无偏补偿）
@@ -2269,10 +2277,14 @@ void ReSTIR_InitReservoir(uint3 id : SV_DispatchThreadID)
         // 自发光
         if ((hitMat.flags & MAT_HAS_EMISS) != 0u)
         {
-            float2 uvT = hitUV * hitMat.uvScaleOffset.xy + hitMat.uvScaleOffset.zw;
-            float3 emTex = EmissiveArray.SampleLevel(sampler_EmissiveArray,
-                float3(uvT, float(hitMat.emissiveTexID)), 0.0).rgb;
-            hitRadiance += hitMat.emissionColor.rgb * emTex;
+            float3 em = hitMat.emissionColor.rgb;
+            if (hitMat.emissiveTexID != TEX_NONE)
+            {
+                float2 uvT = hitUV * hitMat.uvScaleOffset.xy + hitMat.uvScaleOffset.zw;
+                em *= EmissiveArray.SampleLevel(sampler_EmissiveArray,
+                    float3(uvT, float(hitMat.emissiveTexID)), 0.0).rgb;
+            }
+            hitRadiance += em;
         }
 
         // NEE 直接光：对 bounceHit 点做直接光照
@@ -2811,10 +2823,14 @@ float3 ReSTIR_FallbackMultiBounce(float3 origin, float3 dir, uint2 pixel, uint s
         // 自发光
         if ((mat.flags & MAT_HAS_EMISS) != 0u)
         {
-            float2 uvT = huv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
-            float3 emTex = EmissiveArray.SampleLevel(sampler_EmissiveArray,
-                float3(uvT, float(mat.emissiveTexID)), 0.0).rgb;
-            radiance += throughput * mat.emissionColor.rgb * emTex;
+            float3 em = mat.emissionColor.rgb;
+            if (mat.emissiveTexID != TEX_NONE)
+            {
+                float2 uvT = huv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
+                em *= EmissiveArray.SampleLevel(sampler_EmissiveArray,
+                    float3(uvT, float(mat.emissiveTexID)), 0.0).rgb;
+            }
+            radiance += throughput * em;
         }
 
         float3 V = -ray.direction;

@@ -549,11 +549,32 @@ public class ModelManager : MonoBehaviour
             pm.emissiveTexID = texMgr.RegisterEmissive(emissionTex);
             flags |= MaterialFlags.MAT_HAS_EMISS;
         }
-        pm.flags = flags;
 
-        // ── 新增：emissive color ──
+        // ── emissive color：与光栅 URP Lit 自发光语义对齐 ──
+        // 光栅端 SampleEmission（SurfaceInput.hlsl）仅受 _EMISSION keyword 门控，
+        // 贴图未绑定采样默认纹理 → 仅设置 HDR _EmissionColor（无贴图）即自发光。
+        // 原实现仅在 _EmissionMap 存在时打 MAT_HAS_EMISS，导致"只设颜色"的材质
+        // 在路径追踪中丢失自发光，故补齐颜色非黑判定。
+        // 不采用 EmissiveIsBlack 作否定判据：资产实证 New Material 1.mat
+        // m_LightmapFlags=4 且 HDR 颜色、光栅下自发光正常，该 flag 与"GUI 关闭
+        // 后残留颜色"的状态不可区分，会误杀在用的发光材质。
         if (mat.HasProperty("_EmissionColor"))
-            pm.emissionColor = mat.GetColor("_EmissionColor");
+        {
+            Color ec = mat.GetColor("_EmissionColor");
+            // HDR 强度等比钳制：防 RGBA16F（规划中的 emissiveRT）half 溢出与极端
+            // firefly（New Material 2.mat 曾出现 float.MaxValue）
+            const float MaxEmission = 1e4f;
+            float maxComp = Mathf.Max(ec.r, Mathf.Max(ec.g, ec.b));
+            if (maxComp > MaxEmission)
+            {
+                float scale = MaxEmission / maxComp;
+                ec.r *= scale; ec.g *= scale; ec.b *= scale;
+            }
+            pm.emissionColor = ec;
+            if (maxComp > 1e-5f)
+                flags |= MaterialFlags.MAT_HAS_EMISS;
+        }
+        pm.flags = flags;
 
         // ── 新增：bump scale ──
         if (mat.HasProperty("_BumpScale"))
