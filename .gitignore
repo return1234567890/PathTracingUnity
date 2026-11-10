@@ -34,7 +34,6 @@
 *.dll
 # 保留原生路径追踪插件 DLL
 !Assets/Plugins/x86_64/VulkanPathTracePlugin.dll
-!Assets/Plugins/x86_64/TinyBVHNative.dll
 *.apk
 *.aab
 *.ipa
@@ -69,16 +68,6 @@ NativePlugin/build/
 # 临时文件
 NativePlugin/ngx_demo_temp.zip
 sampleLight.diff
-
-# ====================
-# dep/tinybvh 构建产物
-# （该目录是独立 git 仓库，建议作为子模块管理）
-# ====================
-dep/tinybvh/build-win64/
-dep/tinybvh/cache/
-dep/tinybvh/external/
-dep/tinybvh/*.bin
-dep/tinybvh/*.bvh
 
 # ====================
 # HDR 环境贴图（大文件，建议用 Git LFS 管理）

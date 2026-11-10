@@ -4,8 +4,8 @@ using System.Runtime.InteropServices;
 using UnityEngine;
 
 /// <summary>
-/// 路径追踪顶点结构体（全局顶点数组元素）。
-/// 数据为 object-space，世界变换由实例表的 transform/invTransform 在 shader 侧完成。
+/// 路径追踪顶点结构体（全局顶点数组元素，C# 侧收集用，64B）。
+/// 数据为 object-space，世界变换由实例表的 transform 在 shader 侧完成。
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct PathVertex
@@ -27,7 +27,24 @@ public struct PathTriangle
     public uint v0, v1, v2; // 12B
 }
 
-/// <summary>材质数组元素（按 materialID 索引，80B）。</summary>
+/// <summary>
+/// 顶点 GPU 布局（80B，16B 对齐），native 侧统一顶点缓冲元素（与 vpt_types.h 一致）。
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct VertexGpuData
+{
+    public Vector3 pos;
+    public float  pad0;
+    public Vector3 normal;
+    public float  pad1;
+    public Vector4 tangent;
+    public Vector2 uv;
+    public Vector2 pad2;
+    public Vector4 color;
+    // 16 + 16 + 16 + 16 + 16 = 80B
+}
+
+/// <summary>材质数组元素（按 materialID 索引，96B）。</summary>
 /// <remarks>
 /// 金属度工作流：metallic 线性插值 F0；roughness = 1 - URP _Smoothness，钳制 [0.02,1]。
 /// 扩展字段：emissionColor / 4个纹理slice索引 / flags / uvScaleOffset。
@@ -71,32 +88,12 @@ public static class MaterialFlags
 }
 
 /// <summary>
-/// BVH 节点（32 字节，Wald 布局），与 tinybvh BVH::BVHNode 一致。
-/// </summary>
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
-public struct BVHNode32
-{
-    public Vector3 aabbMin;  // 12B
-    public uint    leftFirst;// 4B  内部节点=左子节点索引；叶子=primIdx 起始
-    public Vector3 aabbMax;  // 12B
-    public uint    triCount; // 4B  内部节点=0；叶子>0
-}
-
-/// <summary>
-/// 场景模型收集与加速结构构建管理器。
-/// 在游戏开始时收集场景中的模型物体，通过 <see cref="TinyScene"/> 构建两层级加速结构，
-/// 并组装 <c>tinybvh封装使用示例.md</c> 中定义的 9 个路径追踪数据数组。
+/// 场景模型收集与数据推送管理器。
+/// 在游戏开始时收集场景中的模型物体与材质，把顶点/索引/材质/光源/实例数据
+/// 推送到 native Vulkan 插件；BLAS/TLAS 的构建完全由 native 侧完成，
+/// C# 侧只维护「哪个 BLAS 占用全局数组的哪段区间」这类纯簿记信息。
 ///
-/// 9 个数组：
-///  1. TLAS 节点数组          → <see cref="TlasNodes"/>
-///  2. TLAS primIdx           → <see cref="TlasPrimIdx"/>
-///  3. 全局 BLAS 节点数组     → <see cref="GlobalBlasNodes"/>
-///  4. 全局 BLAS primIdx      → <see cref="GlobalBlasPrimIdx"/>
-///  5. BLAS 描述表            → <see cref="BlasDescriptors"/>
-///  6. 实例表                  → <see cref="InstanceTable"/>
-///  7. 全局三角形数组          → <see cref="GlobalTriangles"/>
-///  8. 全局顶点数组            → <see cref="GlobalVertices"/>
-///  9. 材质颜色数组            → <see cref="Materials"/>
+/// 说明：软件路径追踪（CPU BVH + HLSL 求交）与 tinybvh 依赖已移除。
 /// </summary>
 public class ModelManager : MonoBehaviour
 {
@@ -117,35 +114,40 @@ public class ModelManager : MonoBehaviour
     /// <summary>全局单例，便于路径追踪器访问。</summary>
     public static ModelManager Instance { get; private set; }
 
-    // ── TinyScene 句柄 ──────────────────────────────────
-    public TinyScene Scene { get; private set; }
+    // ════════ 场景数据（构建后可读） ════════
 
-    // ════════ 9 个数据数组（构建后可读） ════════
-
-    // —— 来自 TinyScene 原生导出（已拷贝为托管数组，供 CPU 路径追踪）——
-    /// <summary>1. TLAS 节点数组（32B/节点）</summary>
-    public BVHNode32[]  TlasNodes        { get; private set; }
-    /// <summary>2. TLAS primIdx（实例索引映射）</summary>
-    public uint[]       TlasPrimIdx      { get; private set; }
-    /// <summary>3. 全局 BLAS 节点数组（子节点索引已重定位）</summary>
-    public BVHNode32[]  GlobalBlasNodes  { get; private set; }
-    /// <summary>4. 全局 BLAS primIdx（三角形索引映射）</summary>
-    public uint[]       GlobalBlasPrimIdx { get; private set; }
-    /// <summary>5. BLAS 描述表（按 blasID 索引）</summary>
-    public TinyBVHNative.BLASDescriptor[] BlasDescriptors { get; private set; }
-    /// <summary>6. 实例表（按实例 ID 索引）</summary>
-    public TinyBVHNative.InstanceRecord[] InstanceTable  { get; private set; }
-
-    // —— 外部维护数组 ——
-    /// <summary>7. 全局三角形数组（按 triBase 偏移拼接）</summary>
+    /// <summary>全局三角形数组（按 triBase 偏移拼接）</summary>
     public PathTriangle[] GlobalTriangles { get; private set; }
-    /// <summary>8. 全局顶点数组（按 vertBase 偏移拼接，object-space）</summary>
+    /// <summary>全局顶点数组（按 vertBase 偏移拼接，object-space）</summary>
     public PathVertex[]   GlobalVertices  { get; private set; }
-    /// <summary>9. 材质数组（按 materialID 索引，含纹理索引与UV变换）</summary>
+    /// <summary>材质数组（按 materialID 索引，含纹理索引与UV变换）</summary>
     public PathMaterial[]  Materials       { get; private set; }
 
-    /// <summary>纹理数组管理器（4个 Texture2DArray），供 RenderBufferManager 访问。</summary>
+    /// <summary>纹理数组管理器（4个 Texture2DArray），供 native 侧采样。</summary>
     public TextureArrayManager TextureArrays { get; private set; }
+
+    /// <summary>场景是否已收集到可渲染内容（至少一个实例）。</summary>
+    public bool HasScene { get; private set; }
+
+    // ── BLAS 几何登记（纯托管簿记：全局数组区间由 native BLAS 消费） ──
+    private struct BlasRecord
+    {
+        public int vertBase;   // 该 BLAS 顶点在 GlobalVertices 中的起始下标
+        public int vertCount;
+        public int triBase;    // 该 BLAS 三角形在 GlobalTriangles 中的起始下标
+        public int triCount;
+    }
+    private readonly List<BlasRecord> _blasRecords = new();
+
+    // ── 实例登记（materialID + blasID + object→world 变换） ──
+    private struct InstanceRecord
+    {
+        public Transform transform;    // 世界变换来源（动态同步逐帧重读）
+        public Matrix4x4 localToWorld; // 构建时快照（Transform 失效时回退）
+        public uint      materialID;
+        public uint      blasID;
+    }
+    private readonly List<InstanceRecord> _instances = new();
 
     private void Awake()
     {
@@ -168,8 +170,6 @@ public class ModelManager : MonoBehaviour
         OnDestroyNative();
         if (Instance == this)
             Instance = null;
-        Scene?.Dispose();
-        Scene = null;
         TextureArrays?.Dispose();
         TextureArrays = null;
     }
@@ -177,14 +177,11 @@ public class ModelManager : MonoBehaviour
     // ── 构建主流程 ──────────────────────────────────────
 
     /// <summary>
-    /// 收集场景模型、构建加速结构、组装 9 个数组。
+    /// 收集场景模型与材质，登记 BLAS 区间与实例，并推送数据到 native 插件。
     /// 在 Start 中自动调用；场景变更后可手动调用重建。
     /// </summary>
     public void BuildScene()
     {
-        Scene?.Dispose();
-        Scene = new TinyScene();
-
         // 释放旧纹理数组
         TextureArrays?.Dispose();
         TextureArrays = new TextureArrayManager();
@@ -195,8 +192,10 @@ public class ModelManager : MonoBehaviour
         var materials    = new List<PathMaterial>();
         var matToId      = new Dictionary<Material, int>();
         var meshToBlas   = new Dictionary<Mesh, int>();
-        _instanceTracker.Clear();
+        _blasRecords.Clear();
+        _instances.Clear();
         CleanupSkinnedTrackers();
+        HasScene = false;
 
         // 1. 收集场景中的 MeshFilter
         MeshFilter[] filters = FindObjectsOfType<MeshFilter>();
@@ -221,18 +220,16 @@ public class ModelManager : MonoBehaviour
             var renderer = go.GetComponent<MeshRenderer>();
             if (renderer == null || !renderer.enabled) continue;
 
-            // —— 1a. 为每个唯一 mesh 构建 BLAS（去重）——
+            // —— 1a. 为每个唯一 mesh 登记 BLAS 区间（去重）——
             if (!meshToBlas.TryGetValue(mesh, out int blasId))
             {
+                // 几何追加到全局数组（object-space），并登记该 BLAS 占用的区间
                 int vertBase = globalVerts.Count;
-
-                // 经由 AddBLASIndexed：vertices=object-space 顶点，triangles=顶点索引
-                blasId = Scene.AddBLASIndexed(mesh.vertices, mesh.triangles, vertBase);
-                meshToBlas[mesh] = blasId;
-
-                // 追加该 mesh 的顶点/三角形到全局数组（object-space）
+                int triBase  = globalTris.Count;
                 AppendVertices(globalVerts, mesh);
-                AppendTriangles(globalTris, mesh);
+                int triCount = AppendTriangles(globalTris, mesh);
+                blasId = RegisterBlas(vertBase, mesh.vertexCount, triBase, triCount);
+                meshToBlas[mesh] = blasId;
             }
 
             // —— 1b. 收集材质（去重，取 renderer 的首材质，单材质约束）——
@@ -245,17 +242,9 @@ public class ModelManager : MonoBehaviour
                 materials.Add(GetMaterial(mat, TextureArrays));
             }
 
-            // —— 1c. 添加实例（object→world 变换由 TinyScene 处理）——
-            Scene.AddInstance(blasId, go.transform, materialId);
+            // —— 1c. 登记实例 ——
+            AddInstance(go.transform, (uint)materialId, (uint)blasId);
             collectedInstanceCount++;
-
-            // 动态场景：登记追踪表，供每帧 SyncInstancesNative 重读 Transform
-            _instanceTracker.Add(new NativeInstanceTracker
-            {
-                transform  = go.transform,
-                materialID = (uint)materialId,
-                blasID     = (uint)blasId
-            });
         }
 
         // —— 1.5 收集 SkinnedMeshRenderer（骨骼动画：GPU 蒙皮）——
@@ -328,14 +317,12 @@ public class ModelManager : MonoBehaviour
 
                 // 局部顶点数据（object/bind-pose 空间）+ 原顶点索引表（蒙皮权重重映射用）
                 var origIndices = new int[subVertCount];
-                var posArr = new Vector3[subVertCount];
-                var cache  = new RenderBufferManager.VertexGpuData[subVertCount];
+                var cache  = new VertexGpuData[subVertCount];
                 foreach (var kv in remap)
                 {
                     int old = kv.Key, local = kv.Value;
                     origIndices[local] = old;
-                    posArr[local] = verts[old];
-                    cache[local] = new RenderBufferManager.VertexGpuData
+                    cache[local] = new VertexGpuData
                     {
                         pos     = verts[old],
                         normal  = hasNormal  ? norms[old]  : Vector3.zero,
@@ -345,9 +332,9 @@ public class ModelManager : MonoBehaviour
                     };
                 }
 
-                // —— bind-pose 几何建 BLAS + 全局顶点/三角形数组追加 ——
+                // —— bind-pose 几何登记 BLAS 区间 + 全局顶点/三角形数组追加 ——
                 int vertBase = globalVerts.Count;
-                int skinnedBlasId = Scene.AddBLASIndexed(posArr, remappedTris, vertBase);
+                int triBase  = globalTris.Count;
                 for (int i = 0; i < subVertCount; i++)
                     globalVerts.Add(new PathVertex
                     {
@@ -364,6 +351,8 @@ public class ModelManager : MonoBehaviour
                         v1 = (uint)remappedTris[i + 1],
                         v2 = (uint)remappedTris[i + 2]
                     });
+                int skinnedBlasId = RegisterBlas(vertBase, subVertCount,
+                                                 triBase, remappedTris.Length / 3);
 
                 // —— 材质（per-subMesh 材质槽，去重；槽位缺失时回退首材质）——
                 Material mat = s < smrMats.Length ? smrMats[s] : null;
@@ -377,15 +366,8 @@ public class ModelManager : MonoBehaviour
                 }
 
                 // —— 实例：transform 用 SMR 自身（蒙皮关节矩阵把顶点拉回 SMR 局部空间）——
-                Scene.AddInstance(skinnedBlasId, smr.transform, skinnedMaterialId);
+                AddInstance(smr.transform, (uint)skinnedMaterialId, (uint)skinnedBlasId);
                 collectedInstanceCount++;
-
-                _instanceTracker.Add(new NativeInstanceTracker
-                {
-                    transform  = smr.transform, // SMR 刚体运动（移动/旋转）仍走现有 TLAS 重建路径
-                    materialID = (uint)skinnedMaterialId,
-                    blasID     = (uint)skinnedBlasId
-                });
 
                 // 骨骼动画追踪（GPU 蒙皮：每帧只推送关节矩阵）
                 var tracker = new NativeSkinnedTracker
@@ -414,40 +396,54 @@ public class ModelManager : MonoBehaviour
             if (!jointPinOwned && jointPin.IsAllocated) jointPin.Free();
         }
 
-        // 2. 构建 TLAS + 组装全局 BLAS 数据
-        Scene.BuildTLAS();
-        Scene.AssembleGlobals();
-
-        // 3. 拷贝 6 个原生数组到托管数组
-        TlasNodes         = CopyBVHNodes(Scene.GetTLASNodes(out int tlasNodeCount), tlasNodeCount);
-        TlasPrimIdx       = CopyUint32(Scene.GetTLASPrimIdx(out int tlasPrimCount), tlasPrimCount);
-        GlobalBlasNodes   = CopyBVHNodes(Scene.GetGlobalBLASNodes(out int blasNodeCount), blasNodeCount);
-        GlobalBlasPrimIdx = CopyUint32(Scene.GetGlobalBLASPrimIdx(out int blasPrimCount), blasPrimCount);
-        BlasDescriptors   = CopyBlasDescriptors(Scene.GetBLASDescriptors(out int descCount), descCount);
-        InstanceTable     = CopyInstanceTable(Scene.GetInstanceTable(out int instCount), instCount);
-
-        // 4. 提交外部维护数组
+        // 2. 提交数组
         GlobalVertices  = globalVerts.ToArray();
         GlobalTriangles = globalTris.ToArray();
         Materials       = materials.ToArray();
+        HasScene        = _instances.Count > 0;
 
-        // 4b. 构建纹理数组（所有材质纹理注册完毕后打包）
+        // 3. 构建纹理数组（所有材质纹理注册完毕后打包）
         TextureArrays.Build(1024);
 
-        // 5. 统计
+        // 4. 统计
         if (logBuildStats)
         {
             Debug.Log(
                 "[ModelManager] 构建完成：" +
-                $"BLAS={meshToBlas.Count + skinnedInstanceCount}, 实例={collectedInstanceCount}, 材质={Materials.Length}, " +
+                $"BLAS={_blasRecords.Count}, 实例={collectedInstanceCount}, 材质={Materials.Length}, " +
                 $"蒙皮实例={skinnedInstanceCount}, " +
-                $"TLAS节点={TlasNodes.Length}, TLASprimIdx={TlasPrimIdx.Length}, " +
-                $"全局BLAS节点={GlobalBlasNodes.Length}, 全局BLASprimIdx={GlobalBlasPrimIdx.Length}, " +
                 $"三角形={GlobalTriangles.Length}, 顶点={GlobalVertices.Length}");
         }
 
-        // 6. 推送场景数据到 Native Vulkan 插件（BLAS/TLAS 构建）
+        // 5. 推送场景数据到 Native Vulkan 插件（BLAS/TLAS 构建）
         PushToNative();
+    }
+
+    // ── BLAS / 实例登记 helper ───────────────────────────
+
+    /// <summary>登记一个 BLAS 占用的全局顶点/三角形区间，返回其 blasID（= 登记顺序）。</summary>
+    private int RegisterBlas(int vertBase, int vertCount, int triBase, int triCount)
+    {
+        _blasRecords.Add(new BlasRecord
+        {
+            vertBase  = vertBase,
+            vertCount = vertCount,
+            triBase   = triBase,
+            triCount  = triCount
+        });
+        return _blasRecords.Count - 1;
+    }
+
+    /// <summary>登记一个实例（object→world 变换 + 材质 + BLAS）。</summary>
+    private void AddInstance(Transform transform, uint materialID, uint blasID)
+    {
+        _instances.Add(new InstanceRecord
+        {
+            transform    = transform,
+            localToWorld = transform != null ? transform.localToWorldMatrix : Matrix4x4.identity,
+            materialID   = materialID,
+            blasID       = blasID
+        });
     }
 
     // ── 材质参数提取（albedo + metallic + roughness） ──────
@@ -641,8 +637,11 @@ public class ModelManager : MonoBehaviour
         }
     }
 
-    /// <summary>把 mesh 的三角形索引追加到全局三角形数组（保持原始顺序，值=object 局部顶点索引）。</summary>
-    private static void AppendTriangles(List<PathTriangle> globalTris, Mesh mesh)
+    /// <summary>
+    /// 把 mesh 的三角形索引追加到全局三角形数组（保持原始顺序，值=object 局部顶点索引），
+    /// 返回追加的三角形数量。
+    /// </summary>
+    private static int AppendTriangles(List<PathTriangle> globalTris, Mesh mesh)
     {
         int[] tris = mesh.triangles;
         for (int i = 0; i < tris.Length; i += 3)
@@ -654,44 +653,7 @@ public class ModelManager : MonoBehaviour
                 v2 = (uint)tris[i + 2]
             });
         }
-    }
-
-    // ── 原生指针 → 托管数组 拷贝工具 ────────────────────
-
-    private static BVHNode32[] CopyBVHNodes(IntPtr ptr, int count)
-    {
-        if (ptr == IntPtr.Zero || count <= 0) return Array.Empty<BVHNode32>();
-        var arr = new BVHNode32[count];
-        int size = Marshal.SizeOf<BVHNode32>();
-        for (int i = 0; i < count; i++)
-            arr[i] = Marshal.PtrToStructure<BVHNode32>(ptr + i * size);
-        return arr;
-    }
-
-    private static uint[] CopyUint32(IntPtr ptr, int count)
-    {
-        var arr = new uint[count];
-        for (int i = 0; i < count; i++)
-            arr[i] = (uint)Marshal.ReadInt32(ptr, i * 4);
-        return arr;
-    }
-
-    private static TinyBVHNative.BLASDescriptor[] CopyBlasDescriptors(IntPtr ptr, int count)
-    {
-        var arr = new TinyBVHNative.BLASDescriptor[count];
-        int size = Marshal.SizeOf<TinyBVHNative.BLASDescriptor>();
-        for (int i = 0; i < count; i++)
-            arr[i] = Marshal.PtrToStructure<TinyBVHNative.BLASDescriptor>(ptr + i * size);
-        return arr;
-    }
-
-    private static TinyBVHNative.InstanceRecord[] CopyInstanceTable(IntPtr ptr, int count)
-    {
-        var arr = new TinyBVHNative.InstanceRecord[count];
-        int size = Marshal.SizeOf<TinyBVHNative.InstanceRecord>();
-        for (int i = 0; i < count; i++)
-            arr[i] = Marshal.PtrToStructure<TinyBVHNative.InstanceRecord>(ptr + i * size);
-        return arr;
+        return tris.Length / 3;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -703,14 +665,6 @@ public class ModelManager : MonoBehaviour
     // 非托管内存分配列表（场景重建前 FreeHGlobal）
     private System.Collections.Generic.List<IntPtr> _nativeAllocs = new();
 
-    // ── 动态场景：实例追踪表（BuildScene 收集，每帧重读 Transform 推送 native）──
-    private struct NativeInstanceTracker
-    {
-        public Transform transform;  // 物体世界变换（刚体运动）
-        public uint materialID;
-        public uint blasID;
-    }
-    private readonly List<NativeInstanceTracker> _instanceTracker = new();
     // 每帧复用的非托管实例数组缓冲（56B/元素，避免逐帧分配/封送）
     private IntPtr _instanceNativeBuffer = IntPtr.Zero;
     private int _instanceNativeCapacity = 0;
@@ -743,14 +697,14 @@ public class ModelManager : MonoBehaviour
     /// <summary>是否有待推送的场景数据（插件未就绪时延迟）。</summary>
     public bool NativePushPending => _nativePushPending;
 
+    /// <summary>插件尚未就绪时置 true，待 PathTraceRendererFeature 初始化后重试。</summary>
+    private bool _nativePushPending = false;
+
     /// <summary>
     /// 将场景数据推送到 Native Vulkan 插件。
     /// 在 BuildScene() 完成后调用，将顶点/索引/材质/光源/实例数据
     /// 打包为 VPT_SceneUpdate 结构传入 Native。
     /// </summary>
-    /// <summary>插件尚未就绪时置 true，待 PathTraceRendererFeature 初始化后重试。</summary>
-    private bool _nativePushPending = false;
-
     public void PushToNative()
     {
         // 确保插件已初始化（首次调用触发 DLL 加载 + UnityPluginLoad + VPT_Initialize）
@@ -769,17 +723,17 @@ public class ModelManager : MonoBehaviour
         foreach (var p in _nativeAllocs) Marshal.FreeHGlobal(p);
         _nativeAllocs.Clear();
 
-        if (BlasDescriptors == null || GlobalVertices == null || GlobalTriangles == null)
+        if (_blasRecords.Count == 0 || GlobalVertices == null || GlobalTriangles == null)
         {
             Debug.LogWarning("[ModelManager] PushToNative: scene data not ready.");
             return;
         }
 
         // 1. 顶点重打包: PathVertex(64B) → VertexGpuData(80B)
-        var verts80 = new RenderBufferManager.VertexGpuData[GlobalVertices.Length];
+        var verts80 = new VertexGpuData[GlobalVertices.Length];
         for (int i = 0; i < GlobalVertices.Length; i++)
         {
-            verts80[i] = new RenderBufferManager.VertexGpuData
+            verts80[i] = new VertexGpuData
             {
                 pos     = GlobalVertices[i].pos,
                 normal  = GlobalVertices[i].normal,
@@ -802,25 +756,17 @@ public class ModelManager : MonoBehaviour
         var idxPin = GCHandle.Alloc(flatIndices, GCHandleType.Pinned);
         _nativePins.Add(idxPin);
 
-        // 3. 构建 VPT_MeshData[]（每个 BLAS 一个）
-        var meshDataArr = new NativeBridge.VPT_MeshData[BlasDescriptors.Length];
-        for (int i = 0; i < BlasDescriptors.Length; i++)
+        // 3. 构建 VPT_MeshData[]（每个 BLAS 一个，顺序 = blasID）
+        var meshDataArr = new NativeBridge.VPT_MeshData[_blasRecords.Count];
+        for (int i = 0; i < _blasRecords.Count; i++)
         {
-            var desc = BlasDescriptors[i];
-            // 获取该 BLAS 的三角形数
-            int triCount = (i < BlasDescriptors.Length - 1)
-                ? (int)(BlasDescriptors[i + 1].triBase - desc.triBase)
-                : (GlobalTriangles.Length - (int)desc.triBase);
-            int vertCount = (i < BlasDescriptors.Length - 1)
-                ? (int)(BlasDescriptors[i + 1].vertBase - desc.vertBase)
-                : (GlobalVertices.Length - (int)desc.vertBase);
-
+            var desc = _blasRecords[i];
             meshDataArr[i] = new NativeBridge.VPT_MeshData
             {
-                vertices    = vertPin.AddrOfPinnedObject() + (int)desc.vertBase * 80,
-                vertexCount = (uint)vertCount,
-                indices     = idxPin.AddrOfPinnedObject() + (int)desc.triBase * 3 * 4,
-                indexCount  = (uint)(triCount * 3),
+                vertices    = vertPin.AddrOfPinnedObject() + desc.vertBase * 80,
+                vertexCount = (uint)desc.vertCount,
+                indices     = idxPin.AddrOfPinnedObject() + desc.triBase * 3 * 4,
+                indexCount  = (uint)(desc.triCount * 3),
                 materialID  = 0,  // materialID 由 instance 携带
                 // 骨骼动画：蒙皮 BLAS 加 ALLOW_UPDATE，供每帧 GPU 蒙皮后 refit
                 flags       = _skinnedBlasIds.Contains((uint)i)
@@ -845,16 +791,16 @@ public class ModelManager : MonoBehaviour
             lightCount = LightManager.Instance.Lights.Length;
         }
 
-        // 6. 实例数据转换: InstanceRecord → VPT_InstanceData
-        var vptInstances = new NativeBridge.VPT_InstanceData[InstanceTable.Length];
-        for (int i = 0; i < InstanceTable.Length; i++)
+        // 6. 实例数据转换: InstanceRecord → VPT_InstanceData（3x4 行主序）
+        var vptInstances = new NativeBridge.VPT_InstanceData[_instances.Count];
+        for (int i = 0; i < _instances.Count; i++)
         {
-            var rec = InstanceTable[i];
-            // 从 4x4 行主序 transform 提取 3x4 (前 3 行)
+            InstanceRecord rec = _instances[i];
+            Matrix4x4 m = rec.transform != null ? rec.transform.localToWorldMatrix : rec.localToWorld;
             float[] transform3x4 = new float[12];
             for (int row = 0; row < 3; row++)
                 for (int col = 0; col < 4; col++)
-                    transform3x4[row * 4 + col] = rec.transform[row * 4 + col];
+                    transform3x4[row * 4 + col] = m[row, col];
 
             vptInstances[i] = new NativeBridge.VPT_InstanceData
             {
@@ -867,7 +813,7 @@ public class ModelManager : MonoBehaviour
         // （float[] 存为 8B 引用而非 48B 内联），与 C++ sizeof=56B 步长不匹配。
         // 改用 Marshal.AllocHGlobal + StructureToPtr 逐元素封送，确保 56B/元素。
         int instSize = Marshal.SizeOf<NativeBridge.VPT_InstanceData>();
-        IntPtr instPtr = Marshal.AllocHGlobal(instSize * vptInstances.Length);
+        IntPtr instPtr = Marshal.AllocHGlobal(instSize * Mathf.Max(vptInstances.Length, 1));
         for (int i = 0; i < vptInstances.Length; i++)
             Marshal.StructureToPtr(vptInstances[i], instPtr + instSize * i, false);
         _nativeAllocs.Add(instPtr);
@@ -953,24 +899,24 @@ public class ModelManager : MonoBehaviour
     // ═════════════════════════════════════════════════════════
 
     /// <summary>
-    /// 把追踪表内活跃实例的当前 localToWorldMatrix 写入复用缓冲，
+    /// 把实例表内活跃实例的当前 localToWorldMatrix 写入复用缓冲，
     /// 调用 VPT_UpdateInstances 触发 native 侧下一帧 TLAS 重建。
     /// 隐藏（activeInHierarchy=false）的实例跳过；实例顺序保持稳定。
     /// </summary>
     public void SyncInstancesNative()
     {
-        if (_instanceTracker.Count == 0)
+        if (_instances.Count == 0)
             return;
         if (!NativeBridge.TryInitialize())
             return;
 
-        EnsureInstanceNativeBuffer(_instanceTracker.Count);
+        EnsureInstanceNativeBuffer(_instances.Count);
 
         int stride = Marshal.SizeOf<NativeBridge.VPT_InstanceData>(); // 56B，与 native 布局一致
         int written = 0;
-        for (int i = 0; i < _instanceTracker.Count; i++)
+        for (int i = 0; i < _instances.Count; i++)
         {
-            Transform t = _instanceTracker[i].transform;
+            Transform t = _instances[i].transform;
             if (t == null || !t.gameObject.activeInHierarchy)
                 continue;
 
@@ -981,8 +927,8 @@ public class ModelManager : MonoBehaviour
                     _transformScratch[row * 4 + col] = m[row, col];
 
             IntPtr dst = _instanceNativeBuffer + written * stride;
-            Marshal.WriteInt32(dst, 0, (int)_instanceTracker[i].materialID);
-            Marshal.WriteInt32(dst, 4, (int)_instanceTracker[i].blasID);
+            Marshal.WriteInt32(dst, 0, (int)_instances[i].materialID);
+            Marshal.WriteInt32(dst, 4, (int)_instances[i].blasID);
             Marshal.Copy(_transformScratch, 0, dst + 8, 12);
             written++;
         }
@@ -1002,7 +948,7 @@ public class ModelManager : MonoBehaviour
     /// 只算 jointCount 个关节矩阵（小数据量，参考项目 AnimationVk 的性能关键），
     /// native 蒙皮 compute 读 bind-pose base 副本就地写统一顶点缓冲后 BLAS refit。
     /// 隐藏（activeInHierarchy=false）或禁用的 SMR 跳过。
-    /// 返回 true 表示本帧至少推送了一个蒙皮 mesh（几何变形中，调用方应重置时域累积）。
+    /// 返回 true 表示本帧至少推送了一个蒙皮 mesh（几何变形中，调用方可据此重置历史）。
     /// </summary>
     public bool SyncSkinnedMeshesNative()
     {

@@ -121,11 +121,6 @@ public static class NativeBridge
         IntPtr cameraData,
         int lightCount, int samplesPerPixel);
 
-    /// <summary>执行 debug 深度图 dispatch（直接写入 Unity RenderTexture 的 VkImage）</summary>
-    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
-    public static extern void VPT_DispatchDebugDepth(
-        IntPtr nativeTexturePtr, int width, int height, IntPtr cameraData);
-
     // ── Plan B: Two-phase dispatch (eliminates vkQueueWaitIdle) ──────────
 
     /// <summary>渲染事件 ID：路径追踪 dispatch</summary>
@@ -254,38 +249,23 @@ public static class NativeBridge
         return VPT_GetRenderCallback();
     }
 
-    // ── DLSS 模式枚举（与 native VPT_DLSS_MODE_* 对齐） ──
-    public const int DLSS_MODE_SR = 0; // Super Resolution
-    public const int DLSS_MODE_RR = 1; // Ray Reconstruction
+    // ── DLSS NGX 接口（Ray Reconstruction） ──────────────
 
-    // ── DLSS NGX 接口 ──────────────────────────────────────
-
-    /// <summary>初始化 NGX DLSS feature（SR 或 RR）</summary>
+    /// <summary>初始化 NGX DLSS Ray Reconstruction feature</summary>
     /// <param name="renderW">渲染（低分）宽度</param>
     /// <param name="renderH">渲染（低分）高度</param>
     /// <param name="outputW">输出（全分）宽度</param>
     /// <param name="outputH">输出（全分）高度</param>
     /// <param name="qualityMode">0=Quality 1=Balanced 2=Performance 3=UltraPerf</param>
-    /// <param name="mode">0=SR(超分), 1=RR(光线重建)</param>
-    /// <returns>0=成功, -1=NGX不可用, -2=RR不支持(可降级SR)</returns>
+    /// <returns>0=成功, -1=NGX不可用, -2=RR不支持</returns>
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern int VPT_DLSS_Init(
         int renderW, int renderH, int outputW, int outputH,
-        int qualityMode, int mode);
+        int qualityMode);
 
     /// <summary>销毁 NGX DLSS feature</summary>
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_DLSS_Destroy();
-
-    /// <summary>
-    /// Phase 1: 准备 DLSS SR Evaluate dispatch。
-    /// 访问 Unity 纹理、包装 NGX 资源、填充参数，不提交命令缓冲。
-    /// </summary>
-    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
-    public static extern void VPT_DLSS_PrepareDispatch(
-        IntPtr colorLowPtr, IntPtr motionLowPtr, IntPtr depthLowPtr, IntPtr outputHighPtr,
-        int renderW, int renderH, int outputW, int outputH,
-        float jitterX, float jitterY, int reset);
 
     /// <summary>
     /// Phase 1: 准备 DLSS RR Evaluate dispatch。
@@ -304,27 +284,6 @@ public static class NativeBridge
     /// Phase 2: DLSS 渲染回调（由 IssuePluginEvent 在命令缓冲执行期间触发）。
     /// 复用与路径追踪相同的 VPT_RenderCallback，通过 eventID 区分。
     /// </summary>
-
-    /// <summary>
-    /// 便捷方法：准备 DLSS SR dispatch 并返回回调指针。
-    /// 调用方随后使用 cmd.IssuePluginEvent(ptr, EventDlss)。
-    /// </summary>
-    public static IntPtr PrepareDLSSDispatch(
-        UnityEngine.RenderTexture colorLowRT, UnityEngine.RenderTexture motionLowRT,
-        UnityEngine.RenderTexture depthLowRT, UnityEngine.RenderTexture outputHighRT,
-        int renderW, int renderH, int outputW, int outputH,
-        float jitterX, float jitterY, int reset)
-    {
-        IntPtr colorPtr  = colorLowRT.GetNativeTexturePtr();
-        IntPtr motionPtr = motionLowRT.GetNativeTexturePtr();
-        IntPtr depthPtr  = depthLowRT.GetNativeTexturePtr();
-        IntPtr outputPtr = outputHighRT.GetNativeTexturePtr();
-
-        VPT_DLSS_PrepareDispatch(colorPtr, motionPtr, depthPtr, outputPtr,
-            renderW, renderH, outputW, outputH, jitterX, jitterY, reset);
-
-        return VPT_GetRenderCallback();
-    }
 
     /// <summary>
     /// 便捷方法：准备 DLSS RR dispatch 并返回回调指针。
@@ -366,29 +325,6 @@ public static class NativeBridge
         }
 
         return VPT_GetRenderCallback();
-    }
-
-    /// <summary>
-    /// 执行 debug 深度图 dispatch，直接写入 Unity RenderTexture 的 VkImage。
-    /// 无 CPU 回读 — compute shader 通过 imageStore 直接写入 GPU 显存。
-    /// </summary>
-    /// <param name="nativeTexturePtr">RenderTexture.GetNativeTexturePtr() 返回的指针</param>
-    /// <param name="width">渲染宽度</param>
-    /// <param name="height">渲染高度</param>
-    /// <param name="cameraData">已填充好的相机数据</param>
-    public static void DispatchDebugDepth(IntPtr nativeTexturePtr, int width, int height, ref VPT_CameraData cameraData)
-    {
-        int camSize = System.Runtime.InteropServices.Marshal.SizeOf<VPT_CameraData>();
-        IntPtr camPtr = System.Runtime.InteropServices.Marshal.AllocHGlobal(camSize);
-        try
-        {
-            System.Runtime.InteropServices.Marshal.StructureToPtr(cameraData, camPtr, false);
-            VPT_DispatchDebugDepth(nativeTexturePtr, width, height, camPtr);
-        }
-        finally
-        {
-            System.Runtime.InteropServices.Marshal.FreeHGlobal(camPtr);
-        }
     }
 
     /// <summary>安全初始化：自动检查 DLL 加载和 RT Core 支持</summary>

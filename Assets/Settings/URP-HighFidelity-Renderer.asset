@@ -116,34 +116,14 @@ MonoBehaviour:
   m_Name: PathTraceRendererFeature
   m_EditorClassIdentifier: 
   m_Active: 1
-  pathTraceShader: {fileID: 7200000, guid: b7f0d0256d3797a44bb3711ac875d1a7, type: 3}
+  motionVectorShader: {fileID: 7200000, guid: b7f0d0256d3797a44bb3711ac875d1a7, type: 3}
   outputFormat: 2
   groupXY: 8
   maxDepth: 8
   samplesPerPixel: 1
   ambientColor: {r: 0.019607844, g: 0.019607844, b: 0.019607844, a: 1}
-  hdrEnvironment: {fileID: 2800000, guid: 835de5cc79ea58e4bbd6eb3977eb3ee8, type: 3}
+  hdrEnvironment: {fileID: 2800000, guid: 711a794c83d974b41907a483eac6ea58, type: 3}
   envIntensity: 1
   envRotation: 0
-  denoisingEnabled: 0
-  temporalEnabled: 0
-  spatialEnabled: 0
-  spatialPasses: 0
-  disocclusionThreshold: 0.02
-  normalWeightParam: 0
-  depthThreshold: 0.02
-  poissonTapCount: 8
-  blurRadius: 1
-  phiLuminance: 1
-  maxLuminanceRelativeDiff: 0.1
-  enableAntiFirefly: 1
-  debugDepthMode: 0
-  debugDepthResolution: 521
-  useReSTIRGI: 0
-  spatialNeighborCount: 4
-  specularThreshold: 0.1
-  restirSpatialTwoPass: 1
-  historyValidationInterval: 6
-  dlssMode: 2
+  dlssEnabled: 1
   dlssQualityMode: 1
-  debugDisableJitter: 0

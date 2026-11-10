@@ -68,15 +68,6 @@ extern "C" {
         const VPT_CameraData* cameraData,
         int32_t lightCount, int32_t samplesPerPixel);
 
-    /// 执行 debug 深度图 dispatch（阶段2.6验证用）
-    /// 写入 Unity RenderTexture 的原生 VkImage，无 CPU 回读
-    /// nativeTexturePtr: Unity RenderTexture 的原生指针
-    /// width/height: 渲染尺寸
-    /// cameraData: 指向 VPT_CameraData 结构的指针
-    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_DispatchDebugDepth(
-        void* nativeTexturePtr, int32_t width, int32_t height,
-        const VPT_CameraData* cameraData);
-
     /// 查询设备 RT Core 支持状态
     /// 返回: 1=支持 VK_KHR_ray_query, 0=不支持
     UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_QueryRayQuerySupport();
@@ -107,24 +98,17 @@ extern "C" {
     /// 获取渲染回调函数指针（供 C# IssuePluginEvent 使用）
     UNITY_INTERFACE_EXPORT void* UNITY_INTERFACE_API VPT_GetRenderCallback();
 
-    // ── DLSS NGX 接口（阶段3 SR + 阶段4 RR） ──────────────
+    // ── DLSS NGX 接口（Ray Reconstruction） ──────────────
 
-    /// 初始化 NGX DLSS feature（SR 或 RR）
+    /// 初始化 NGX DLSS Ray Reconstruction feature
     /// renderW/H: 渲染尺寸; outputW/H: 输出尺寸; qualityMode: 0=Q 1=B 2=P 3=UP
-    /// mode: 0=SR(超分), 1=RR(光线重建)
-    /// 返回: 0=成功, -1=不可用, -2=RR不支持
+    /// 返回: 0=成功, -1=不可用, -2=RR 不支持
     UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_DLSS_Init(
         int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
-        int32_t qualityMode, int32_t mode);
+        int32_t qualityMode);
 
     /// 销毁 NGX DLSS feature
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_DLSS_Destroy();
-
-    /// Phase 1: 准备 DLSS SR Evaluate dispatch
-    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_DLSS_PrepareDispatch(
-        void* colorLowPtr, void* motionLowPtr, void* depthLowPtr, void* outputHighPtr,
-        int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
-        float jitterX, float jitterY, int32_t reset);
 
     /// Phase 1: 准备 DLSS RR Evaluate dispatch
     /// 额外绑定 normalRoughPtr (GBuffer1) + 线性深度 + albedo G-buffer + 视图/投影矩阵

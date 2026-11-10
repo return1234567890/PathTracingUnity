@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$spvPath,
     [Parameter(Mandatory=$true)][string]$headerPath,
-    [string]$varName = "g_DebugDepthSpv"
+    [string]$varName = "g_PathTraceSpv"
 )
 $bytes = [System.IO.File]::ReadAllBytes($spvPath)
 $sb = [System.Text.StringBuilder]::new()

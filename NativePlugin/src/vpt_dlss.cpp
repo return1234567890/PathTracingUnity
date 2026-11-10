@@ -1,10 +1,8 @@
-// VulkanPathTracePlugin — NGX DLSS Super Sampling + Ray Reconstruction 集成
+// VulkanPathTracePlugin — NGX DLSS Ray Reconstruction 集成
 //
 // 职责：
 //   1. NVSDK_NGX_VULKAN_Init 初始化 NGX（设备就绪后）
-//   2. 创建/销毁 DLSS feature：
-//      - SR 模式: NVSDK_NGX_Feature_SuperSampling（超分）
-//      - RR 模式: NVSDK_NGX_Feature_RayReconstruction（降噪+超分一体化）
+//   2. 创建/销毁 DLSS RR feature：NVSDK_NGX_Feature_RayReconstruction（降噪+超分一体化）
 //   3. Phase 1: 包装 Unity RT 为 NVSDK_NGX_Resource_VK + 填充评估参数
 //   4. Phase 2: 通过 CommandRecordingState 获取 Unity VkCommandBuffer，
 //               调用 NGX Evaluate 录入命令流
@@ -47,7 +45,6 @@ static bool                 s_NGXInitialized = false;
 static NVSDK_NGX_Handle*    s_DLSSHandle      = nullptr;
 static NVSDK_NGX_Parameter* s_DLSSParams      = nullptr;
 static bool                 s_DLSSReady       = false;
-static int32_t              s_DLSSMode         = VPT_DLSS_MODE_SR; // 0=SR, 1=RR
 
 // 缓存的 ImageView（当 Unity VkImage 变化时重建）
 struct DLSSImageViewCache {
@@ -59,7 +56,7 @@ struct DLSSImageViewCache {
 };
 static DLSSImageViewCache s_ColorView;   // 低分辨率颜色输入
 static DLSSImageViewCache s_MotionView;  // 低分辨率运动矢量
-static DLSSImageViewCache s_DepthView;   // 低分辨率深度（SR: NDC, RR: 线性）
+static DLSSImageViewCache s_DepthView;   // 低分辨率视空间线性深度（RR 用）
 static DLSSImageViewCache s_OutputView; // 全分辨率输出
 static DLSSImageViewCache s_NormalRoughView; // RR: normal.xyz + roughness.w（GBuffer1）
 static DLSSImageViewCache s_DiffuseAlbedoView;  // RR: diffuse albedo = albedo*(1-metallic)
@@ -78,8 +75,6 @@ static uint32_t s_PendingRenderH = 0;
 static uint32_t s_PendingOutputW = 0;
 static uint32_t s_PendingOutputH = 0;
 static bool   s_DlssDispatchPending = false;
-// RR 模式标志（Phase 2 用此判断走 SR 还是 RR eval 路径）
-static bool   s_PendingIsRR = false;
 
 // ═══════════════════════════════════════════════════════════
 //  Helper: Access Unity texture and ensure VkImageView
@@ -138,7 +133,7 @@ static bool EnsureDLSSImageView(IUnityGraphicsVulkan* vulkan, VkDevice device,
 int32_t VPT_DLSS_Init_Internal(
     int32_t renderW, int32_t renderH,
     int32_t outputW, int32_t outputH,
-    int32_t qualityMode, int32_t mode)
+    int32_t qualityMode)
 {
     if (s_DLSSReady)
     {
@@ -159,8 +154,6 @@ int32_t VPT_DLSS_Init_Internal(
         fprintf(stderr, "[VPT-DLSS] Vulkan device not available.\n");
         return -1;
     }
-
-    s_DLSSMode = mode;
 
     // NGX data path + feature DLL 搜索路径：使用插件 DLL 自身所在目录（Assets/Plugins/x86_64/）
     // （函数级作用域：Init 块与下方扩展诊断块共用）
@@ -183,7 +176,7 @@ int32_t VPT_DLSS_Init_Internal(
         // ── GDPA 透传诊断：NGX 通过 GIPA/GDPA 获取 NVX 扩展函数 ──
         // （vkCreateCuModuleNVX/vkCreateCuFunctionNVX 是 CUDA 二进制导入，
         // transformer 模型（dlssd）运行的核心 API）。Unity 拦截层若不透传
-        // 这些函数，RR 创建时拿不到指针即失败，而 SR（CNN）不受影响。
+        // 这些函数，RR 创建时拿不到指针即失败。
         // A/B 对照：Unity 链 vs 真实 vulkan-1.dll ICD 链。
         {
             PFN_vkGetInstanceProcAddr gipaU = inst.getInstanceProcAddr;
@@ -255,9 +248,9 @@ int32_t VPT_DLSS_Init_Internal(
     }
 
     // ── 1.5 查询 NGX 能力 ──
-    // SR 查询 SuperSampling_Available；RR 查询 SuperSamplingDenoising_Available
+    // RR 查询 SuperSamplingDenoising_Available
     {
-        // ── 扩展需求诊断：查询 RR/SR 需要的 Vulkan 设备/instance 扩展 ──
+        // ── 扩展需求诊断：查询 RR 需要的 Vulkan 设备/instance 扩展 ──
         // CreateFeature 参数矩阵已全部排除（12 组全 0xbad00005），
         // 新假设：Unity VkDevice 未启用 RR 所需的设备扩展。
         {
@@ -269,7 +262,6 @@ int32_t VPT_DLSS_Init_Internal(
             struct FeatDiag { NVSDK_NGX_Feature id; const char* name; };
             const FeatDiag featDiags[] = {
                 { NVSDK_NGX_Feature_RayReconstruction, "RR" },
-                { NVSDK_NGX_Feature_SuperSampling,     "SR" },
             };
             for (const FeatDiag& fd : featDiags)
             {
@@ -315,36 +307,29 @@ int32_t VPT_DLSS_Init_Internal(
         fprintf(stderr, "[VPT-DLSS] GetCapabilityParameters: 0x%x, params=%p\n", capResult, (void*)capParams);
         if (capResult == NVSDK_NGX_Result_Success && capParams)
         {
-            int srAvailable = 0;
-            NVSDK_NGX_Parameter_GetI(capParams, NVSDK_NGX_Parameter_SuperSampling_Available, &srAvailable);
-            fprintf(stderr, "[VPT-DLSS] DLSS SR available: %d\n", srAvailable);
+            int rrAvailable = 0;
+            NVSDK_NGX_Parameter_GetI(capParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &rrAvailable);
+            fprintf(stderr, "[VPT-DLSS] DLSS RR available: %d\n", rrAvailable);
 
-            if (mode == VPT_DLSS_MODE_RR)
+            // RR 诊断：查询驱动版本和 FeatureInitResult
+            int needsUpdate = 0;
+            NVSDK_NGX_Parameter_GetI(capParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_NeedsUpdatedDriver, &needsUpdate);
+            int minMajor = 0, minMinor = 0;
+            NVSDK_NGX_Parameter_GetI(capParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMajor, &minMajor);
+            NVSDK_NGX_Parameter_GetI(capParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMinor, &minMinor);
+            int featInitResult = 0;
+            NVSDK_NGX_Parameter_GetI(capParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_FeatureInitResult, &featInitResult);
+            fprintf(stderr, "[VPT-DLSS] RR NeedsUpdatedDriver=%d, MinDriver=%d.%d, FeatureInitResult=0x%x\n",
+                    needsUpdate, minMajor, minMinor, featInitResult);
+
+            if (!rrAvailable)
             {
-                int rrAvailable = 0;
-                NVSDK_NGX_Parameter_GetI(capParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &rrAvailable);
-                fprintf(stderr, "[VPT-DLSS] DLSS RR available: %d\n", rrAvailable);
-
-                // RR 诊断：查询驱动版本和 FeatureInitResult
-                int needsUpdate = 0;
-                NVSDK_NGX_Parameter_GetI(capParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_NeedsUpdatedDriver, &needsUpdate);
-                int minMajor = 0, minMinor = 0;
-                NVSDK_NGX_Parameter_GetI(capParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMajor, &minMajor);
-                NVSDK_NGX_Parameter_GetI(capParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMinor, &minMinor);
-                int featInitResult = 0;
-                NVSDK_NGX_Parameter_GetI(capParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_FeatureInitResult, &featInitResult);
-                fprintf(stderr, "[VPT-DLSS] RR NeedsUpdatedDriver=%d, MinDriver=%d.%d, FeatureInitResult=0x%x\n",
-                        needsUpdate, minMajor, minMinor, featInitResult);
-
-                if (!rrAvailable)
-                {
-                    fprintf(stderr, "[VPT-DLSS] Ray Reconstruction not supported on this GPU/driver.\n");
-                    NVSDK_NGX_VULKAN_DestroyParameters(capParams);
-                    return -2; // RR 不支持，调用方可降级到 SR
-                }
+                fprintf(stderr, "[VPT-DLSS] Ray Reconstruction not supported on this GPU/driver.\n");
+                NVSDK_NGX_VULKAN_DestroyParameters(capParams);
+                return -2; // RR 不支持
             }
 
-            // ── RR/SR 尺寸范围诊断：直接提取 capability params 中的
+            // ── RR 尺寸范围诊断：直接提取 capability params 中的
             //    OptimalSettingsCallback 调用（helper 版会引入 D3D 头依赖）。
             //    callback 只存在于 GetCapabilityParameters 返回的 params 中。
             //    返回 snippet 推荐的渲染尺寸与动态 min/max 范围，
@@ -362,7 +347,6 @@ int32_t VPT_DLSS_Init_Internal(
                 struct CbDiag { const char* param; const char* name; };
                 const CbDiag cbDiags[] = {
                     { NVSDK_NGX_Parameter_DLSSDOptimalSettingsCallback, "RR(dlssd)" },
-                    { NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback,  "SR(dlss)"  },
                 };
                 for (const CbDiag& d : cbDiags)
                 {
@@ -408,8 +392,8 @@ int32_t VPT_DLSS_Init_Internal(
     }
 
     // ── 3. 映射 qualityMode ──
-    fprintf(stderr, "[VPT-DLSS] CreateFeature params: render=%dx%d output=%dx%d quality=%d mode=%d\n",
-            renderW, renderH, outputW, outputH, qualityMode, mode);
+    fprintf(stderr, "[VPT-DLSS] CreateFeature params: render=%dx%d output=%dx%d quality=%d\n",
+            renderW, renderH, outputW, outputH, qualityMode);
     // C# 约定: 0=Quality 1=Balanced 2=Performance 3=UltraPerf
     NVSDK_NGX_PerfQuality_Value perfQuality;
     switch (qualityMode)
@@ -453,112 +437,78 @@ int32_t VPT_DLSS_Init_Internal(
     vr = vkBeginCommandBuffer(cmdBuf, &beginInfo);
     fprintf(stderr, "[VPT-DLSS] vkBeginCommandBuffer: %d\n", vr);
 
-    if (mode == VPT_DLSS_MODE_RR)
+    // ═══ RR: NVSDK_NGX_Feature_RayReconstruction ═══
+    // 根因（nvngx_dlssd_310_7_0.log）：
+    //   [NgxSwinDenoiser::CreateDldnInstance] Error: HDR Color required
+    // RR 的 Preset_D transformer 模型（SwinDenoiser）强制要求 IsHDR flag，
+    // 输入颜色须为线性 HDR（路径追踪 radiance 天然满足）。
+    //
+    // DepthInverted 排除（边缘抖动修复 2026-09-07）：
+    // 该 flag 语义是「深度缓冲为反向 z 排序（near 大 far 小）」，
+    // 只适用于 reversed-Z 的 NDC 深度。RR 用 Linear 深度
+    // （LinearDepthOut = curClip.w，near 小 far 大，非反向），
+    // 设置该 flag 会使 RR 深度一致性/disocclusion 检测方向颠倒，
+    // 边缘深度突变处时域历史被错误取舍 → 模型边缘抖动。
+    //
+    // AutoExposure 排除（亮处抖动修复 2026-09-07）：
+    // 官方参考 Linear 深度下 InFeatureCreateFlags = IsHDR | MVLowRes，
+    // 不含 AutoExposure。RR 输入是 1spp 逐帧独立噪声（NEE 随机选灯 +
+    // Halton jitter），全图亮度统计逐帧波动 → AutoExposure 估计出的曝光
+    // 逐帧波动（日志佐证：dlssd 创建了 AutoExposure / PrevAutoExposureTexture_0/1
+    // 内部纹理）。曝光是全图乘性作用，亮区绝对波动远大于暗区 →
+    // 「被光照到的像素抖、暗处不抖」。Streamline 官方文档亦注明
+    // "DLSS-RR will ignore DLSS options sharpness and useAutoExposure"。
+    // 移除后 evaluate 侧 InPreExposure/InExposureScale=1.0 即固定曝光。
+    // 首选组合 = 0x03（与官方参考完全一致），0x43（旧首选）与
+    // 0x4b（含 DepthInverted）降为备选对照。
+    const int rrFlagCombos[] = {
+        NVSDK_NGX_DLSS_Feature_Flags_IsHDR
+      | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes,                    // 0x03 首选
+        NVSDK_NGX_DLSS_Feature_Flags_IsHDR
+      | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes
+      | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure,               // 0x43 备选（旧首选）
+        NVSDK_NGX_DLSS_Feature_Flags_IsHDR
+      | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes
+      | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure
+      | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted,              // 0x4b 末选对照
+    };
+    const int rrComboCount = (int)(sizeof(rrFlagCombos) / sizeof(rrFlagCombos[0]));
+
+    result = NVSDK_NGX_Result_Fail;
+    for (int fi = 0; fi < rrComboCount && result != NVSDK_NGX_Result_Success; fi++)
     {
-        // ═══ RR: NVSDK_NGX_Feature_RayReconstruction ═══
-        // 根因（nvngx_dlssd_310_7_0.log）：
-        //   [NgxSwinDenoiser::CreateDldnInstance] Error: HDR Color required
-        // RR 的 Preset_D transformer 模型（SwinDenoiser）强制要求 IsHDR flag，
-        // 输入颜色须为线性 HDR（路径追踪 radiance 天然满足）；
-        // SR 的 CNN 模型无此检查，故此前 SR 成功 / RR 全参数组合失败。
-        //
-        // DepthInverted 排除（边缘抖动修复 2026-09-07）：
-        // 该 flag 语义是「深度缓冲为反向 z 排序（near 大 far 小）」，
-        // 仅适用于 SR 的 reversed-Z NDC 深度。RR 用 Linear 深度
-        // （LinearDepthOut = curClip.w，near 小 far 大，非反向），
-        // 设置该 flag 会使 RR 深度一致性/disocclusion 检测方向颠倒，
-        // 边缘深度突变处时域历史被错误取舍 → 模型边缘抖动。
-        //
-        // AutoExposure 排除（亮处抖动修复 2026-09-07）：
-        // 官方参考 Linear 深度下 InFeatureCreateFlags = IsHDR | MVLowRes，
-        // 不含 AutoExposure。该 flag 是从 SR 分支沿袭的——SR 输入是
-        // 空域滤波后的干净图像，内部曝光估计帧间稳定；而 RR 输入是
-        // 1spp 逐帧独立噪声（NEE 随机选灯 + Halton jitter），全图亮度
-        // 统计逐帧波动 → AutoExposure 估计出的曝光逐帧波动（日志佐证：
-        // dlssd 创建了 AutoExposure / PrevAutoExposureTexture_0/1 内部
-        // 纹理）。曝光是全图乘性作用，亮区绝对波动远大于暗区 →
-        // 「被光照到的像素抖、暗处不抖」。Streamline 官方文档亦注明
-        // "DLSS-RR will ignore DLSS options sharpness and useAutoExposure"。
-        // 移除后 evaluate 侧 InPreExposure/InExposureScale=1.0 即固定曝光。
-        // 首选组合 = 0x03（与官方参考完全一致），0x43（旧首选）与
-        // 0x4b（含 DepthInverted）降为备选对照。
-        const int rrFlagCombos[] = {
-            NVSDK_NGX_DLSS_Feature_Flags_IsHDR
-          | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes,                    // 0x03 首选
-            NVSDK_NGX_DLSS_Feature_Flags_IsHDR
-          | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes
-          | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure,               // 0x43 备选（旧首选）
-            NVSDK_NGX_DLSS_Feature_Flags_IsHDR
-          | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes
-          | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure
-          | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted,              // 0x4b 末选对照
-        };
-        const int rrComboCount = (int)(sizeof(rrFlagCombos) / sizeof(rrFlagCombos[0]));
+        NVSDK_NGX_DLSSD_Create_Params rrParams{};
+        rrParams.InWidth             = (unsigned)renderW;
+        rrParams.InHeight            = (unsigned)renderH;
+        rrParams.InTargetWidth       = (unsigned)outputW;
+        rrParams.InTargetHeight      = (unsigned)outputH;
+        rrParams.InPerfQualityValue  = perfQuality;
+        rrParams.InFeatureCreateFlags = rrFlagCombos[fi];
+        rrParams.InEnableOutputSubrects = false;
+        rrParams.InDenoiseMode       = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
+        rrParams.InRoughnessMode     = NVSDK_NGX_DLSS_Roughness_Mode_Packed;
+        rrParams.InUseHWDepth        = NVSDK_NGX_DLSS_Depth_Type_Linear;
 
-        result = NVSDK_NGX_Result_Fail;
-        for (int fi = 0; fi < rrComboCount && result != NVSDK_NGX_Result_Success; fi++)
-        {
-            NVSDK_NGX_DLSSD_Create_Params rrParams{};
-            rrParams.InWidth             = (unsigned)renderW;
-            rrParams.InHeight            = (unsigned)renderH;
-            rrParams.InTargetWidth       = (unsigned)outputW;
-            rrParams.InTargetHeight      = (unsigned)outputH;
-            rrParams.InPerfQualityValue  = perfQuality;
-            rrParams.InFeatureCreateFlags = rrFlagCombos[fi];
-            rrParams.InEnableOutputSubrects = false;
-            rrParams.InDenoiseMode       = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
-            rrParams.InRoughnessMode     = NVSDK_NGX_DLSS_Roughness_Mode_Packed;
-            rrParams.InUseHWDepth        = NVSDK_NGX_DLSS_Depth_Type_Linear;
+        fprintf(stderr, "[VPT-DLSS] RR create (flags=0x%x%s): W=%u H=%u TW=%u TH=%u PQ=%d\n",
+                rrParams.InFeatureCreateFlags,
+                (fi == 0) ? " refFlags(noAutoExposure)" :
+                (fi == 1) ? " autoExposure-fallback" : " autoExposure+depthInv-fallback",
+                rrParams.InWidth, rrParams.InHeight,
+                rrParams.InTargetWidth, rrParams.InTargetHeight, (int)perfQuality);
 
-            fprintf(stderr, "[VPT-DLSS] RR create (flags=0x%x%s): W=%u H=%u TW=%u TH=%u PQ=%d\n",
-                    rrParams.InFeatureCreateFlags,
-                    (fi == 0) ? " refFlags(noAutoExposure)" :
-                    (fi == 1) ? " autoExposure-fallback" : " autoExposure+depthInv-fallback",
-                    rrParams.InWidth, rrParams.InHeight,
-                    rrParams.InTargetWidth, rrParams.InTargetHeight, (int)perfQuality);
-
-            s_DLSSHandle = nullptr;
-            result = NGX_VULKAN_CREATE_DLSSD_EXT1(
-                inst.device, cmdBuf,
-                0, 0,
-                &s_DLSSHandle, s_DLSSParams, &rrParams);
-            fprintf(stderr, "[VPT-DLSS]   -> 0x%x, handle=%p\n", result, (void*)s_DLSSHandle);
-
-            if (result != NVSDK_NGX_Result_Success)
-            {
-                // 结束本次记录并重新 begin（pool 带 RESET flag，begin 隐式重置）
-                vkEndCommandBuffer(cmdBuf);
-                vkBeginCommandBuffer(cmdBuf, &beginInfo);
-            }
-        }
-    }
-    else
-    {
-        // ═══ SR: NVSDK_NGX_Feature_SuperSampling ═══
-        // DLSS flags: MVLowRes + AutoExposure + DepthInverted
-        // MVLowRes: 运动矢量为低分辨率
-        // AutoExposure: 不使用 exposure texture
-        // DepthInverted: Unity 使用 reversed-Z（near=1, far=0），深度值近处更高
-        // 不设 MVJittered：MV 用未 jitter 的投影矩阵计算，不含 jitter 偏移；
-        // DLSS 会用 InJitterOffsetX/Y 内部校正 MV，与 jittered 渲染图像对齐。
-        int createFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes
-                        | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure
-                        | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
-
-        NVSDK_NGX_DLSS_Create_Params createParams{};
-        createParams.Feature.InWidth           = (unsigned)renderW;
-        createParams.Feature.InHeight          = (unsigned)renderH;
-        createParams.Feature.InTargetWidth     = (unsigned)outputW;
-        createParams.Feature.InTargetHeight    = (unsigned)outputH;
-        createParams.Feature.InPerfQualityValue = perfQuality;
-        createParams.InFeatureCreateFlags      = createFlags;
-        createParams.InEnableOutputSubrects    = false;
-
-        result = NGX_VULKAN_CREATE_DLSS_EXT1(
+        s_DLSSHandle = nullptr;
+        result = NGX_VULKAN_CREATE_DLSSD_EXT1(
             inst.device, cmdBuf,
             0, 0,
-            &s_DLSSHandle, s_DLSSParams, &createParams);
-        fprintf(stderr, "[VPT-DLSS] NGX_VULKAN_CREATE_DLSS_EXT1 (SR): 0x%x, handle=%p\n", result, (void*)s_DLSSHandle);
+            &s_DLSSHandle, s_DLSSParams, &rrParams);
+        fprintf(stderr, "[VPT-DLSS]   -> 0x%x, handle=%p\n", result, (void*)s_DLSSHandle);
+
+        if (result != NVSDK_NGX_Result_Success)
+        {
+            // 结束本次记录并重新 begin（pool 带 RESET flag，begin 隐式重置）
+            vkEndCommandBuffer(cmdBuf);
+            vkBeginCommandBuffer(cmdBuf, &beginInfo);
+        }
     }
 
     vr = vkEndCommandBuffer(cmdBuf);
@@ -586,8 +536,7 @@ int32_t VPT_DLSS_Init_Internal(
     }
 
     s_DLSSReady = true;
-    fprintf(stderr, "[VPT-DLSS] DLSS feature created (%s): %dx%d -> %dx%d (quality=%d)\n",
-            mode == VPT_DLSS_MODE_RR ? "RR" : "SR",
+    fprintf(stderr, "[VPT-DLSS] DLSS RR feature created: %dx%d -> %dx%d (quality=%d)\n",
             renderW, renderH, outputW, outputH, qualityMode);
     return 0;
 }
@@ -642,57 +591,8 @@ void VPT_DLSS_Destroy_Internal()
 }
 
 // ═══════════════════════════════════════════════════════════
-//  Phase 1: 准备 DLSS Evaluate dispatch
-// ═══════════════════════════════════════════════════════════
-
-void VPT_DLSS_PrepareDispatch_Internal(
-    void* colorLowPtr, void* motionLowPtr, void* depthLowPtr, void* outputHighPtr,
-    int32_t renderW, int32_t renderH,
-    int32_t outputW, int32_t outputH,
-    float jitterX, float jitterY, int32_t reset)
-{
-    if (!s_DLSSReady || !colorLowPtr || !motionLowPtr || !depthLowPtr || !outputHighPtr)
-        return;
-
-    IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
-    VkDevice device = VPT_GetInstance().device;
-
-    // ── Access Unity textures and ensure ImageViews ──
-    // Color: read-only, Shader Read Only layout
-    if (!EnsureDLSSImageView(vulkan, device, colorLowPtr, s_ColorView,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        VK_ACCESS_SHADER_READ_BIT, "Color")) return;
-
-    // Motion: read-only
-    if (!EnsureDLSSImageView(vulkan, device, motionLowPtr, s_MotionView,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        VK_ACCESS_SHADER_READ_BIT, "Motion")) return;
-
-    // Depth: read-only
-    if (!EnsureDLSSImageView(vulkan, device, depthLowPtr, s_DepthView,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        VK_ACCESS_SHADER_READ_BIT, "Depth")) return;
-
-    // Output: write-only, General layout
-    if (!EnsureDLSSImageView(vulkan, device, outputHighPtr, s_OutputView,
-        VK_IMAGE_LAYOUT_GENERAL,
-        VK_ACCESS_SHADER_WRITE_BIT, "Output")) return;
-
-    // ── Store pending params for Phase 2 ──
-    s_PendingJitterX = jitterX;
-    s_PendingJitterY = jitterY;
-    s_PendingReset    = reset;
-    s_PendingRenderW  = (uint32_t)renderW;
-    s_PendingRenderH  = (uint32_t)renderH;
-    s_PendingOutputW  = (uint32_t)outputW;
-    s_PendingOutputH  = (uint32_t)outputH;
-    s_PendingIsRR     = false;
-    s_DlssDispatchPending = true;
-}
-
-// ═══════════════════════════════════════════════════════════
-//  Phase 1: 准备 DLSS RR Evaluate dispatch（RR 模式）
-//  额外绑定 Normal+Roughness (GBuffer1)、LinearDepth、相机矩阵
+//  Phase 1: 准备 DLSS RR Evaluate dispatch
+//  绑定 Normal+Roughness (GBuffer1)、LinearDepth、albedo G-buffer、相机矩阵
 // ═══════════════════════════════════════════════════════════
 
 void VPT_DLSS_PrepareRRDispatch_Internal(
@@ -755,7 +655,6 @@ void VPT_DLSS_PrepareRRDispatch_Internal(
     s_PendingRenderH  = (uint32_t)renderH;
     s_PendingOutputW  = (uint32_t)outputW;
     s_PendingOutputH  = (uint32_t)outputH;
-    s_PendingIsRR     = true;
     // 拷贝矩阵（16 float，行主序，不含 jitter）
     if (viewMatrix) memcpy(s_RRViewMatrix, viewMatrix, sizeof(float) * 16);
     if (projMatrix) memcpy(s_RRProjMatrix, projMatrix, sizeof(float) * 16);
@@ -765,8 +664,7 @@ void VPT_DLSS_PrepareRRDispatch_Internal(
 // ═══════════════════════════════════════════════════════════
 //  Phase 2: DLSS Render Callback
 //  通过 CommandRecordingState 获取 Unity VkCommandBuffer，
-//  根据 s_PendingIsRR 走 SR (NGX_VULKAN_EVALUATE_DLSS_EXT)
-//  或 RR (NGX_VULKAN_EVALUATE_DLSSD_EXT) 评估路径
+//  走 RR (NGX_VULKAN_EVALUATE_DLSSD_EXT) 评估路径
 // ═══════════════════════════════════════════════════════════
 
 void VPT_DLSS_RenderCallback()
@@ -820,90 +718,59 @@ void VPT_DLSS_RenderCallback()
 
     NVSDK_NGX_Result result;
 
-    if (s_PendingIsRR)
-    {
-        // ═══ RR: NGX_VULKAN_EVALUATE_DLSSD_EXT ═══
-        // RR 额外绑定 Normal+Roughness、Diffuse/Specular Albedo、WorldToView/ViewToClip 矩阵
-        NVSDK_NGX_Resource_VK normalRoughRes = NVSDK_NGX_Create_ImageView_Resource_VK(
-            s_NormalRoughView.view, s_NormalRoughView.image, subRange,
-            s_NormalRoughView.format, s_NormalRoughView.width, s_NormalRoughView.height, false);
+    // ═══ RR: NGX_VULKAN_EVALUATE_DLSSD_EXT ═══
+    // RR 绑定 Normal+Roughness、Diffuse/Specular Albedo、WorldToView/ViewToClip 矩阵
+    NVSDK_NGX_Resource_VK normalRoughRes = NVSDK_NGX_Create_ImageView_Resource_VK(
+        s_NormalRoughView.view, s_NormalRoughView.image, subRange,
+        s_NormalRoughView.format, s_NormalRoughView.width, s_NormalRoughView.height, false);
 
-        // RR albedo G-buffer（主 kernel 首命中写入的材质分解）
-        NVSDK_NGX_Resource_VK diffuseAlbedoRes = NVSDK_NGX_Create_ImageView_Resource_VK(
-            s_DiffuseAlbedoView.view, s_DiffuseAlbedoView.image, subRange,
-            s_DiffuseAlbedoView.format, s_DiffuseAlbedoView.width, s_DiffuseAlbedoView.height, false);
+    // RR albedo G-buffer（主 kernel 首命中写入的材质分解）
+    NVSDK_NGX_Resource_VK diffuseAlbedoRes = NVSDK_NGX_Create_ImageView_Resource_VK(
+        s_DiffuseAlbedoView.view, s_DiffuseAlbedoView.image, subRange,
+        s_DiffuseAlbedoView.format, s_DiffuseAlbedoView.width, s_DiffuseAlbedoView.height, false);
 
-        NVSDK_NGX_Resource_VK specularAlbedoRes = NVSDK_NGX_Create_ImageView_Resource_VK(
-            s_SpecularAlbedoView.view, s_SpecularAlbedoView.image, subRange,
-            s_SpecularAlbedoView.format, s_SpecularAlbedoView.width, s_SpecularAlbedoView.height, false);
+    NVSDK_NGX_Resource_VK specularAlbedoRes = NVSDK_NGX_Create_ImageView_Resource_VK(
+        s_SpecularAlbedoView.view, s_SpecularAlbedoView.image, subRange,
+        s_SpecularAlbedoView.format, s_SpecularAlbedoView.width, s_SpecularAlbedoView.height, false);
 
-        NVSDK_NGX_VK_DLSSD_Eval_Params rrEval{};
-        rrEval.pInColor       = &colorRes;
-        rrEval.pInOutput      = &outputRes;
-        rrEval.pInDepth       = &depthRes;
-        rrEval.pInMotionVectors = &motionRes;
-        rrEval.pInNormals     = &normalRoughRes;
-        rrEval.pInRoughness   = &normalRoughRes; // Packed 模式：roughness 从 normals.w 读取
-        // RR guide 3.4 节要求的材质分解输入：
-        // Diffuse = albedo*(1-metallic)，Specular = EnvBRDFApprox(F0, roughness², NoV)
-        rrEval.pInDiffuseAlbedo  = &diffuseAlbedoRes;
-        rrEval.pInSpecularAlbedo = &specularAlbedoRes;
-        // Jitter 取负（边缘抖动修复 2026-09-07）：
-        // 渲染侧 pathtrace.glsl 的 jitter 应用方向为 uv = (pixel + 0.5 + jitter)/res，
-        // 与 NVIDIA nvpro 官方参考（gltf_pathtrace.slang L786 subpixelJitter = jitter + 0.5）
-        // 完全一致；而官方参考传 NGX 时取负（dlss_wrapper.cpp L390
-        // InJitterOffsetX = -info.jitter.x）。此前 RR 沿用 SR 的 +jitter 传法，
-        // transformer 模型的帧间亚像素对齐每帧偏差 2×jitter（随 Halton 相位变化）
-        // → 模型边缘轻微抖动。SR 分支保持 +jitter 不动（CNN 模型对此不敏感，
-        // 实测静止不抖，避免引入回归）。
-        rrEval.InJitterOffsetX = -s_PendingJitterX;
-        rrEval.InJitterOffsetY = -s_PendingJitterY;
-        rrEval.InRenderSubrectDimensions.Width  = s_PendingRenderW;
-        rrEval.InRenderSubrectDimensions.Height = s_PendingRenderH;
-        rrEval.InReset         = s_PendingReset;
-        // MV kernel 输出 UV 空间运动矢量，乘以渲染分辨率转为像素空间
-        rrEval.InMVScaleX      = (float)s_PendingRenderW;
-        rrEval.InMVScaleY      = (float)s_PendingRenderH;
-        // 固定曝光（无 AutoExposure flag 时即生效，官方参考同此约定）
-        rrEval.InPreExposure   = 1.0f;
-        rrEval.InExposureScale = 1.0f;
-        // RR 相机矩阵（不含 jitter，行主序 float[16]）
-        rrEval.pInWorldToViewMatrix = s_RRViewMatrix;
-        rrEval.pInViewToClipMatrix  = s_RRProjMatrix;
+    NVSDK_NGX_VK_DLSSD_Eval_Params rrEval{};
+    rrEval.pInColor       = &colorRes;
+    rrEval.pInOutput      = &outputRes;
+    rrEval.pInDepth       = &depthRes;
+    rrEval.pInMotionVectors = &motionRes;
+    rrEval.pInNormals     = &normalRoughRes;
+    rrEval.pInRoughness   = &normalRoughRes; // Packed 模式：roughness 从 normals.w 读取
+    // RR guide 3.4 节要求的材质分解输入：
+    // Diffuse = albedo*(1-metallic)，Specular = EnvBRDFApprox(F0, roughness², NoV)
+    rrEval.pInDiffuseAlbedo  = &diffuseAlbedoRes;
+    rrEval.pInSpecularAlbedo = &specularAlbedoRes;
+    // Jitter 取负（边缘抖动修复 2026-09-07）：
+    // 渲染侧 pathtrace.glsl 的 jitter 应用方向为 uv = (pixel + 0.5 + jitter)/res，
+    // 与 NVIDIA nvpro 官方参考（gltf_pathtrace.slang L786 subpixelJitter = jitter + 0.5）
+    // 完全一致；而官方参考传 NGX 时取负（dlss_wrapper.cpp L390
+    // InJitterOffsetX = -info.jitter.x）。此前按 +jitter 传，
+    // transformer 模型的帧间亚像素对齐每帧偏差 2×jitter（随 Halton 相位变化）
+    // → 模型边缘轻微抖动。
+    rrEval.InJitterOffsetX = -s_PendingJitterX;
+    rrEval.InJitterOffsetY = -s_PendingJitterY;
+    rrEval.InRenderSubrectDimensions.Width  = s_PendingRenderW;
+    rrEval.InRenderSubrectDimensions.Height = s_PendingRenderH;
+    rrEval.InReset         = s_PendingReset;
+    // MV kernel 输出 UV 空间运动矢量，乘以渲染分辨率转为像素空间
+    rrEval.InMVScaleX      = (float)s_PendingRenderW;
+    rrEval.InMVScaleY      = (float)s_PendingRenderH;
+    // 固定曝光（无 AutoExposure flag 时即生效，官方参考同此约定）
+    rrEval.InPreExposure   = 1.0f;
+    rrEval.InExposureScale = 1.0f;
+    // RR 相机矩阵（不含 jitter，行主序 float[16]）
+    rrEval.pInWorldToViewMatrix = s_RRViewMatrix;
+    rrEval.pInViewToClipMatrix  = s_RRProjMatrix;
 
-        result = NGX_VULKAN_EVALUATE_DLSSD_EXT(
-            cmd, s_DLSSHandle, s_DLSSParams, &rrEval);
+    result = NGX_VULKAN_EVALUATE_DLSSD_EXT(
+        cmd, s_DLSSHandle, s_DLSSParams, &rrEval);
 
-        if (result != NVSDK_NGX_Result_Success)
-            fprintf(stderr, "[VPT-DLSS] RR EvaluateFeature failed: 0x%x\n", result);
-    }
-    else
-    {
-        // ═══ SR: NGX_VULKAN_EVALUATE_DLSS_EXT ═══
-        NVSDK_NGX_VK_DLSS_Eval_Params evalParams{};
-        evalParams.Feature.pInColor   = &colorRes;
-        evalParams.Feature.pInOutput  = &outputRes;
-        evalParams.Feature.InSharpness = 0.0f;
-        evalParams.pInDepth            = &depthRes;
-        evalParams.pInMotionVectors    = &motionRes;
-        evalParams.InJitterOffsetX    = s_PendingJitterX;
-        evalParams.InJitterOffsetY    = s_PendingJitterY;
-        evalParams.InRenderSubrectDimensions.Width  = s_PendingRenderW;
-        evalParams.InRenderSubrectDimensions.Height = s_PendingRenderH;
-        evalParams.InReset             = s_PendingReset;
-        // MV kernel 输出 UV 空间运动矢量 (prevUV - curUV)，DLSS 期望像素空间。
-        // 乘以渲染分辨率将 UV → 像素偏移量。
-        evalParams.InMVScaleX          = (float)s_PendingRenderW;
-        evalParams.InMVScaleY          = (float)s_PendingRenderH;
-        evalParams.InPreExposure       = 1.0f;
-        evalParams.InExposureScale     = 1.0f;
-
-        result = NGX_VULKAN_EVALUATE_DLSS_EXT(
-            cmd, s_DLSSHandle, s_DLSSParams, &evalParams);
-
-        if (result != NVSDK_NGX_Result_Success)
-            fprintf(stderr, "[VPT-DLSS] SR EvaluateFeature failed: 0x%x\n", result);
-    }
+    if (result != NVSDK_NGX_Result_Success)
+        fprintf(stderr, "[VPT-DLSS] RR EvaluateFeature failed: 0x%x\n", result);
 }
 
 bool VPT_DLSS_IsReady()
@@ -915,14 +782,13 @@ bool VPT_DLSS_IsReady()
 
 // ── Stub implementations when NGX SDK is not available ──
 
-int32_t VPT_DLSS_Init_Internal(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t)
+int32_t VPT_DLSS_Init_Internal(int32_t, int32_t, int32_t, int32_t, int32_t)
 {
     fprintf(stderr, "[VPT-DLSS] NGX SDK not linked. DLSS unavailable.\n");
     return -1;
 }
 
 void VPT_DLSS_Destroy_Internal() {}
-void VPT_DLSS_PrepareDispatch_Internal(void*, void*, void*, void*, int32_t, int32_t, int32_t, int32_t, float, float, int32_t) {}
 void VPT_DLSS_PrepareRRDispatch_Internal(void*, void*, void*, void*, void*, void*, void*, int32_t, int32_t, int32_t, int32_t, float, float, int32_t, const float*, const float*) {}
 void VPT_DLSS_RenderCallback() {}
 bool VPT_DLSS_IsReady() { return false; }

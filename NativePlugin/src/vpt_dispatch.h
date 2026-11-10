@@ -3,30 +3,16 @@
 #include "vpt_types.h"
 #include <vulkan/vulkan.h>
 
-// ── Debug depth dispatch (Phase 2.6 verification) ─────────
-// Traces one ray per pixel against TLAS, writes hit distance as grayscale
-// directly to Unity's RenderTexture via imageStore — no CPU readback.
-
 namespace VPTDispatch {
 
-    /// Initialize debug pipeline (descriptor set layout, pipeline layout, compute pipeline)
-    /// Must be called after VPTScene::UpdateScene (TLAS must be ready)
-    void InitPipeline(VkDevice device, VkPhysicalDevice gpu);
+    // ── 共享 GPU 资源 ────────────────────────────────────────
+    // 命令池：由 PathTrace 的直连 dispatch 路径复用（Plan B 走 Unity 命令缓冲，不用它）。
 
-    /// Dispatch debug depth shader — writes directly to Unity's RenderTexture
-    /// nativeTexturePtr: Unity RenderTexture native pointer (obtained via Texture2D.GetNativeTexturePtr())
-    /// width/height: render dimensions
-    /// cameraData: camera parameters
-    void DispatchDebugDepth(
-        void* nativeTexturePtr,
-        int32_t width, int32_t height,
-        const VPT_CameraData& cameraData);
+    /// 创建共享资源（命令池）。VPT_Initialize 成功后调用一次。
+    void InitSharedResources(VkDevice device);
 
-    /// Cleanup debug pipeline resources
-    void DestroyPipeline(VkDevice device);
-
-    /// Whether debug pipeline is initialized
-    bool IsPipelineReady();
+    /// 释放共享资源。VPT_Destroy 时调用。
+    void DestroySharedResources(VkDevice device);
 
     // ── PathTrace dispatch (Phase 3) ──────────────────────
     // Multi-bounce PBR path tracing with NEE, GGX BSDF, Russian roulette.

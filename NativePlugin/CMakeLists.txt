@@ -21,6 +21,13 @@ file(GLOB_RECURSE VPT_SOURCES CONFIGURE_DEPENDS
 # ── DLL 目标 ───────────────────────────────────────────────
 add_library(${PROJECT_NAME} SHARED ${VPT_SOURCES})
 
+# 源码为 UTF-8（含中文注释）。不显式指定时 MSVC 按本地代码页（936）解析，
+# 末尾字节会把行尾吞进注释，导致紧随其后的声明被当成注释内容（C4819 +
+# "不是 X 的成员" 一类报错）。同时消除全工程的 C4819 噪声。
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /utf-8)
+endif()
+
 target_include_directories(${PROJECT_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${UNITY_PLUGIN_API}"

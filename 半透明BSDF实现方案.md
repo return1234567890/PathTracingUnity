@@ -4,6 +4,10 @@
 > 目标工程：`d:\unityHub\project\URPPT`（Unity URP 软件光追路径追踪）
 > any-hit 模拟策略：路径 B（迭代式 closest-hit，不改现有遍历代码）
 
+> **状态说明**：本文档所述的 Unity/HLSL 软件路径追踪链路（含 tinybvh 加速结构）已从工程中移除。
+> 文中的 BSDF 数学与透射/阴影策略目前实现在 Vulkan 侧 `NativePlugin/shaders/pathtrace.glsl`，
+> 阅读时请以该文件为准。
+
 ---
 
 ## 一、参考实现核心机制分析

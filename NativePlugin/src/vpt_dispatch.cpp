@@ -1,14 +1,13 @@
-// VulkanPathTracePlugin — Debug depth dispatch (Phase 2.6)
+// VulkanPathTracePlugin — PathTrace dispatch
 //
-// Creates a compute pipeline from pre-compiled SPIR-V, binds TLAS + VkImage + UBO,
-// dispatches, and writes results directly to Unity's RenderTexture via imageStore.
-// No CPU readback — data stays entirely on GPU.
+// 两阶段 dispatch（Plan B）：Phase 1 在 C# 侧准备描述符/UBO，
+// Phase 2 通过 IssuePluginEvent 在 Unity 的 VkCommandBuffer 中录制 dispatch，
+// 结果通过 imageStore 直接写入 Unity 的 RenderTexture（无 CPU 回读）。
 
 #include "vpt_dispatch.h"
 #include "vpt_internal.h"
 #include "vpt_scene.h"
 #include "vpt_env.h"
-#include "debug_depth_spv.h"
 #include "pathtrace_spv.h"
 
 #include <cstdio>
@@ -16,24 +15,10 @@
 #include <vector>
 
 // ═══════════════════════════════════════════════════════════
-//  Pipeline state (created once)
+//  Shared GPU state (created once)
 // ═══════════════════════════════════════════════════════════
 
-static VkDescriptorSetLayout s_DSLayout    = VK_NULL_HANDLE;
-static VkPipelineLayout      s_PipeLayout  = VK_NULL_HANDLE;
-static VkPipeline            s_Pipeline    = VK_NULL_HANDLE;
-static VkDescriptorPool      s_DescPool    = VK_NULL_HANDLE;
-static VkDescriptorSet       s_DescSet      = VK_NULL_HANDLE;
-
-static VkBuffer      s_UBOBuffer  = VK_NULL_HANDLE;
-static VkDeviceMemory s_UBOMemory  = VK_NULL_HANDLE;
-static void*          s_UBOMapped  = nullptr;
-
-// Cached output ImageView (recreated when Unity's VkImage changes between frames)
-static VkImageView   s_OutputImageView = VK_NULL_HANDLE;
-static VkImage        s_CachedImage     = VK_NULL_HANDLE;
-
-// Reusable command pool (reset each frame instead of create/destroy)
+// 命令池：供直连 dispatch 路径（DispatchPathTrace）复用，重置而非逐帧创建/销毁
 static VkCommandPool  s_CmdPool         = VK_NULL_HANDLE;
 
 static bool s_Ready = false;
@@ -62,21 +47,6 @@ static ImageViewCache s_OutputViews[5];
 // Cached ImageViews for 4 texture arrays (Phase 4)
 static ImageViewCache s_TexViews[4]; // [0]=baseColor, [1]=metallicRough, [2]=normal, [3]=emissive
 static VkSampler s_TexSampler = VK_NULL_HANDLE;
-
-// ═══════════════════════════════════════════════════════════
-//  Debug camera UBO layout (matches GLSL std140 + row_major)
-// ═══════════════════════════════════════════════════════════
-
-struct DebugCameraUBO
-{
-    float viewInv[16];      // 64B (row-major, matches Unity Matrix4x4)
-    float projInv[16];      // 64B
-    float posFar[4];         // 16B (xyz = position, w = farPlane)
-    float resolution[2];    // 8B
-    float nearPlane;         // 4B
-    float pad;               // 4B
-    // Total: 160B
-};
 
 // ═══════════════════════════════════════════════════════════
 //  Utility
@@ -149,345 +119,36 @@ struct PathTraceCameraUBO
 };
 
 // ═══════════════════════════════════════════════════════════
-//  Pipeline initialization
+//  Shared resource initialization
 // ═══════════════════════════════════════════════════════════
 
-void VPTDispatch::InitPipeline(VkDevice device, VkPhysicalDevice gpu)
+void VPTDispatch::InitSharedResources(VkDevice device)
 {
     if (s_Ready) return;
 
-    // 1. Descriptor set layout: TLAS + Storage Image + UBO
-    VkDescriptorSetLayoutBinding bindings[3] = {};
-    bindings[0].binding            = 0;
-    bindings[0].descriptorType    = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-    bindings[0].descriptorCount    = 1;
-    bindings[0].stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    bindings[1].binding            = 1;
-    bindings[1].descriptorType    = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    bindings[1].descriptorCount    = 1;
-    bindings[1].stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    bindings[2].binding            = 2;
-    bindings[2].descriptorType    = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    bindings[2].descriptorCount    = 1;
-    bindings[2].stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutCreateInfo dslCI{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dslCI.bindingCount = 3;
-    dslCI.pBindings    = bindings;
-
-    VkResult res = vkCreateDescriptorSetLayout(device, &dslCI, nullptr, &s_DSLayout);
-    if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] vkCreateDescriptorSetLayout failed: %d\n", res); return; }
-
-    // 2. Pipeline layout
-    VkPipelineLayoutCreateInfo plCI{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plCI.setLayoutCount = 1;
-    plCI.pSetLayouts    = &s_DSLayout;
-
-    res = vkCreatePipelineLayout(device, &plCI, nullptr, &s_PipeLayout);
-    if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] vkCreatePipelineLayout failed: %d\n", res); return; }
-
-    // 3. Shader module from embedded SPIR-V
-    VkShaderModuleCreateInfo smCI{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    smCI.codeSize = g_DebugDepthSpvSize;
-    smCI.pCode    = g_DebugDepthSpv;
-
-    VkShaderModule shaderModule;
-    res = vkCreateShaderModule(device, &smCI, nullptr, &shaderModule);
-    if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] vkCreateShaderModule failed: %d\n", res); return; }
-
-    // 4. Compute pipeline
-    VkComputePipelineCreateInfo cpCI{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    cpCI.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpCI.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpCI.stage.module  = shaderModule;
-    cpCI.stage.pName    = "main";
-    cpCI.layout        = s_PipeLayout;
-
-    res = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &s_Pipeline);
-    vkDestroyShaderModule(device, shaderModule, nullptr);
-    if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] vkCreateComputePipelines failed: %d\n", res); return; }
-
-    // 5. Descriptor pool + set
-    VkDescriptorPoolSize poolSizes[3] = {};
-    poolSizes[0].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-    poolSizes[0].descriptorCount = 1;
-    poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSizes[1].descriptorCount = 1;
-    poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[2].descriptorCount = 1;
-
-    VkDescriptorPoolCreateInfo dpCI{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    dpCI.maxSets       = 1;
-    dpCI.poolSizeCount = 3;
-    dpCI.pPoolSizes    = poolSizes;
-
-    res = vkCreateDescriptorPool(device, &dpCI, nullptr, &s_DescPool);
-    if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] vkCreateDescriptorPool failed: %d\n", res); return; }
-
-    VkDescriptorSetAllocateInfo dsAI{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    dsAI.descriptorPool     = s_DescPool;
-    dsAI.descriptorSetCount = 1;
-    dsAI.pSetLayouts       = &s_DSLayout;
-
-    res = vkAllocateDescriptorSets(device, &dsAI, &s_DescSet);
-    if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] vkAllocateDescriptorSets failed: %d\n", res); return; }
-
-    // 6. Camera UBO (persistent, mapped)
-    res = CreateHostBuffer(device, gpu, sizeof(DebugCameraUBO),
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, s_UBOBuffer, s_UBOMemory, &s_UBOMapped);
-    if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] UBO create failed: %d\n", res); return; }
-
-    // 7. Command pool (reused per frame, no create/destroy overhead)
+    // 命令池（复用：重置而非逐帧创建/销毁，直连 dispatch 路径使用）
     VkCommandPoolCreateInfo poolCI{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     poolCI.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolCI.queueFamilyIndex = VPT_GetInstance().queueFamilyIndex;
-    res = vkCreateCommandPool(device, &poolCI, nullptr, &s_CmdPool);
+    VkResult res = vkCreateCommandPool(device, &poolCI, nullptr, &s_CmdPool);
     if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] Command pool create failed: %d\n", res); return; }
 
     s_Ready = true;
-    fprintf(stderr, "[VPT] Debug pipeline initialized.\n");
-}
-
-// ═══════════════════════════════════════════════════════════
-//  Dispatch — writes directly to Unity's RenderTexture (no CPU readback)
-// ═══════════════════════════════════════════════════════════
-
-void VPTDispatch::DispatchDebugDepth(
-    void* nativeTexturePtr,
-    int32_t width, int32_t height,
-    const VPT_CameraData& cameraData)
-{
-    if (!s_Ready || !nativeTexturePtr || width <= 0 || height <= 0)
-        return;
-
-    const UnityVulkanInstance& inst = VPT_GetInstance();
-    VkDevice device = inst.device;
-    IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
-
-    VkAccelerationStructureKHR tlas = VPTScene::GetTLAS();
-    if (tlas == VK_NULL_HANDLE)
-    {
-        fprintf(stderr, "[VPT] DispatchDebugDepth: TLAS not ready\n");
-        return;
-    }
-
-    // ── Access Unity's RenderTexture as VkImage (ObserveOnly: just query, no barriers) ──
-    UnityVulkanImage vkImg{};
-    bool ok = vulkan->AccessTexture(nativeTexturePtr, UnityVulkanWholeImage,
-        VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_ACCESS_SHADER_WRITE_BIT,
-        kUnityVulkanResourceAccess_ObserveOnly, &vkImg);
-    if (!ok || vkImg.image == VK_NULL_HANDLE)
-    {
-        fprintf(stderr, "[VPT] AccessTexture failed\n");
-        return;
-    }
-
-    // Recreate ImageView if the underlying VkImage changed (Unity may reallocate textures)
-    if (s_CachedImage != vkImg.image)
-    {
-        if (s_OutputImageView)
-        {
-            vkDestroyImageView(device, s_OutputImageView, nullptr);
-            s_OutputImageView = VK_NULL_HANDLE;
-        }
-
-        VkImageViewCreateInfo ivCI{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        ivCI.image = vkImg.image;
-        ivCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        ivCI.format = vkImg.format;
-        ivCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        ivCI.subresourceRange.baseMipLevel = 0;
-        ivCI.subresourceRange.levelCount = 1;
-        ivCI.subresourceRange.baseArrayLayer = 0;
-        ivCI.subresourceRange.layerCount = 1;
-
-        VkResult res = vkCreateImageView(device, &ivCI, nullptr, &s_OutputImageView);
-        if (res != VK_SUCCESS)
-        {
-            fprintf(stderr, "[VPT] vkCreateImageView failed: %d\n", res);
-            return;
-        }
-        s_CachedImage = vkImg.image;
-    }
-
-    // ── Fill camera UBO (host-visible, persistent mapping) ──
-    DebugCameraUBO uboData{};
-    memcpy(uboData.viewInv, cameraData.viewInv, sizeof(float) * 16);
-    memcpy(uboData.projInv, cameraData.projInv, sizeof(float) * 16);
-    uboData.posFar[0] = cameraData.position[0];
-    uboData.posFar[1] = cameraData.position[1];
-    uboData.posFar[2] = cameraData.position[2];
-    uboData.posFar[3] = cameraData.farPlane;
-    uboData.resolution[0] = (float)width;
-    uboData.resolution[1] = (float)height;
-    uboData.nearPlane = cameraData.nearPlane;
-    memcpy(s_UBOMapped, &uboData, sizeof(DebugCameraUBO));
-
-    // ── Update descriptor set (TLAS + StorageImage + UBO) ──
-    VkWriteDescriptorSetAccelerationStructureKHR asInfo{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
-    asInfo.accelerationStructureCount = 1;
-    asInfo.pAccelerationStructures = &tlas;
-
-    VkDescriptorImageInfo imgInfo{};
-    imgInfo.sampler = VK_NULL_HANDLE;
-    imgInfo.imageView = s_OutputImageView;
-    imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-    VkDescriptorBufferInfo uboInfo{};
-    uboInfo.buffer = s_UBOBuffer;
-    uboInfo.offset = 0;
-    uboInfo.range  = sizeof(DebugCameraUBO);
-
-    VkWriteDescriptorSet writes[3] = {};
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].pNext = &asInfo;
-    writes[0].dstSet = s_DescSet;
-    writes[0].dstBinding = 0;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = s_DescSet;
-    writes[1].dstBinding = 1;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[1].pImageInfo = &imgInfo;
-
-    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[2].dstSet = s_DescSet;
-    writes[2].dstBinding = 2;
-    writes[2].descriptorCount = 1;
-    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    writes[2].pBufferInfo = &uboInfo;
-
-    vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
-
-    // ── Command buffer (allocated from reusable pool) ──
-    VkCommandBufferAllocateInfo allocCI{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    allocCI.commandPool = s_CmdPool;
-    allocCI.commandBufferCount = 1;
-    allocCI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device, &allocCI, &cmd);
-
-    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
-
-    // ── 骨骼动画：GPU 蒙皮 dispatch（若有更新，须先于 refit/TLAS，蒙皮 compute 就地写统一顶点缓冲）──
-    VPTScene::RecordGPUSkinningIfNeeded(cmd);
-
-    // ── 骨骼动画：变形顶点上传 + BLAS refit（若有更新，需先于 TLAS 重建）──
-    VPTScene::RecordBLASRefitIfNeeded(cmd);
-
-    // ── 动态场景：每帧 TLAS 重建（若本帧有实例更新，优先于 dispatch 录制）──
-    VPTScene::RecordTLASUpdateIfNeeded(cmd);
-
-    // Barrier 1: UBO host write → compute shader read
-    VkBufferMemoryBarrier uboBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
-    uboBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-    uboBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    uboBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    uboBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    uboBarrier.buffer = s_UBOBuffer;
-    uboBarrier.offset = 0;
-    uboBarrier.size = sizeof(DebugCameraUBO);
-
-    // Barrier 2: Image UNDEFINED → GENERAL (prepare for compute write, discard old contents)
-    VkImageMemoryBarrier imgToGeneral{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    imgToGeneral.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    imgToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    imgToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    imgToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    imgToGeneral.image = vkImg.image;
-    imgToGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    imgToGeneral.subresourceRange.baseMipLevel = 0;
-    imgToGeneral.subresourceRange.levelCount = 1;
-    imgToGeneral.subresourceRange.baseArrayLayer = 0;
-    imgToGeneral.subresourceRange.layerCount = 1;
-    imgToGeneral.srcAccessMask = 0;
-    imgToGeneral.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 1, &uboBarrier, 1, &imgToGeneral);
-
-    // Dispatch
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_Pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        s_PipeLayout, 0, 1, &s_DescSet, 0, nullptr);
-
-    uint32_t gx = (width + 7) / 8;
-    uint32_t gy = (height + 7) / 8;
-    vkCmdDispatch(cmd, gx, gy, 1);
-
-    // Barrier 3: Image GENERAL → SHADER_READ_ONLY_OPTIMAL (for Unity Blit)
-    VkImageMemoryBarrier imgToReadOnly{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    imgToReadOnly.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    imgToReadOnly.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imgToReadOnly.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    imgToReadOnly.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    imgToReadOnly.image = vkImg.image;
-    imgToReadOnly.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    imgToReadOnly.subresourceRange.baseMipLevel = 0;
-    imgToReadOnly.subresourceRange.levelCount = 1;
-    imgToReadOnly.subresourceRange.baseArrayLayer = 0;
-    imgToReadOnly.subresourceRange.layerCount = 1;
-    imgToReadOnly.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    imgToReadOnly.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &imgToReadOnly);
-
-    vkEndCommandBuffer(cmd);
-
-    // Submit + wait (ensures compute finishes before Unity uses the image)
-    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    VkResult qRes = vkQueueSubmit(inst.graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(inst.graphicsQueue);
-    if (qRes != VK_SUCCESS) {
-        fprintf(stderr, "[VPT] DispatchDebugDepth: vkQueueSubmit failed: %d\n", qRes);
-    }
-
-    vkFreeCommandBuffers(device, s_CmdPool, 1, &cmd);
 }
 
 // ═══════════════════════════════════════════════════════════
 //  Cleanup
 // ═══════════════════════════════════════════════════════════
 
-void VPTDispatch::DestroyPipeline(VkDevice device)
+void VPTDispatch::DestroySharedResources(VkDevice device)
 {
     if (!s_Ready) return;
     vkDeviceWaitIdle(device);
 
-    if (s_OutputImageView) { vkDestroyImageView(device, s_OutputImageView, nullptr); s_OutputImageView = VK_NULL_HANDLE; }
-    s_CachedImage = VK_NULL_HANDLE;
-
     if (s_CmdPool) { vkDestroyCommandPool(device, s_CmdPool, nullptr); s_CmdPool = VK_NULL_HANDLE; }
 
-    if (s_UBOMapped) { vkUnmapMemory(device, s_UBOMemory); s_UBOMapped = nullptr; }
-    if (s_UBOBuffer) { vkDestroyBuffer(device, s_UBOBuffer, nullptr); s_UBOBuffer = VK_NULL_HANDLE; }
-    if (s_UBOMemory) { vkFreeMemory(device, s_UBOMemory, nullptr); s_UBOMemory = VK_NULL_HANDLE; }
-
-    if (s_DescPool) { vkDestroyDescriptorPool(device, s_DescPool, nullptr); s_DescPool = VK_NULL_HANDLE; }
-    if (s_Pipeline) { vkDestroyPipeline(device, s_Pipeline, nullptr); s_Pipeline = VK_NULL_HANDLE; }
-    if (s_PipeLayout) { vkDestroyPipelineLayout(device, s_PipeLayout, nullptr); s_PipeLayout = VK_NULL_HANDLE; }
-    if (s_DSLayout) { vkDestroyDescriptorSetLayout(device, s_DSLayout, nullptr); s_DSLayout = VK_NULL_HANDLE; }
-
     s_Ready = false;
-    fprintf(stderr, "[VPT] Debug pipeline destroyed.\n");
 }
-
-bool VPTDispatch::IsPipelineReady() { return s_Ready; }
 
 // ═══════════════════════════════════════════════════════════
 //  PathTrace pipeline initialization (Phase 3)

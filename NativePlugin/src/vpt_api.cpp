@@ -61,7 +61,7 @@ VPT_Initialize()
     }
 
     VPT_SetInitialized(true);
-    VPTDispatch::InitPipeline(inst.device, inst.physicalDevice);
+    VPTDispatch::InitSharedResources(inst.device);
     VPTDispatch::InitPathTracePipeline(inst.device, inst.physicalDevice);
 
     // ── Configure rendering event for Plan B (CommandRecordingState) ──
@@ -95,7 +95,7 @@ VPT_Destroy()
         return;
 
     VPTDispatch::DestroyPathTracePipeline(VPT_GetInstance().device);
-    VPTDispatch::DestroyPipeline(VPT_GetInstance().device);
+    VPTDispatch::DestroySharedResources(VPT_GetInstance().device);
     VPT_DLSS_Destroy_Internal();
     VPTScene::DestroyResources();
     VPTEnv::DestroyResources();
@@ -183,24 +183,6 @@ VPT_DispatchPathTrace(
         (uint32_t)lightCount, (uint32_t)samplesPerPixel);
 }
 
-// ── VPT_DispatchDebugDepth（阶段2.6验证）──────────────────
-extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
-VPT_DispatchDebugDepth(
-    void* nativeTexturePtr, int32_t width, int32_t height,
-    const VPT_CameraData* cameraData)
-{
-    if (!VPT_IsInitialized() || !cameraData || !nativeTexturePtr)
-        return;
-    if (!VPTDispatch::IsPipelineReady())
-        VPTDispatch::InitPipeline(VPT_GetInstance().device, VPT_GetInstance().physicalDevice);
-    if (!VPTDispatch::IsPipelineReady())
-    {
-        fprintf(stderr, "[VPT] VPT_DispatchDebugDepth: pipeline not ready\n");
-        return;
-    }
-    VPTDispatch::DispatchDebugDepth(nativeTexturePtr, width, height, *cameraData);
-}
-
 // ── VPT_QueryRayQuerySupport ──────────────────────────────
 extern "C" UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API
 VPT_QueryRayQuerySupport()
@@ -264,30 +246,20 @@ VPT_GetRenderCallback()
 }
 
 // ══════════════════════════════════════════════════════════════
-//  DLSS NGX 导出接口（阶段3 SR + 阶段4 RR）
+//  DLSS NGX 导出接口（DLSS Ray Reconstruction）
 // ══════════════════════════════════════════════════════════════
 
 extern "C" UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API
 VPT_DLSS_Init(int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
-              int32_t qualityMode, int32_t mode)
+              int32_t qualityMode)
 {
-    return VPT_DLSS_Init_Internal(renderW, renderH, outputW, outputH, qualityMode, mode);
+    return VPT_DLSS_Init_Internal(renderW, renderH, outputW, outputH, qualityMode);
 }
 
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 VPT_DLSS_Destroy()
 {
     VPT_DLSS_Destroy_Internal();
-}
-
-extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
-VPT_DLSS_PrepareDispatch(
-    void* colorLowPtr, void* motionLowPtr, void* depthLowPtr, void* outputHighPtr,
-    int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
-    float jitterX, float jitterY, int32_t reset)
-{
-    VPT_DLSS_PrepareDispatch_Internal(colorLowPtr, motionLowPtr, depthLowPtr, outputHighPtr,
-        renderW, renderH, outputW, outputH, jitterX, jitterY, reset);
 }
 
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API

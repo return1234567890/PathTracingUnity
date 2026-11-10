@@ -4,37 +4,43 @@ using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 
 /// <summary>
-/// URP 路径追踪渲染特性：在 URP 管线中调度 PathTrace.compute 的单 kernel
-/// 多弹射路径追踪，并把结果经时域累积 + 空域滤波后 Blit 到相机颜色目标。
+/// URP 路径追踪渲染特性：把 Vulkan Ray Query 原生插件的路径追踪结果接入 URP 管线，
+/// 并调度 DLSS Ray Reconstruction（RR）完成降噪与超分。
 ///
-/// 四阶段流水线：
-///   1. PathTrace kernel        → OutputRT(radiance) + GBuffer0(pos+depth) + GBuffer1(normal+rough)
-///   2. TemporalAccumulate kernel→ AccumRT（EMA 累积历史帧）
-///   3. SpatialFilter kernel    → FilteredRT（à-trous G-buffer 引导滤波，多 pass）
-///   4. Blit → 相机颜色目标；ping-pong history ← accum
+/// 管线（全部路径追踪计算都在 native Vulkan 插件侧）：
+///   1. native Vulkan RayQuery PT → OutputRT(radiance) + GBuffer0(pos+depth) +
+///                                  GBuffer1(normal+rough) + Diffuse/Specular Albedo（RR 材质分解）
+///   2. MotionVector kernel       → MotionVectorRT + LinearDepthRT（DLSS RR 辅助图）
+///   3. NGX DLSS RR Evaluate（native）→ 全分辨率输出
+///   4. Blit → 相机颜色目标
 ///
 /// 用法：
-///   1. 场景中存在挂载 ModelManager 的 GameObject（负责构建 9 数组）；
+///   1. 场景中存在挂载 ModelManager 的 GameObject（负责收集模型/材质并推送 native）；
 ///   2. 场景中存在挂载 LightManager 的 GameObject（负责收集光源）；
 ///   3. 在 URP Renderer 资产的 Renderer Features 列表中添加本特性；
-///   4. 将 PathTrace.compute 资产拖入 pathTraceShader 字段；
-///   5. 播放后画面应显示多弹射路径追踪结果（直接照明 + 阴影 + 间接光）。
+///   4. 将 DlssAux.compute 资产拖入 motionVectorShader 字段（启用 DLSS 时必需）；
+///   5. 播放后画面显示 Vulkan 路径追踪 + DLSS RR 重建结果。
+///
+/// 说明：软件路径追踪链路（HLSL 光线求交 + 自研时域累积/空域滤波 + ReSTIR GI）与
+///       tinybvh 依赖已移除；DLSS 只保留 RR（SR 与 debug 深度图分支已删除）。
 /// </summary>
 public class PathTraceRendererFeature : ScriptableRendererFeature
 {
     [Header("路径追踪")]
-    public ComputeShader pathTraceShader;
+    [Tooltip("DLSS 辅助数据计算着色器（只含 MotionVector kernel：G-buffer → 运动矢量 + 深度）。\n" +
+             "仅在启用 DLSS 时需要；留空则关闭 DLSS 后仍可正常显示 PT 结果。")]
+    public ComputeShader motionVectorShader;
 
-    [Tooltip("输出中间 RenderTexture 的格式（需支持 UAV 写入）")]
+    [Tooltip("输出中间 RenderTexture 的格式（native 侧写入，需支持 UAV）")]
     public RenderTextureFormat outputFormat = RenderTextureFormat.ARGBHalf;
 
-    [Tooltip("线程组大小（每组的像素数 = groupXY²）")]
+    [Tooltip("线程组大小（每组的像素数 = groupXY²），用于 MotionVector kernel 的 dispatch")]
     public int groupXY = 8;
 
-    [Tooltip("最大弹射深度（光线反弹次数）")]
+    [Tooltip("最大弹射深度（光线反弹次数），传给 native 侧路径追踪")]
     [Range(1, 32)] public int maxDepth = 8;
 
-    [Tooltip("每像素采样数（每帧每像素发射的独立光线路径数，1=单路径靠时域累积降噪）")]
+    [Tooltip("每像素采样数（每帧每像素发射的独立光线路径数，1=单路径靠 DLSS RR 重建）")]
     [Range(1, 32)] public int samplesPerPixel = 1;
 
     [Tooltip("环境光颜色（偏蓝天空）。双重用途：1) 光线未命中几何时返回的天空辐亮度；" +
@@ -57,93 +63,16 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
 
     private bool _envMapPushed = false;
 
-    [Header("降噪总开关")]
-    [Tooltip("关闭后跳过时域累积与空域滤波，直接输出原始路径追踪结果（1 spp 噪点）")]
-    public bool denoisingEnabled = true;
-
-    [Header("时域降噪（方案A）")]
-    [Tooltip("启用时域累积：静态相机时多帧 EMA 累积，有效 spp 随帧增长")]
-    public bool temporalEnabled = true;
-
-    [Header("空域降噪（方案B）")]
-    [Tooltip("启用 G-buffer 引导空域滤波（à-trous 3x3 方形核）")]
-    public bool spatialEnabled = true;
-
-    [Tooltip("空域滤波 pass 数（步长 1/2/4/8...，0=禁用）")]
-    [Range(0, 6)] public int spatialPasses = 3;
-
-    [Header("NRD 降噪参数")]
-    [Tooltip("遮挡检测基础阈值（默认0.02，NRD 标准）")]
-    public float disocclusionThreshold = 0.02f;
-
-    [Tooltip("法线权重参数（0=自适应随粗糙度/帧数，>0=固定值覆盖）")]
-    public float normalWeightParam = 0f;
-
-    [Tooltip("平面距离深度阈值")]
-    public float depthThreshold = 0.02f;
-
-    [Tooltip("Poisson 采样点数（8 或 16）")]
-    [Range(8, 16)] public int poissonTapCount = 8;
-
-    [Tooltip("模糊半径（像素单位，每 pass 乘以步长）")]
-    public float blurRadius = 1.0f;
-
-    [Tooltip("亮度权重系数（方差驱动时）")]
-    public float phiLuminance = 1.0f;
-
-    [Tooltip("亮度相对差异上限（防止过度滤波）")]
-    public float maxLuminanceRelativeDiff = 0.1f;
-
-    [Tooltip("启用 anti-firefly 前置 pass（3x3 RCRS 极值替换）")]
-    public bool enableAntiFirefly = false;
-
-    [Header("Debug 验证（阶段2.6）")]
-    [Tooltip("启用灰度深度图验证模式：跳过路径追踪管线，用 Vulkan RayQuery 对 TLAS 发射射线并输出灰度深度。" +
-             "近=白，远=黑，未命中=黑。用于验证 BLAS/TLAS 构建正确性。")]
-    public bool debugDepthMode = false;
-
-    [Tooltip("Debug 深度图渲染分辨率（正方形，越小越快）")]
-    [Range(64, 1024)] public int debugDepthResolution = 512;
-
-    [Header("ReSTIR GI")]
-    [Tooltip("启用 ReSTIR GI 模式（关闭则走当前时域+空域管线）")]
-    public bool useReSTIRGI = false;
-
-    [Tooltip("空域重采样邻居数（4 或 8）")]
-    [Range(4, 8)] public int spatialNeighborCount = 4;
-
-    [Tooltip("粗糙度低于此值的表面视为镜面，走回退多弹射而非 ReSTIR 重采样")]
-    [Range(0.01f, 0.5f)] public float specularThreshold = 0.3f;
-
-    [Tooltip("K4 两 pass 模式：Pass 2 读 Pass 1 的空域输出再做一轮空域复用，" +
-             "加速相机移动时新进入屏幕像素的收敛（M < M_MAX/2 才合并）")]
-    public bool restirSpatialTwoPass = true;
-
-    [Tooltip("历史样本验证间隔：每N帧重追验证历史蓄水池命中点，刷新hitRadiance（0=禁用）")]
-    [Range(0, 30)] public int historyValidationInterval = 6;
-
-    public enum DLSSMode { None, SR, RR }
-
-    [Header("DLSS 超分")]
-    [Tooltip("None=关闭，SR=超分(关时域保留空域)，RR=光线重建(降噪+超分一体化，完全关闭自研降噪链)")]
-    public DLSSMode dlssMode = DLSSMode.None;
-
-    /// <summary>DLSS 是否启用（dlssMode != None 的便捷访问）</summary>
-    public bool dlssEnabled => dlssMode != DLSSMode.None;
+    [Header("DLSS Ray Reconstruction")]
+    [Tooltip("启用 DLSS RR（降噪+超分一体化）。关闭则直接输出 native 路径追踪的 1spp 原始结果。")]
+    public bool dlssEnabled = true;
 
     [Tooltip("质量模式：0=Quality(1.5x) 1=Balanced(1.7x) 2=Performance(2x) 3=UltraPerformance(3x)")]
     [Range(0, 3)] public int dlssQualityMode = 1;
 
-    [Header("调试实验（DLSS RR 亮区抖动诊断）")]
-    [Tooltip("实验3：关闭 Halton jitter，强制 jitter=0。需配合 maxDepth=1 使用：\n" +
-             "若 RR 输出完全不抖 → 抖动 100% 来自 jitter 相位重采样（类型A），根因闭环；\n" +
-             "若仍抖 → 问题在 RR 内部时域稳定性，需另开方向排查。仅作诊断，会损失超分质量。")]
-    public bool debugDisableJitter = false;
-
     /// <summary>按质量模式计算精确渲染尺寸（输出像素 -> 渲染像素）。</summary>
-    /// <remarks>DLSS SR 允许预设倍率附近范围内任意尺寸，但 RR 严格要求渲染分辨率
-    /// 精确匹配预设倍率（1.5/1.7/2/3x），否则 CreateFeature 返回
-    /// FAIL_InvalidParameter。整数除法避免浮点截断误差（0.58*1920=1113，
+    /// <remarks>RR 严格要求渲染分辨率精确匹配预设倍率（1.5/1.7/2/3x），否则 CreateFeature
+    /// 返回 FAIL_InvalidParameter。整数除法避免浮点截断误差（0.58*1920=1113，
     /// 而 1.7x 的精确值是 1920*10/17=1129）。</remarks>
     public static void RenderSizeOf(int mode, int outW, int outH, out int w, out int h)
     {
@@ -200,7 +129,7 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
 
     public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
     {
-        if (pathTraceShader == null || ModelManager.Instance == null)
+        if (ModelManager.Instance == null)
             return;
 
         // 一次性初始化 Native Vulkan 插件
@@ -263,84 +192,34 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
 }
 
 /// <summary>
-/// 路径追踪渲染 Pass：每帧 Sync 数据 -> 绑定 -> 四阶段 Dispatch -> Blit。
+/// 路径追踪渲染 Pass：每帧 同步场景 → native dispatch PT → MotionVector → DLSS/Blit。
 /// </summary>
 public class PathTraceRenderPass : ScriptableRenderPass
 {
     private readonly PathTraceRendererFeature _feature;
 
+    // ── DLSS 辅助 kernel ──
     private ComputeShader _resolvedShader;
-    private int _kPathTrace;
-    private int _kTemporal;
-    private int _kSpatial;
-    private int _kAntiFirefly;
-    private int _kMotionVector;  // DLSS 阶段2：运动矢量 + 深度输出
+    private int _kMotionVector;
 
-    // ── ReSTIR GI kernel 索引 ──
-    private int _kRestirPrimary;
-    private int _kRestirInit;
-    private int _kRestirTemp;
-    private int _kRestirSpat;
-    private int _kRestirShade;
-
-    private RenderBufferManager _bufferMgr;
-
-    // ── Render Targets（按相机分辨率维护） ──
-    private RenderTexture _outputRT;     // PathTrace radiance 输出
-    private RenderTexture _gbuffer0;     // worldPos.xyz + depth (ARGBFloat)
-    private RenderTexture _gbuffer1;     // normal.xyz + roughness (ARGBHalf)
-    private RenderTexture _gbuffer2;     // hitInfo: instIndex/triIndex/u/v (ARGBFloat, ReSTIR 专用)
-    private RenderTexture _prevGbuffer0;  // 上一帧 G-buffer pos+depth（遮挡检测）
-    private RenderTexture _prevGbuffer1;  // 上一帧 G-buffer normal+roughness
-    private RenderTexture _accumRT;      // 本帧累积结果（ping-pong A）
-    private RenderTexture _historyRT;    // 上帧累积结果（ping-pong B）
-    private RenderTexture _filterInRT;   // 空域滤波临时 RT A
-    private RenderTexture _filterOutRT;  // 空域滤波临时 RT B
-
-    // ── DLSS 专用 RT ──
-    private RenderTexture _motionVectorRT;  // 低分辨率 RGFloat（运动矢量）
-    private RenderTexture _depthRT;          // 低分辨率 RFloat（NDC 深度，SR 用）
-    private RenderTexture _linearDepthRT;  // 低分辨率 RFloat（视空间线性距离，RR 用）
-    private RenderTexture _dlssOutputRT;    // 全分辨率 ARGBHalf（NGX DLSS 输出）
+    // ── Render Targets（按渲染分辨率维护） ──
+    private RenderTexture _outputRT;          // native PT radiance 输出
+    private RenderTexture _gbuffer0;          // worldPos.xyz + depth (ARGBFloat)
+    private RenderTexture _gbuffer1;          // normal.xyz + roughness (ARGBHalf)
     // ── DLSS RR albedo G-buffer（无条件创建：native binding 14/15 descriptor 必须始终有效）──
     private RenderTexture _diffuseAlbedoRT;   // 低分辨率 ARGBHalf，albedo*(1-metallic)
     private RenderTexture _specularAlbedoRT;  // 低分辨率 ARGBHalf，EnvBRDFApprox(F0, roughness², NoV)
 
-    // ── ReSTIR GI 专用 RT ──
-    private RenderTexture _directLightRT;      // RGBA16F，直接光照
-    private RenderTexture _reservoirRT0;       // RGBA16F，方向+距离
-    private RenderTexture _reservoirRT1;       // RGBA16F，法线+亮度
-    private RenderTexture _reservoirRT2;       // RGBA32F，W+M+pdf
-    private RenderTexture _reservoirRT3;       // RGBA16F，辐射度+matID
-    private RenderTexture _reservoirRT4;       // RGBA32F，BSDF
-    private RenderTexture _prevReservoirRT0;   // RGBA16F，历史蓄水池
-    private RenderTexture _prevReservoirRT1;
-    private RenderTexture _prevReservoirRT2;
-    private RenderTexture _prevReservoirRT3;
-    private RenderTexture _prevReservoirRT4;
-    private RenderTexture _temporalResRT0;     // 时域输出（ping-pong）
-    private RenderTexture _temporalResRT1;
-    private RenderTexture _temporalResRT2;
-    private RenderTexture _temporalResRT3;
-    private RenderTexture _temporalResRT4;
-    private RenderTexture _spatialResRT0;      // 空域输出（ping-pong）
-    private RenderTexture _spatialResRT1;
-    private RenderTexture _spatialResRT2;
-    private RenderTexture _spatialResRT3;
-    private RenderTexture _spatialResRT4;
+    // ── DLSS 专用 RT ──
+    private RenderTexture _motionVectorRT;    // 低分辨率 RGFloat（运动矢量）
+    private RenderTexture _linearDepthRT;     // 低分辨率 RFloat（视空间线性距离，RR 用）
+    private RenderTexture _dlssOutputRT;      // 全分辨率 ARGBHalf（NGX DLSS 输出）
 
     private int _cachedW = -1;
     private int _cachedH = -1;
 
-    // ── Debug depth RenderTexture（阶段2.6验证） ──
-    // GPU device-local，compute shader 直接写入 VkImage，无 CPU 回读
-    private RenderTexture _debugDepthRT;
-
-    // ── 时域累积状态 ──
-    private Matrix4x4 _prevView;   // 上一帧 camera.worldToCameraMatrix
-    private Matrix4x4 _prevProj;   // 上一帧 camera.projectionMatrix
-    private int _accumFrame;       // 静态累积帧数（相机移动时重置为 0）
-    private bool _hasPrev;         // 是否已记录上一帧矩阵
+    private bool _hasPrev;         // 是否已渲染过上一帧（DLSS reset 标志）
+    private bool _warnedNoMotionVector;  // motionVectorShader 缺失只告警一次
 
     /// <summary>当前 URP renderer 引用，由 feature 在 AddRenderPasses 中注入。</summary>
     public ScriptableRenderer Renderer { get; set; }
@@ -350,24 +229,15 @@ public class PathTraceRenderPass : ScriptableRenderPass
         _feature = feature;
     }
 
-    /// <summary>pathTraceShader 引用变化时重新解析 kernel 索引。</summary>
+    /// <summary>motionVectorShader 引用变化时重新解析 kernel 索引。</summary>
     private ComputeShader ResolveKernels()
     {
-        ComputeShader cs = _feature.pathTraceShader;
+        ComputeShader cs = _feature.motionVectorShader;
         if (cs == null) return null;
         if (_resolvedShader != cs)
         {
             _resolvedShader = cs;
-            _kPathTrace = cs.FindKernel("PathTrace");
-            _kTemporal   = cs.FindKernel("TemporalAccumulate");
-            _kSpatial    = cs.FindKernel("SpatialFilter");
-            _kAntiFirefly = cs.FindKernel("AntiFirefly");
             _kMotionVector = cs.FindKernel("MotionVector");
-            _kRestirPrimary = cs.FindKernel("ReSTIR_PrimaryRay");
-            _kRestirInit   = cs.FindKernel("ReSTIR_InitReservoir");
-            _kRestirTemp   = cs.FindKernel("ReSTIR_TemporalResample");
-            _kRestirSpat   = cs.FindKernel("ReSTIR_SpatialResample");
-            _kRestirShade  = cs.FindKernel("ReSTIR_FinalShading");
         }
         return cs;
     }
@@ -378,26 +248,15 @@ public class PathTraceRenderPass : ScriptableRenderPass
 
     public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
     {
-        // ── Debug 深度图模式：跳过 compute shader 管线 ──
-        if (_feature.debugDepthMode)
-        {
-            ExecuteDebugDepth(context, ref renderingData);
+        // native Vulkan 插件是唯一路径追踪实现，未就绪则直接跳过
+        if (!_feature.IsNativeReady)
             return;
-        }
-
-        ComputeShader cs = ResolveKernels();
-        if (cs == null) return;
 
         ModelManager mm = ModelManager.Instance;
-        if (mm == null || mm.TlasNodes == null || mm.TlasNodes.Length == 0)
+        if (mm == null || !mm.HasScene)
             return;
 
-        // ── 1. 同步 9 大数组 + 光源数组到 ComputeBuffer ──
-        if (_bufferMgr == null)
-            _bufferMgr = new RenderBufferManager();
-        _bufferMgr.Sync(mm);
-
-        // ── 2. 相机参数 ──
+        // ── 1. 相机参数 ──
         Camera camera = renderingData.cameraData.camera;
         // ── DLSS 低分辨率渲染：dispatch / RT / uniform 均用低分辨率，
         //    最终 Blit 到全分辨率 colorTarget 时由 Bilinear 上采样 ──
@@ -417,98 +276,34 @@ public class PathTraceRenderPass : ScriptableRenderPass
         Matrix4x4 invProj = camera.projectionMatrix.inverse;
         Matrix4x4 curView = camera.worldToCameraMatrix;
         Matrix4x4 curProj = camera.projectionMatrix;
-        float farPlane = camera.farClipPlane;
 
         // ── DLSS 抖动：Halton(2,3) 8 相位循环，渲染像素空间 [-0.5,0.5] ──
         // NGX 要求传出的 jitter 与渲染 jitter 数值一致且单位为输出像素
-        // ── 调试实验3：debugDisableJitter 时强制 jitter=0，同时作用于 pathtrace 采样、
-        //    MotionVector kernel 与传给 NGX 的 InJitterOffset（三者同源，保证采样与超分配对一致）──
-        Vector2 jitter = (_feature.dlssEnabled && !_feature.debugDisableJitter)
+        Vector2 jitter = _feature.dlssEnabled
             ? PathTraceRendererFeature.GetJitter(Time.frameCount)
             : Vector2.zero;
 
-        // ── RT 尺寸/模式变化检测：DLSS 开关或质量模式切换导致分辨率变化时，
-        //    EnsureRTs 会重建所有 RT（历史帧为空白），需重置时域累积 ──
-        bool rtResized = _cachedW != w || _cachedH != h || _outputRT == null ||
-                         _prevUseReSTIR != _feature.useReSTIRGI ||
-                         _prevDlssMode != (int)_feature.dlssMode;
-
-        // ── 时域累积：相机移动 或 RT 重建 均重置累积帧数 ──
-        bool moved = !_hasPrev || _prevView != curView || _prevProj != curProj || rtResized;
-        if (moved)
-            _accumFrame = 0;
-        else
-            _accumFrame = Mathf.Min(_accumFrame + 1, 1000);
-
-        // 上一帧 viewProj（用于重投影；静态时 == 当前 viewProj → 恒等映射）
+        // ── 当前帧 viewProj（用于重投影；静态时 == 上一帧 viewProj → 恒等映射）──
         Matrix4x4 prevViewProj = _prevProj * _prevView;
 
-        CommandBuffer cmd = CommandBufferPool.Get("PathTrace");
-
-        // ── PathTraceCB（全局 cbuffer，三个 kernel 共用 Width/Height） ──
-        cmd.SetComputeMatrixParam(cs, "CamToWorld", camToWorld);
-        cmd.SetComputeMatrixParam(cs, "InvProjection", invProj);
-        cmd.SetComputeIntParam(cs, "Width", w);
-        cmd.SetComputeIntParam(cs, "Height", h);
-        cmd.SetComputeFloatParam(cs, "FarPlane", farPlane);
-
-        int lightCount = (LightManager.Instance != null && LightManager.Instance.Lights != null)
-            ? LightManager.Instance.Lights.Length : 0;
-        cmd.SetComputeIntParam(cs, "LightCount", lightCount);
-        cmd.SetComputeIntParam(cs, "FrameCount", Time.frameCount);
-        cmd.SetComputeIntParam(cs, "MaxDepth", Mathf.Max(1, _feature.maxDepth));
-        cmd.SetComputeIntParam(cs, "SamplesPerPixel", Mathf.Max(1, _feature.samplesPerPixel));
-        cmd.SetComputeVectorParam(cs, "AmbientColor", _feature.ambientColor);
-
-        // ── TemporalCB ──
-        cmd.SetComputeMatrixParam(cs, "PrevViewProj", prevViewProj);
-        cmd.SetComputeIntParam(cs, "AccumFrame", _accumFrame);
-        // DLSS 模式关闭自研时域累积；RR 模式额外关闭空域滤波（由 RR 一体化完成降噪+超分）
-        int enableTemporal = (_feature.dlssEnabled || !_feature.temporalEnabled) ? 0 : 1;
-        int spatialPasses = (_feature.dlssMode == PathTraceRendererFeature.DLSSMode.RR || !_feature.spatialEnabled)
-            ? 0 : _feature.spatialPasses;
-        cmd.SetComputeIntParam(cs, "EnableTemporal", enableTemporal);
-        cmd.SetComputeIntParam(cs, "SpatialPasses", spatialPasses);
-
-        // ── NRD 移植参数（全局 uniform） ──
-        cmd.SetComputeFloatParam(cs, "DisocclusionThreshold", _feature.disocclusionThreshold);
-        cmd.SetComputeFloatParam(cs, "NormalWeightParam", _feature.normalWeightParam);
-        cmd.SetComputeFloatParam(cs, "DepthThreshold", _feature.depthThreshold);
-        cmd.SetComputeIntParam(cs, "PoissonTapCount", _feature.poissonTapCount);
-        cmd.SetComputeFloatParam(cs, "BlurRadius", _feature.blurRadius);
-        cmd.SetComputeFloatParam(cs, "PhiLuminance", _feature.phiLuminance);
-        cmd.SetComputeFloatParam(cs, "MaxLuminanceRelativeDiff", _feature.maxLuminanceRelativeDiff);
-        cmd.SetComputeIntParam(cs, "EnableAntiFirefly", _feature.enableAntiFirefly ? 1 : 0);
-
-        // ── ReSTIR GI cbuffer 参数 ──
-        if (_feature.useReSTIRGI)
-        {
-            cmd.SetComputeIntParam(cs, "SpatialNeighborCount", _feature.spatialNeighborCount);
-            cmd.SetComputeFloatParam(cs, "SpecularThreshold", _feature.specularThreshold);
-            cmd.SetComputeIntParam(cs, "HistoryValidationInterval", Mathf.Max(0, _feature.historyValidationInterval));
-        }
-
-        // ── 3. 维护所有 RT ──
+        // ── 维护所有 RT ──
         EnsureRTs(w, h, camera.pixelWidth, camera.pixelHeight);
 
-        // ── 3.5 DLSS NGX 初始化/重建 ──
+        // ── DLSS RR 初始化/重建 ──
         // 当 DLSS 开关、质量模式、分辨率变化时触发重建
-        if (_feature.dlssEnabled && _feature.IsNativeReady)
+        if (_feature.dlssEnabled)
         {
-            int nativeMode = (_feature.dlssMode == PathTraceRendererFeature.DLSSMode.RR)
-                ? NativeBridge.DLSS_MODE_RR : NativeBridge.DLSS_MODE_SR;
             bool needReinit = !_dlssInitialized
                 || _dlssRenderW != w || _dlssRenderH != h
                 || _dlssOutW != camera.pixelWidth || _dlssOutH != camera.pixelHeight
-                || _dlssQuality != _feature.dlssQualityMode
-                || _dlssMode != nativeMode;
+                || _dlssQuality != _feature.dlssQualityMode;
             if (needReinit)
             {
                 if (_dlssInitialized)
                     NativeBridge.VPT_DLSS_Destroy();
 
                 int result = NativeBridge.VPT_DLSS_Init(
-                    w, h, camera.pixelWidth, camera.pixelHeight, _feature.dlssQualityMode, nativeMode);
+                    w, h, camera.pixelWidth, camera.pixelHeight, _feature.dlssQualityMode);
                 if (result == 0)
                 {
                     _dlssInitialized = true;
@@ -517,530 +312,50 @@ public class PathTraceRenderPass : ScriptableRenderPass
                     _dlssOutW = camera.pixelWidth;
                     _dlssOutH = camera.pixelHeight;
                     _dlssQuality = _feature.dlssQualityMode;
-                    _dlssMode = nativeMode;
-                    Debug.Log($"[PathTrace] DLSS NGX initialized ({(nativeMode == NativeBridge.DLSS_MODE_RR ? "RR" : "SR")}): {w}x{h} -> {camera.pixelWidth}x{camera.pixelHeight} (quality={_feature.dlssQualityMode})");
+                    Debug.Log($"[PathTrace] DLSS RR initialized: {w}x{h} -> {camera.pixelWidth}x{camera.pixelHeight} (quality={_feature.dlssQualityMode})");
                 }
-                else if (result == -2 && nativeMode == NativeBridge.DLSS_MODE_RR)
+                else if (result == -2)
                 {
-                    // RR 不支持，降级到 SR
-                    Debug.LogWarning("[PathTrace] DLSS RR not supported on this GPU/driver, falling back to SR.");
-                    result = NativeBridge.VPT_DLSS_Init(
-                        w, h, camera.pixelWidth, camera.pixelHeight, _feature.dlssQualityMode, NativeBridge.DLSS_MODE_SR);
-                    if (result == 0)
-                    {
-                        _dlssInitialized = true;
-                        _dlssRenderW = w;
-                        _dlssRenderH = h;
-                        _dlssOutW = camera.pixelWidth;
-                        _dlssOutH = camera.pixelHeight;
-                        _dlssQuality = _feature.dlssQualityMode;
-                        _dlssMode = NativeBridge.DLSS_MODE_SR;
-                        Debug.Log($"[PathTrace] DLSS NGX initialized (SR fallback): {w}x{h} -> {camera.pixelWidth}x{camera.pixelHeight}");
-                    }
-                    else
-                    {
-                        Debug.LogWarning("[PathTrace] DLSS SR init also failed, falling back to Bilinear.");
-                        _dlssInitialized = false;
-                    }
+                    // RR 不支持（需 RTX 显卡 + 新版驱动）
+                    Debug.LogWarning("[PathTrace] DLSS RR not supported on this GPU/driver, falling back to plain Blit.");
+                    _dlssInitialized = false;
                 }
                 else
                 {
-                    Debug.LogWarning("[PathTrace] DLSS NGX init failed, falling back to Bilinear.");
+                    Debug.LogWarning("[PathTrace] DLSS RR init failed, falling back to plain Blit.");
                     _dlssInitialized = false;
                 }
             }
         }
-        else if (_dlssInitialized && (!_feature.dlssEnabled || !_feature.IsNativeReady))
+        else if (_dlssInitialized)
         {
-            // DLSS 被关闭或 native 不可用时销毁
+            // DLSS 被关闭时销毁
             NativeBridge.VPT_DLSS_Destroy();
             _dlssInitialized = false;
         }
 
-        int gx = (w + _feature.groupXY - 1) / _feature.groupXY;
-        int gy = (h + _feature.groupXY - 1) / _feature.groupXY;
+        // ── 动态场景：同步实例变换 → native 每帧重建 TLAS（必须在 PrepareDispatch 之前，
+        //    使 descriptor 指向本帧槽位）──
+        mm.SyncInstancesNative();
+
+        // ── 骨骼动画：关节矩阵 → native 蒙皮 compute + BLAS refit（同样必须
+        //    先于 PrepareDispatch，refit/TLAS 重建均在该帧命令流内录制）──
+        mm.SyncSkinnedMeshesNative();
+
+        int lightCount = (LightManager.Instance != null && LightManager.Instance.Lights != null)
+            ? LightManager.Instance.Lights.Length : 0;
+
+        CommandBuffer cmd = CommandBufferPool.Get("PathTrace");
 
         RTHandle colorTarget = Renderer.cameraColorTargetHandle;
 
         // ══════════════════════════════════════════════════════════════
-        //  阶段 1：路径生成 → _outputRT（ReSTIR 5-kernel 或原始 PathTrace）
+        //  阶段 1：Vulkan RayQuery 路径追踪 → _outputRT + G-buffer + albedo
         // ══════════════════════════════════════════════════════════════
-        if (_feature.useReSTIRGI)
-        {
-            // ═══ K1: ReSTIR_PrimaryRay ═══
-            // 写 G-buffer + 直接光照
-            cmd.SetComputeTextureParam(cs, _kRestirPrimary, "GBufferPosDepth", _gbuffer0);
-            cmd.SetComputeTextureParam(cs, _kRestirPrimary, "GBufferNormalRough", _gbuffer1);
-            cmd.SetComputeTextureParam(cs, _kRestirPrimary, "GBufferHitInfo", _gbuffer2);
-            cmd.SetComputeTextureParam(cs, _kRestirPrimary, "ReSTIR_DirectLighting", _directLightRT);
-            // DLSS RR albedo G-buffer（D3D11 pitfall：kernel 引用的全局 UAV 必须绑定）
-            cmd.SetComputeTextureParam(cs, _kRestirPrimary, "DiffuseAlbedoOut", _diffuseAlbedoRT);
-            cmd.SetComputeTextureParam(cs, _kRestirPrimary, "SpecularAlbedoOut", _specularAlbedoRT);
-            _bufferMgr.Bind(cmd, cs, _kRestirPrimary);
-            cmd.DispatchCompute(cs, _kRestirPrimary, gx, gy, 1);
-
-            // ═══ K2: ReSTIR_InitReservoir ═══
-            // 读 G-buffer，写初始蓄水池 → _reservoirRT0-4
-            cmd.SetComputeTextureParam(cs, _kRestirInit, "GBufferPosDepth", _gbuffer0);
-            cmd.SetComputeTextureParam(cs, _kRestirInit, "GBufferNormalRough", _gbuffer1);
-            cmd.SetComputeTextureParam(cs, _kRestirInit, "GBufferHitInfo", _gbuffer2);
-            BindReservoirUAVs(cmd, cs, _kRestirInit, _reservoirRT0, _reservoirRT1, _reservoirRT2, _reservoirRT3);
-            cmd.SetComputeTextureParam(cs, _kRestirInit, "ReservoirRT4", _reservoirRT4);
-            _bufferMgr.Bind(cmd, cs, _kRestirInit);
-            cmd.DispatchCompute(cs, _kRestirInit, gx, gy, 1);
-
-            // ═══ K3: ReSTIR_TemporalResample ═══
-            // 读 G-buffer(当前+历史) + 当前蓄水池(K2) + 历史蓄水池
-            // 写时域蓄水池 → _temporalResRT0-4
-            cmd.SetComputeTextureParam(cs, _kRestirTemp, "GBufferPosDepth", _gbuffer0);
-            cmd.SetComputeTextureParam(cs, _kRestirTemp, "GBufferNormalRough", _gbuffer1);
-            cmd.SetComputeTextureParam(cs, _kRestirTemp, "PrevGBufferPosDepth", _prevGbuffer0);
-            cmd.SetComputeTextureParam(cs, _kRestirTemp, "PrevGBufferNormalRough", _prevGbuffer1);
-            BindCurReservoirSRVs(cmd, cs, _kRestirTemp, _reservoirRT0, _reservoirRT1, _reservoirRT2, _reservoirRT3);
-            cmd.SetComputeTextureParam(cs, _kRestirTemp, "CurReservoirRT4", _reservoirRT4);
-            BindPrevReservoirSRVs(cmd, cs, _kRestirTemp, _prevReservoirRT0, _prevReservoirRT1, _prevReservoirRT2, _prevReservoirRT3);
-            cmd.SetComputeTextureParam(cs, _kRestirTemp, "PrevReservoirRT4", _prevReservoirRT4);
-            BindReservoirUAVs(cmd, cs, _kRestirTemp, _temporalResRT0, _temporalResRT1, _temporalResRT2, _temporalResRT3);
-            cmd.SetComputeTextureParam(cs, _kRestirTemp, "ReservoirRT4", _temporalResRT4);
-            _bufferMgr.Bind(cmd, cs, _kRestirTemp);
-            cmd.DispatchCompute(cs, _kRestirTemp, gx, gy, 1);
-
-            // ═══ K4 Pass 1: ReSTIR_SpatialResample ═══
-            // 读 G-buffer + 时域蓄水池(K3)
-            // 写空域蓄水池 → _spatialResRT0-4
-            cmd.SetComputeIntParam(cs, "K4_PassIndex", 0);
-            cmd.SetComputeTextureParam(cs, _kRestirSpat, "GBufferPosDepth", _gbuffer0);
-            cmd.SetComputeTextureParam(cs, _kRestirSpat, "GBufferNormalRough", _gbuffer1);
-            BindCurReservoirSRVs(cmd, cs, _kRestirSpat, _temporalResRT0, _temporalResRT1, _temporalResRT2, _temporalResRT3);
-            cmd.SetComputeTextureParam(cs, _kRestirSpat, "CurReservoirRT4", _temporalResRT4);
-            BindReservoirUAVs(cmd, cs, _kRestirSpat, _spatialResRT0, _spatialResRT1, _spatialResRT2, _spatialResRT3);
-            cmd.SetComputeTextureParam(cs, _kRestirSpat, "ReservoirRT4", _spatialResRT4);
-            cmd.DispatchCompute(cs, _kRestirSpat, gx, gy, 1);
-
-            // K5 读取的蓄水池来源：两 pass 模式下读 _reservoirRT（Pass 2 输出），
-            // 否则读 _spatialResRT（Pass 1 输出）
-            RenderTexture k5ResR0 = _spatialResRT0;
-            RenderTexture k5ResR1 = _spatialResRT1;
-            RenderTexture k5ResR2 = _spatialResRT2;
-            RenderTexture k5ResR3 = _spatialResRT3;
-            RenderTexture k5ResR4 = _spatialResRT4;
-
-            // ═══ K4 Pass 2: 额外空域复用（读 Pass 1 输出）═══
-            // 读 G-buffer + 空域蓄水池(Pass 1 输出)
-            // 写 _reservoirRT0-4（复用 K2 输出纹理，已不再需要）
-            // Pass 2 在 outM < M_MAX/2 时合并邻居空域蓄水池，加速新像素收敛
-            if (_feature.restirSpatialTwoPass)
-            {
-                cmd.SetComputeIntParam(cs, "K4_PassIndex", 1);
-                cmd.SetComputeTextureParam(cs, _kRestirSpat, "GBufferPosDepth", _gbuffer0);
-                cmd.SetComputeTextureParam(cs, _kRestirSpat, "GBufferNormalRough", _gbuffer1);
-                BindCurReservoirSRVs(cmd, cs, _kRestirSpat, _spatialResRT0, _spatialResRT1, _spatialResRT2, _spatialResRT3);
-                cmd.SetComputeTextureParam(cs, _kRestirSpat, "CurReservoirRT4", _spatialResRT4);
-                BindReservoirUAVs(cmd, cs, _kRestirSpat, _reservoirRT0, _reservoirRT1, _reservoirRT2, _reservoirRT3);
-                cmd.SetComputeTextureParam(cs, _kRestirSpat, "ReservoirRT4", _reservoirRT4);
-                cmd.DispatchCompute(cs, _kRestirSpat, gx, gy, 1);
-
-                k5ResR0 = _reservoirRT0;
-                k5ResR1 = _reservoirRT1;
-                k5ResR2 = _reservoirRT2;
-                k5ResR3 = _reservoirRT3;
-                k5ResR4 = _reservoirRT4;
-            }
-
-            // ═══ K5: ReSTIR_FinalShading ═══
-            // 读 G-buffer + 直接光照 + 最终蓄水池(K4 输出)
-            // 写 Output
-            cmd.SetComputeTextureParam(cs, _kRestirShade, "GBufferPosDepth", _gbuffer0);
-            cmd.SetComputeTextureParam(cs, _kRestirShade, "GBufferNormalRough", _gbuffer1);
-            cmd.SetComputeTextureParam(cs, _kRestirShade, "GBufferHitInfo", _gbuffer2);
-            cmd.SetComputeTextureParam(cs, _kRestirShade, "ReSTIR_DirectLighting", _directLightRT);
-            BindCurReservoirSRVs(cmd, cs, _kRestirShade, k5ResR0, k5ResR1, k5ResR2, k5ResR3);
-            cmd.SetComputeTextureParam(cs, _kRestirShade, "CurReservoirRT4", k5ResR4);
-            cmd.SetComputeTextureParam(cs, _kRestirShade, "Output", _outputRT);
-            _bufferMgr.Bind(cmd, cs, _kRestirShade);
-            cmd.DispatchCompute(cs, _kRestirShade, gx, gy, 1);
-        }
-        else
-        {
-            // ═══ PathTrace ═══
-            if (_feature.IsNativeReady)
-            {
-                // ── 动态场景：同步实例变换 → native 每帧重建 TLAS（必须在 PrepareDispatch 之前，
-                //    使 descriptor 指向本帧槽位）──
-                mm.SyncInstancesNative();
-
-                // ── 骨骼动画：关节矩阵 → native 蒙皮 compute + BLAS refit（同样必须
-                //    先于 PrepareDispatch，refit/TLAS 重建均在该帧命令流内录制）──
-                bool skinnedUpdated = mm.SyncSkinnedMeshesNative();
-                if (skinnedUpdated)
-                {
-                    // 几何变形期间历史帧像素不再对应同一几何，重置自研时域累积
-                    // （DLSS RR 路径不走自研累积，此 uniform 仅 TemporalAccumulate 使用）
-                    _accumFrame = 0;
-                    cmd.SetComputeIntParam(cs, "AccumFrame", 0);
-                }
-
-                // Vulkan RayQuery 硬件加速路径追踪
-                var camData = new NativeBridge.VPT_CameraData
-                {
-                    viewInv = MatrixToFloat16(camToWorld),
-                    projInv = MatrixToFloat16(invProj),
-                    position = new float[]
-                    {
-                        camera.transform.position.x,
-                        camera.transform.position.y,
-                        camera.transform.position.z
-                    },
-                    fov = camera.fieldOfView,
-                    jitter = new float[] { jitter.x, jitter.y },
-                    nearPlane = camera.nearClipPlane,
-                    farPlane = camera.farClipPlane,
-                    frameCount = Time.frameCount,
-                    maxDepth = Mathf.Max(1, _feature.maxDepth),
-                    ambientColor = new float[]
-                    {
-                        _feature.ambientColor.r,
-                        _feature.ambientColor.g,
-                        _feature.ambientColor.b
-                    },
-                    pad = 0f,
-                    envIntensity = _feature.envIntensity,
-                    envRotation = _feature.envRotation * Mathf.Deg2Rad
-                };
-
-                // Plan B: 两阶段 dispatch（消除 vkQueueWaitIdle）
-                // Phase 1: 准备 dispatch 参数（AccessTexture + UBO + DescriptorSet）
-                // Phase 2: IssuePluginEvent 将 dispatch 录制进 Unity 的命令缓冲
-                // 后续 Unity compute shader dispatch 自然在同一命令流中执行
-                TextureArrayManager texArr = mm.TextureArrays;
-                IntPtr callbackPtr = NativeBridge.PrepareDispatch(_outputRT, _gbuffer0, _gbuffer1,
-                    _diffuseAlbedoRT, _specularAlbedoRT,
-                    texArr != null ? texArr.BaseColorArray : null,
-                    texArr != null ? texArr.MetallicSmoothArray : null,
-                    texArr != null ? texArr.NormalArray : null,
-                    texArr != null ? texArr.EmissiveArray : null,
-                    w, h, ref camData,
-                    lightCount, Mathf.Max(1, _feature.samplesPerPixel));
-                cmd.IssuePluginEvent(callbackPtr, NativeBridge.EventPathTrace);
-            }
-            else
-            {
-                // Fallback: Unity compute shader (HLSL software BVH)
-                cmd.SetComputeTextureParam(cs, _kPathTrace, "Output", _outputRT);
-                cmd.SetComputeTextureParam(cs, _kPathTrace, "GBufferPosDepth", _gbuffer0);
-                cmd.SetComputeTextureParam(cs, _kPathTrace, "GBufferNormalRough", _gbuffer1);
-                // DLSS RR albedo G-buffer（D3D11 pitfall：kernel 引用的全局 UAV 必须绑定）
-                cmd.SetComputeTextureParam(cs, _kPathTrace, "DiffuseAlbedoOut", _diffuseAlbedoRT);
-                cmd.SetComputeTextureParam(cs, _kPathTrace, "SpecularAlbedoOut", _specularAlbedoRT);
-                _bufferMgr.Bind(cmd, cs, _kPathTrace);
-                cmd.DispatchCompute(cs, _kPathTrace, gx, gy, 1);
-            }
-        }
-
-        // ═══ 阶段 1.5：MotionVector + Depth 输出（DLSS 专用） ═══
-        // 读当前帧 GBufferPosDepth + PrevViewProj，输出运动矢量 + 线性深度
-        // 在降噪前 dispatch；无需历史缓冲（只依赖当前 G-buffer + PrevViewProj）
-        if (_feature.dlssEnabled)
-        {
-            cmd.SetComputeVectorParam(cs, "JitterOffset", new Vector4(jitter.x, jitter.y, 0f, 0f));
-            cmd.SetComputeMatrixParam(cs, "CurViewProj", curProj * curView);
-            cmd.SetComputeTextureParam(cs, _kMotionVector, "GBufferPosDepth", _gbuffer0);
-            cmd.SetComputeTextureParam(cs, _kMotionVector, "MotionVectorOut", _motionVectorRT);
-            cmd.SetComputeTextureParam(cs, _kMotionVector, "DepthOut", _depthRT);
-            // RR 模式额外绑定线性深度输出
-            if (_feature.dlssMode == PathTraceRendererFeature.DLSSMode.RR)
-                cmd.SetComputeTextureParam(cs, _kMotionVector, "LinearDepthOut", _linearDepthRT);
-            cmd.DispatchCompute(cs, _kMotionVector, gx, gy, 1);
-        }
-
-        // ══════════════════════════════════════════════════════════════
-        //  阶段 2：降噪（共享：时域累积 + 空域滤波）
-        // ══════════════════════════════════════════════════════════════
-
-        // ── 降噪总开关关闭：跳过时域+空域，直接 Blit 原始输出 ──
-        if (!_feature.denoisingEnabled)
-        {
-            // DLSS 模式下仍需通过 NGX 上采样
-            if (_feature.dlssEnabled && _dlssInitialized)
-            {
-                IntPtr dlssPtr;
-                if (_dlssMode == NativeBridge.DLSS_MODE_RR)
-                {
-                    // RR: 1spp 噪声 → NGX RR 降噪+超分
-                    float[] viewMat = MatrixToFloat16(curView);
-                    float[] projMat = MatrixToFloat16(curProj);
-                    dlssPtr = NativeBridge.PrepareDLSSRRDispatch(
-                        _outputRT, _motionVectorRT, _linearDepthRT, _dlssOutputRT,
-                        _gbuffer1, _diffuseAlbedoRT, _specularAlbedoRT,
-                        w, h, camera.pixelWidth, camera.pixelHeight,
-                        jitter.x, jitter.y, _hasPrev ? 0 : 1,
-                        viewMat, projMat);
-                }
-                else
-                {
-                    // SR: 关闭时域后直接用 _outputRT 作为 NGX color 输入
-                    dlssPtr = NativeBridge.PrepareDLSSDispatch(
-                        _outputRT, _motionVectorRT, _depthRT, _dlssOutputRT,
-                        w, h, camera.pixelWidth, camera.pixelHeight,
-                        jitter.x, jitter.y, _hasPrev ? 0 : 1);
-                }
-                cmd.IssuePluginEvent(dlssPtr, NativeBridge.EventDlss);
-                cmd.Blit(_dlssOutputRT, colorTarget);
-            }
-            else
-            {
-                cmd.Blit(_outputRT, colorTarget);
-            }
-            context.ExecuteCommandBuffer(cmd);
-            CommandBufferPool.Release(cmd);
-
-            // ── ping-pong：history ← 本帧 accum ──
-            Swap(ref _historyRT, ref _accumRT);
-            // ── ping-pong：prevGBuffer ← 本帧 G-buffer ──
-            Swap(ref _prevGbuffer0, ref _gbuffer0);
-            Swap(ref _prevGbuffer1, ref _gbuffer1);
-            // ── ReSTIR 蓄水池 swap（仅 ReSTIR 模式）──
-            if (_feature.useReSTIRGI)
-            {
-                Swap(ref _prevReservoirRT0, ref _temporalResRT0);
-                Swap(ref _prevReservoirRT1, ref _temporalResRT1);
-                Swap(ref _prevReservoirRT2, ref _temporalResRT2);
-                Swap(ref _prevReservoirRT3, ref _temporalResRT3);
-                Swap(ref _prevReservoirRT4, ref _temporalResRT4);
-            }
-            // ── 更新上一帧矩阵 ──
-            _prevView = curView;
-            _prevProj = curProj;
-            _hasPrev = true;
-            return;
-        }
-
-        // ═══ DLSS 分支：跳过时域累积，NGX 超分 ═══
-        // DLSS SR：关闭自研时域，保留空域滤波作为前置降噪器，再 NGX 超分
-        // DLSS RR：完全关闭自研时域+空域+AntiFirefly，以 1spp 噪声 _outputRT 直接输入 NGX RR
-        if (_feature.dlssEnabled)
-        {
-            RenderTexture dlssFinalRT;
-
-            if (_dlssMode == NativeBridge.DLSS_MODE_RR)
-            {
-                // ═══ RR: 跳过空域滤波+AntiFirefly，直接用 _outputRT（1spp 噪声） ═══
-                dlssFinalRT = _outputRT;
-            }
-            else
-            {
-                // ═══ SR: 空域滤波作为前置降噪 ═══
-                // 空域滤波输入：直接用 _outputRT（跳过 TemporalAccumulate）
-                RenderTexture dlssSpatialInput = _outputRT;
-
-                // AntiFirefly（可选前置 pass）
-                if (_feature.enableAntiFirefly)
-                {
-                    cmd.SetComputeTextureParam(cs, _kAntiFirefly, "AntiFlyInput", _outputRT);
-                    cmd.SetComputeTextureParam(cs, _kAntiFirefly, "AntiFlyOutput", _filterInRT);
-                    cmd.SetComputeTextureParam(cs, _kAntiFirefly, "GBufferPosDepth", _gbuffer0);
-                    cmd.DispatchCompute(cs, _kAntiFirefly, gx, gy, 1);
-                    dlssSpatialInput = _filterInRT;
-                }
-
-                // SpatialFilter（Poisson + à-trous 多 pass）
-                if (_feature.spatialEnabled && _feature.spatialPasses > 0)
-                {
-                    cmd.SetComputeTextureParam(cs, _kSpatial, "GBufferPosDepth", _gbuffer0);
-                    cmd.SetComputeTextureParam(cs, _kSpatial, "GBufferNormalRough", _gbuffer1);
-
-                    RenderTexture src = dlssSpatialInput;
-                    RenderTexture dst = (_feature.enableAntiFirefly) ? _filterOutRT : _filterInRT;
-                    for (int p = 0; p < _feature.spatialPasses; p++)
-                    {
-                        cmd.SetComputeTextureParam(cs, _kSpatial, "FilterInput", src);
-                        cmd.SetComputeTextureParam(cs, _kSpatial, "FilterOutput", dst);
-                        cmd.SetComputeIntParam(cs, "PassIndex", p);
-                        cmd.DispatchCompute(cs, _kSpatial, gx, gy, 1);
-                        src = dst;
-                        dst = (dst == _filterInRT) ? _filterOutRT : _filterInRT;
-                    }
-                    dlssFinalRT = src;
-                }
-                else
-                {
-                    dlssFinalRT = dlssSpatialInput;
-                }
-            }
-
-            // NGX DLSS Evaluate（native：低分 → 全分）
-            if (_dlssInitialized)
-            {
-                IntPtr dlssPtr;
-                if (_dlssMode == NativeBridge.DLSS_MODE_RR)
-                {
-                    // RR: 传入 1spp 噪声 color + linearDepth + normalRough + 相机矩阵
-                    float[] viewMat = MatrixToFloat16(curView);
-                    float[] projMat = MatrixToFloat16(curProj);
-                    dlssPtr = NativeBridge.PrepareDLSSRRDispatch(
-                        dlssFinalRT, _motionVectorRT, _linearDepthRT, _dlssOutputRT,
-                        _gbuffer1, _diffuseAlbedoRT, _specularAlbedoRT,
-                        w, h, camera.pixelWidth, camera.pixelHeight,
-                        jitter.x, jitter.y, _hasPrev ? 0 : 1,
-                        viewMat, projMat);
-                }
-                else
-                {
-                    // SR: 传入空域滤波后的 color + NDC depth
-                    dlssPtr = NativeBridge.PrepareDLSSDispatch(
-                        dlssFinalRT, _motionVectorRT, _depthRT, _dlssOutputRT,
-                        w, h, camera.pixelWidth, camera.pixelHeight,
-                        jitter.x, jitter.y, _hasPrev ? 0 : 1);
-                }
-                cmd.IssuePluginEvent(dlssPtr, NativeBridge.EventDlss);
-                cmd.Blit(_dlssOutputRT, colorTarget);
-            }
-            else
-            {
-                // Native 不可用时退化为 Bilinear 上采样
-                cmd.Blit(dlssFinalRT, colorTarget);
-            }
-
-            context.ExecuteCommandBuffer(cmd);
-            CommandBufferPool.Release(cmd);
-
-            // ping-pong：G-buffer swap（MV kernel 需要上一帧 G-buffer）
-            Swap(ref _prevGbuffer0, ref _gbuffer0);
-            Swap(ref _prevGbuffer1, ref _gbuffer1);
-
-            _prevView = curView;
-            _prevProj = curProj;
-            _hasPrev = true;
-            return;
-        }
-
-        // ═══ 阶段 3：TemporalAccumulate ═══
-        // 读：History(_historyRT) + CurSample(_outputRT) + GBuffer(_gbuffer0/1) + PrevGBuffer(_prevGbuffer0/1)
-        // 写：Accum(_accumRT)，.a 通道存储近似方差
-        cmd.SetComputeTextureParam(cs, _kTemporal, "History", _historyRT);
-        cmd.SetComputeTextureParam(cs, _kTemporal, "CurSample", _outputRT);
-        cmd.SetComputeTextureParam(cs, _kTemporal, "GBufferPosDepth", _gbuffer0);
-        cmd.SetComputeTextureParam(cs, _kTemporal, "GBufferNormalRough", _gbuffer1);
-        cmd.SetComputeTextureParam(cs, _kTemporal, "PrevGBufferPosDepth", _prevGbuffer0);
-        cmd.SetComputeTextureParam(cs, _kTemporal, "PrevGBufferNormalRough", _prevGbuffer1);
-        cmd.SetComputeTextureParam(cs, _kTemporal, "Accum", _accumRT);
-        cmd.DispatchCompute(cs, _kTemporal, gx, gy, 1);
-
-        // ═══ 阶段 3.5：AntiFirefly（可选前置 pass） ═══
-        // 3x3 RCRS 极值替换，消除镜面反射单像素刺眼亮点
-        // 输入 _accumRT → 输出 _filterInRT，供后续 SpatialFilter 使用
-        RenderTexture spatialInput = _accumRT;
-        if (_feature.enableAntiFirefly)
-        {
-            cmd.SetComputeTextureParam(cs, _kAntiFirefly, "AntiFlyInput", _accumRT);
-            cmd.SetComputeTextureParam(cs, _kAntiFirefly, "AntiFlyOutput", _filterInRT);
-            cmd.SetComputeTextureParam(cs, _kAntiFirefly, "GBufferPosDepth", _gbuffer0);
-            cmd.DispatchCompute(cs, _kAntiFirefly, gx, gy, 1);
-            spatialInput = _filterInRT;
-        }
-
-        // ═══ 阶段 4：SpatialFilter（Poisson + à-trous 多 pass） ═══
-        RenderTexture finalRT;
-        if (_feature.spatialEnabled && _feature.spatialPasses > 0)
-        {
-            cmd.SetComputeTextureParam(cs, _kSpatial, "GBufferPosDepth", _gbuffer0);
-            cmd.SetComputeTextureParam(cs, _kSpatial, "GBufferNormalRough", _gbuffer1);
-
-            // AntiFirefly 开启时从 _filterInRT 开始，否则从 _accumRT 开始
-            RenderTexture src = spatialInput;
-            // AntiFirefly 已写入 _filterInRT，故空域首个 pass 写 _filterOutRT
-            RenderTexture dst = (_feature.enableAntiFirefly) ? _filterOutRT : _filterInRT;
-            for (int p = 0; p < _feature.spatialPasses; p++)
-            {
-                cmd.SetComputeTextureParam(cs, _kSpatial, "FilterInput", src);
-                cmd.SetComputeTextureParam(cs, _kSpatial, "FilterOutput", dst);
-                cmd.SetComputeIntParam(cs, "PassIndex", p);
-                cmd.DispatchCompute(cs, _kSpatial, gx, gy, 1);
-                // 下一 pass：读本次输出（= dst），写另一张临时 RT
-                src = dst;
-                dst = (dst == _filterInRT) ? _filterOutRT : _filterInRT;
-            }
-            finalRT = src; // 最后一次写入的目标
-        }
-        else
-        {
-            finalRT = spatialInput;
-        }
-
-        // ═══ 阶段 5：Blit → 相机颜色目标 ═══
-        cmd.Blit(finalRT, colorTarget);
-
-        context.ExecuteCommandBuffer(cmd);
-        CommandBufferPool.Release(cmd);
-
-        // ── ping-pong：history ← 本帧 accum ──
-        Swap(ref _historyRT, ref _accumRT);
-
-        // ── ping-pong：prevGBuffer ← 本帧 G-buffer ──
-        Swap(ref _prevGbuffer0, ref _gbuffer0);
-        Swap(ref _prevGbuffer1, ref _gbuffer1);
-
-        // ── ReSTIR 蓄水池 swap（仅 ReSTIR 模式）──
-        // ReSTIR GI 论文规定：跨帧反馈的是 Temporal Reservoir（样本严格来自同一像素、
-        // 同 domain，保证 RIS 无偏）。Spatial Reservoir 已混入邻居像素样本（经
-        // Jacobian shift 跨 domain），若反馈会使空间 shift 偏差跨帧复合 + M 指数饱和。
-        if (_feature.useReSTIRGI)
-        {
-            Swap(ref _prevReservoirRT0, ref _temporalResRT0);
-            Swap(ref _prevReservoirRT1, ref _temporalResRT1);
-            Swap(ref _prevReservoirRT2, ref _temporalResRT2);
-            Swap(ref _prevReservoirRT3, ref _temporalResRT3);
-            Swap(ref _prevReservoirRT4, ref _temporalResRT4);
-        }
-
-        // ── 更新上一帧矩阵 ──
-        _prevView = curView;
-        _prevProj = curProj;
-        _hasPrev = true;
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    //  Debug 深度图渲染（阶段2.6 验证）
-    //  跳过 compute shader 管线，直接用 Vulkan RayQuery 对 TLAS 发射射线
-    //  输出灰度深度图 Blit 到相机颜色目标
-    // ══════════════════════════════════════════════════════════════
-
-    private void ExecuteDebugDepth(ScriptableRenderContext context, ref RenderingData renderingData)
-    {
-        if (!_feature.IsNativeReady)
-            return;
-
-        // ── 动态场景：同步实例变换 → native 每帧重建 TLAS ──
-        // ── 骨骼动画：同步蒙皮状态 → BLAS refit（debug depth 模式同样需要）──
-        if (ModelManager.Instance != null)
-        {
-            ModelManager.Instance.SyncInstancesNative();
-            ModelManager.Instance.SyncSkinnedMeshesNative();
-        }
-
-        Camera camera = renderingData.cameraData.camera;
-        int w = _feature.debugDepthResolution;
-        int h = _feature.debugDepthResolution;
-
-        // 创建/复用 device-local RenderTexture
-        // enableRandomWrite=true 确保 Unity 创建 VkImage 时包含 STORAGE_IMAGE usage flag
-        if (_debugDepthRT == null || _debugDepthRT.width != w || _debugDepthRT.height != h)
-        {
-            if (_debugDepthRT != null)
-                _debugDepthRT.Release();
-            _debugDepthRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGB32)
-            {
-                enableRandomWrite = true,
-                filterMode = FilterMode.Bilinear
-            };
-            _debugDepthRT.Create();
-        }
-
-        // 填充 VPT_CameraData（行主序矩阵，与 Unity Matrix4x4 存储一致）
         var camData = new NativeBridge.VPT_CameraData
         {
-            viewInv = MatrixToFloat16(camera.cameraToWorldMatrix),
-            projInv = MatrixToFloat16(camera.projectionMatrix.inverse),
+            viewInv = MatrixToFloat16(camToWorld),
+            projInv = MatrixToFloat16(invProj),
             position = new float[]
             {
                 camera.transform.position.x,
@@ -1048,24 +363,92 @@ public class PathTraceRenderPass : ScriptableRenderPass
                 camera.transform.position.z
             },
             fov = camera.fieldOfView,
-            jitter = new float[] { 0f, 0f },
+            jitter = new float[] { jitter.x, jitter.y },
             nearPlane = camera.nearClipPlane,
             farPlane = camera.farClipPlane,
             frameCount = Time.frameCount,
-            maxDepth = 1,
-            ambientColor = new float[] { 0f, 0f, 0f },
-            pad = 0f
+            maxDepth = Mathf.Max(1, _feature.maxDepth),
+            ambientColor = new float[]
+            {
+                _feature.ambientColor.r,
+                _feature.ambientColor.g,
+                _feature.ambientColor.b
+            },
+            pad = 0f,
+            envIntensity = _feature.envIntensity,
+            envRotation = _feature.envRotation * Mathf.Deg2Rad
         };
 
-        // 直接写入 GPU RenderTexture 的 VkImage — 无 CPU 回读
-        NativeBridge.DispatchDebugDepth(_debugDepthRT.GetNativeTexturePtr(), w, h, ref camData);
+        // Plan B: 两阶段 dispatch（消除 vkQueueWaitIdle）
+        // Phase 1: 准备 dispatch 参数（AccessTexture + UBO + DescriptorSet）
+        // Phase 2: IssuePluginEvent 将 dispatch 录制进 Unity 的命令缓冲
+        TextureArrayManager texArr = mm.TextureArrays;
+        IntPtr callbackPtr = NativeBridge.PrepareDispatch(_outputRT, _gbuffer0, _gbuffer1,
+            _diffuseAlbedoRT, _specularAlbedoRT,
+            texArr != null ? texArr.BaseColorArray : null,
+            texArr != null ? texArr.MetallicSmoothArray : null,
+            texArr != null ? texArr.NormalArray : null,
+            texArr != null ? texArr.EmissiveArray : null,
+            w, h, ref camData,
+            lightCount, Mathf.Max(1, _feature.samplesPerPixel));
+        cmd.IssuePluginEvent(callbackPtr, NativeBridge.EventPathTrace);
 
-        // Blit 到相机颜色目标（GPU 内部操作，无 CPU 参与）
-        RTHandle colorTarget = Renderer.cameraColorTargetHandle;
-        CommandBuffer cmd = CommandBufferPool.Get("DebugDepth");
-        cmd.Blit(_debugDepthRT, colorTarget);
+        // ═══ 阶段 1.5：MotionVector + 线性深度（DLSS RR 专用） ═══
+        // 读当前帧 GBufferPosDepth + PrevViewProj，输出运动矢量 + 视空间线性深度
+        ComputeShader cs = _feature.dlssEnabled ? ResolveKernels() : null;
+        if (cs == null && _feature.dlssEnabled && !_warnedNoMotionVector)
+        {
+            _warnedNoMotionVector = true;
+            Debug.LogWarning("[PathTrace] DLSS 已启用但 motionVectorShader 未赋值（或缺少 MotionVector kernel），" +
+                              "将退化为 Bilinear 上采样。");
+        }
+
+        if (cs != null)
+        {
+            int gx = (w + _feature.groupXY - 1) / _feature.groupXY;
+            int gy = (h + _feature.groupXY - 1) / _feature.groupXY;
+
+            cmd.SetComputeIntParam(cs, "Width", w);
+            cmd.SetComputeIntParam(cs, "Height", h);
+            cmd.SetComputeFloatParam(cs, "FarPlane", camera.farClipPlane);
+            cmd.SetComputeMatrixParam(cs, "PrevViewProj", prevViewProj);
+            cmd.SetComputeMatrixParam(cs, "CurViewProj", curProj * curView);
+            cmd.SetComputeTextureParam(cs, _kMotionVector, "GBufferPosDepth", _gbuffer0);
+            cmd.SetComputeTextureParam(cs, _kMotionVector, "MotionVectorOut", _motionVectorRT);
+            cmd.SetComputeTextureParam(cs, _kMotionVector, "LinearDepthOut", _linearDepthRT);
+            cmd.DispatchCompute(cs, _kMotionVector, gx, gy, 1);
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  阶段 2：NGX DLSS RR 重建，或直接 Blit
+        // ══════════════════════════════════════════════════════════════
+        if (_feature.dlssEnabled && _dlssInitialized && cs != null)
+        {
+            // RR: 1spp 噪声 color + linearDepth + normalRough + albedo + 相机矩阵
+            float[] viewMat = MatrixToFloat16(curView);
+            float[] projMat = MatrixToFloat16(curProj);
+            IntPtr dlssPtr = NativeBridge.PrepareDLSSRRDispatch(
+                _outputRT, _motionVectorRT, _linearDepthRT, _dlssOutputRT,
+                _gbuffer1, _diffuseAlbedoRT, _specularAlbedoRT,
+                w, h, camera.pixelWidth, camera.pixelHeight,
+                jitter.x, jitter.y, _hasPrev ? 0 : 1,
+                viewMat, projMat);
+            cmd.IssuePluginEvent(dlssPtr, NativeBridge.EventDlss);
+            cmd.Blit(_dlssOutputRT, colorTarget);
+        }
+        else
+        {
+            // 未启用 DLSS（或初始化失败/辅助 shader 缺失）：直接输出 PT 结果
+            cmd.Blit(_outputRT, colorTarget);
+        }
+
         context.ExecuteCommandBuffer(cmd);
         CommandBufferPool.Release(cmd);
+
+        // ── 更新上一帧矩阵 ──
+        _prevView = curView;
+        _prevProj = curProj;
+        _hasPrev = true;
     }
 
     /// <summary>将 Unity Matrix4x4 转换为行主序 float[16]</summary>
@@ -1092,19 +475,11 @@ public class PathTraceRenderPass : ScriptableRenderPass
         }
 
         ReleaseRTs();
-        if (_debugDepthRT != null)
-        {
-            _debugDepthRT.Release();
-            _debugDepthRT = null;
-        }
-        _bufferMgr?.Dispose();
-        _bufferMgr = null;
     }
 
     // ── 内部工具 ───────────────────────────────────────
 
-    private bool _prevUseReSTIR = false;  // 跟踪 useReSTIRGI 状态变化
-    private int _prevDlssMode = 0;     // 跟踪 dlssMode 状态变化（0=None）
+    private bool _prevDlssEnabled;          // 跟踪 dlssEnabled 状态变化（切换时重建 RT）
     private int _cachedOutW = -1;            // 全分辨率宽度（DLSS 输出）
     private int _cachedOutH = -1;            // 全分辨率高度（DLSS 输出）
 
@@ -1115,18 +490,18 @@ public class PathTraceRenderPass : ScriptableRenderPass
     private int _dlssOutW = -1;
     private int _dlssOutH = -1;
     private int _dlssQuality = -1;
-    private int _dlssMode = -1;       // 当前 NGX feature 模式（0=SR, 1=RR）
+
+    // ── 上一帧相机矩阵（DLSS 重投影用） ──
+    private Matrix4x4 _prevView;
+    private Matrix4x4 _prevProj;
 
     private void EnsureRTs(int w, int h, int outW, int outH)
     {
-        int curDlssMode = (int)_feature.dlssMode;
-        bool restirChanged = _prevUseReSTIR != _feature.useReSTIRGI;
-        bool dlssChanged = _prevDlssMode != curDlssMode;
+        bool dlssChanged = _prevDlssEnabled != _feature.dlssEnabled;
         bool outResChanged = _cachedOutW != outW || _cachedOutH != outH;
-        if (_cachedW == w && _cachedH == h && _outputRT != null && !restirChanged && !dlssChanged && !outResChanged)
+        if (_cachedW == w && _cachedH == h && _outputRT != null && !dlssChanged && !outResChanged)
             return;
-        _prevUseReSTIR = _feature.useReSTIRGI;
-        _prevDlssMode = curDlssMode;
+        _prevDlssEnabled = _feature.dlssEnabled;
 
         ReleaseRTs();
 
@@ -1141,54 +516,12 @@ public class PathTraceRenderPass : ScriptableRenderPass
         // descriptor 必须始终有效，即使 DLSS 关闭也不能为 null）
         _diffuseAlbedoRT  = NewRT(w, h, RenderTextureFormat.ARGBHalf);
         _specularAlbedoRT = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-        _gbuffer2   = NewRT(w, h, RenderTextureFormat.ARGBFloat);  // ReSTIR hit info
-        _prevGbuffer0 = NewRT(w, h, RenderTextureFormat.ARGBFloat);
-        _prevGbuffer1 = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-        _accumRT    = NewRT(w, h, RenderTextureFormat.ARGBFloat, rtFilter);
-        // History 纹理使用 Bilinear 滤波，使 TemporalAccumulate 的重投影采样
-        // 能获得亚像素精度（SampleLevel 双线性）
-        _historyRT  = NewRT(w, h, RenderTextureFormat.ARGBFloat, FilterMode.Bilinear);
-        _filterInRT  = NewRT(w, h, RenderTextureFormat.ARGBHalf, rtFilter);
-        _filterOutRT = NewRT(w, h, RenderTextureFormat.ARGBHalf, rtFilter);
-
-        // ── ReSTIR GI 专用 RT ──
-        if (_feature.useReSTIRGI)
-        {
-            _directLightRT  = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            // 蓄水池 4 张（当前帧 + 历史）
-            _reservoirRT0   = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _reservoirRT1   = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _reservoirRT2   = NewRT(w, h, RenderTextureFormat.ARGBFloat);  // RGBA32F for W+M+pdf
-            _reservoirRT3   = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _reservoirRT4   = NewRT(w, h, RenderTextureFormat.ARGBFloat);  // RGBA32F for BSDF
-            _prevReservoirRT0 = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _prevReservoirRT1 = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _prevReservoirRT2 = NewRT(w, h, RenderTextureFormat.ARGBFloat);
-            _prevReservoirRT3 = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _prevReservoirRT4 = NewRT(w, h, RenderTextureFormat.ARGBFloat);
-            // 时域 / 空域输出（格式同蓄水池）
-            _temporalResRT0 = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _temporalResRT1 = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _temporalResRT2 = NewRT(w, h, RenderTextureFormat.ARGBFloat);
-            _temporalResRT3 = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _temporalResRT4 = NewRT(w, h, RenderTextureFormat.ARGBFloat);
-            _spatialResRT0  = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _spatialResRT1  = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _spatialResRT2  = NewRT(w, h, RenderTextureFormat.ARGBFloat);
-            _spatialResRT3  = NewRT(w, h, RenderTextureFormat.ARGBHalf);
-            _spatialResRT4  = NewRT(w, h, RenderTextureFormat.ARGBFloat);
-        }
 
         // ── DLSS 专用 RT ──
-        // RR 模式不创建 _accumRT/_historyRT/_filterInRT/_filterOutRT（省显存）
-        // 但当前实现为简化逻辑仍创建它们；仅额外创建 _linearDepthRT
         if (_feature.dlssEnabled)
         {
             _motionVectorRT = NewRT(w, h, RenderTextureFormat.RGFloat);   // 低分辨率运动矢量
-            _depthRT        = NewRT(w, h, RenderTextureFormat.RFloat);     // 低分辨率 NDC 深度（SR 用）
-            // RR 模式额外创建线性深度 RT
-            if (_feature.dlssMode == PathTraceRendererFeature.DLSSMode.RR)
-                _linearDepthRT  = NewRT(w, h, RenderTextureFormat.RFloat);   // 低分辨率视空间线性距离（RR 用）
+            _linearDepthRT  = NewRT(w, h, RenderTextureFormat.RFloat);     // 低分辨率视空间线性距离（RR 用）
             _dlssOutputRT   = NewRT(outW, outH, RenderTextureFormat.ARGBHalf, FilterMode.Bilinear);  // 全分辨率 NGX 输出
         }
 
@@ -1218,78 +551,21 @@ public class PathTraceRenderPass : ScriptableRenderPass
         Release(ref _outputRT);
         Release(ref _gbuffer0);
         Release(ref _gbuffer1);
-        Release(ref _gbuffer2);
-        Release(ref _prevGbuffer0);
-        Release(ref _prevGbuffer1);
-        Release(ref _accumRT);
-        Release(ref _historyRT);
-        Release(ref _filterInRT);
-        Release(ref _filterOutRT);
-        // ── DLSS ──
-        Release(ref _motionVectorRT);
-        Release(ref _depthRT);
-        Release(ref _linearDepthRT);
-        Release(ref _dlssOutputRT);
         Release(ref _diffuseAlbedoRT);
         Release(ref _specularAlbedoRT);
-        // ── ReSTIR GI ──
-        Release(ref _directLightRT);
-        Release(ref _reservoirRT0); Release(ref _reservoirRT1);
-        Release(ref _reservoirRT2); Release(ref _reservoirRT3);
-        Release(ref _reservoirRT4);
-        Release(ref _prevReservoirRT0); Release(ref _prevReservoirRT1);
-        Release(ref _prevReservoirRT2); Release(ref _prevReservoirRT3);
-        Release(ref _prevReservoirRT4);
-        Release(ref _temporalResRT0); Release(ref _temporalResRT1);
-        Release(ref _temporalResRT2); Release(ref _temporalResRT3);
-        Release(ref _temporalResRT4);
-        Release(ref _spatialResRT0); Release(ref _spatialResRT1);
-        Release(ref _spatialResRT2); Release(ref _spatialResRT3);
-        Release(ref _spatialResRT4);
+        // ── DLSS ──
+        Release(ref _motionVectorRT);
+        Release(ref _linearDepthRT);
+        Release(ref _dlssOutputRT);
         _cachedW = -1;
         _cachedH = -1;
         _cachedOutW = -1;
         _cachedOutH = -1;
+        _prevDlssEnabled = false;
     }
 
     private static void Release(ref RenderTexture rt)
     {
         if (rt != null) { rt.Release(); rt = null; }
-    }
-
-    // ── ReSTIR GI 蓄水池纹理绑定辅助方法 ──
-
-    private static void BindReservoirUAVs(CommandBuffer cmd, ComputeShader cs, int kernel,
-        RenderTexture rt0, RenderTexture rt1, RenderTexture rt2, RenderTexture rt3)
-    {
-        cmd.SetComputeTextureParam(cs, kernel, "ReservoirRT0", rt0);
-        cmd.SetComputeTextureParam(cs, kernel, "ReservoirRT1", rt1);
-        cmd.SetComputeTextureParam(cs, kernel, "ReservoirRT2", rt2);
-        cmd.SetComputeTextureParam(cs, kernel, "ReservoirRT3", rt3);
-    }
-
-    private static void BindCurReservoirSRVs(CommandBuffer cmd, ComputeShader cs, int kernel,
-        RenderTexture rt0, RenderTexture rt1, RenderTexture rt2, RenderTexture rt3)
-    {
-        cmd.SetComputeTextureParam(cs, kernel, "CurReservoirRT0", rt0);
-        cmd.SetComputeTextureParam(cs, kernel, "CurReservoirRT1", rt1);
-        cmd.SetComputeTextureParam(cs, kernel, "CurReservoirRT2", rt2);
-        cmd.SetComputeTextureParam(cs, kernel, "CurReservoirRT3", rt3);
-    }
-
-    private static void BindPrevReservoirSRVs(CommandBuffer cmd, ComputeShader cs, int kernel,
-        RenderTexture rt0, RenderTexture rt1, RenderTexture rt2, RenderTexture rt3)
-    {
-        cmd.SetComputeTextureParam(cs, kernel, "PrevReservoirRT0", rt0);
-        cmd.SetComputeTextureParam(cs, kernel, "PrevReservoirRT1", rt1);
-        cmd.SetComputeTextureParam(cs, kernel, "PrevReservoirRT2", rt2);
-        cmd.SetComputeTextureParam(cs, kernel, "PrevReservoirRT3", rt3);
-    }
-
-    private static void Swap(ref RenderTexture a, ref RenderTexture b)
-    {
-        RenderTexture tmp = a;
-        a = b;
-        b = tmp;
     }
 }
