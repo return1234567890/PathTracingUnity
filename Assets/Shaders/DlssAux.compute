@@ -1,0 +1,101 @@
+// URPPT DLSS 辅助数据计算着色器
+//
+// 只保留 MotionVector kernel：它不含任何路径追踪逻辑，仅把 native Vulkan 路径追踪
+// 写出的 GBufferPosDepth 重投影为 DLSS Ray Reconstruction 所需的两张辅助图：
+//   MotionVectorOut → 运动矢量（渲染分辨率 RG16F）
+//   LinearDepthOut  → 视空间线性距离（渲染分辨率 R32F）
+//
+// 说明：软件路径追踪（PathTrace / TemporalAccumulate / SpatialFilter / AntiFirefly /
+//       ReSTIR GI 全链路）与 tinybvh 依赖已全部移除；DLSS 只保留 RR（SR 的 NDC 深度输出已删）。
+
+#pragma kernel MotionVector
+
+// ── 常量缓冲（由 PathTraceRenderPass 注入） ──
+cbuffer PathTraceCB
+{
+    uint     Width;
+    uint     Height;
+    float    FarPlane;
+    uint     _cbPad0;
+};
+
+// ── 上一帧 viewProj（由渲染器注入） ──
+cbuffer TemporalCB
+{
+    float4x4 PrevViewProj;  // 上一帧 viewProj = prevProjection * prevView
+};
+
+// ── 当前帧 viewProj（world -> clip） ──
+// 全局 uniform，仅 MotionVector kernel 用于计算 NDC 深度与当前帧屏幕坐标
+float4x4 CurViewProj;      // Unity reversed-Z: near=1, far=0
+
+// ── G-buffer 输入（native Vulkan 路径追踪写入） ──
+// GBuffer0: worldPos.xyz + depth(hit.t)；miss 时 rgb=0,a=0
+Texture2D<float4> GBufferPosDepth;
+
+// ── 输出 ──
+RWTexture2D<float2> MotionVectorOut;  // 渲染分辨率 RG16F
+RWTexture2D<float>  LinearDepthOut;   // 渲染分辨率 R32F，视空间线性距离
+
+// ══════════════════════════════════════════════════════
+//  Kernel: MotionVector（DLSS RR：运动矢量 + 线性深度）
+//  读当前帧 GBufferPosDepth（worldPos + depth），用 PrevViewProj
+//  重投影到上一帧屏幕坐标，输出 prevUV - curUV（低分辨率 RG16F）。
+//  未命中/天空像素输出 (0,0)。
+//
+//  LinearDepthOut → 视空间线性距离 (curClip.w)，供 DLSS RR 使用。
+// ══════════════════════════════════════════════════════
+
+[numthreads(8, 8, 1)]
+void MotionVector(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    float4 gpd = GBufferPosDepth.Load(int3(id.xy, 0));
+    float  depth = gpd.a;
+
+    // 天空像素（miss）：线性远=FarPlane，无运动矢量
+    if (depth <= 0.0)
+    {
+        LinearDepthOut[id.xy] = FarPlane;
+        MotionVectorOut[id.xy] = float2(0.0, 0.0);
+        return;
+    }
+
+    float3 worldPos = gpd.rgb;
+
+    // 计算当前帧 clip 坐标（Unity reversed-Z: near=1, far=0）
+    float4 curClip = mul(CurViewProj, float4(worldPos, 1.0));
+    // 视空间线性距离 = clip.w（透视投影中 clip.w = -viewSpaceZ > 0）
+    LinearDepthOut[id.xy] = curClip.w;
+
+    // 重投影：worldPos -> 上一帧屏幕坐标
+    float4 prevClip = mul(PrevViewProj, float4(worldPos, 1.0));
+    if (prevClip.w <= 0.0)
+    {
+        MotionVectorOut[id.xy] = float2(0.0, 0.0);
+        return;
+    }
+
+    float2 prevNdc = prevClip.xy / prevClip.w;
+    float2 prevUV = prevNdc * 0.5 + 0.5;
+
+    // 超出屏幕边界：无有效运动矢量
+    if (any(prevUV < 0.0) || any(prevUV > 1.0))
+    {
+        MotionVectorOut[id.xy] = float2(0.0, 0.0);
+        return;
+    }
+
+    // 当前帧屏幕位置：同样通过投影 worldPos 得到（与 prevUV 对称）
+    // worldPos 由 jittered 光线命中，用未 jitter 的 CurViewProj 投影后
+    // 与用 PrevViewProj 投影的结果在静态相机时完全一致 → MV = 0。
+    // 不能用像素中心 (id+0.5)/resolution，因为 jittered 光线命中的 worldPos
+    // 投影后 ≈ (pixel+0.5+jitter)/resolution，与像素中心差一个 jitter → 静止抖动。
+    float2 curNdc = curClip.xy / curClip.w;
+    float2 curUV  = curNdc * 0.5 + 0.5;
+
+    // 运动矢量 = 上一帧位置 - 当前帧位置（DLSS 约定：MV = dst - src）
+    // DLSS 的 MV 表示「该像素从上一帧哪里来」，即 prevUV - curUV
+    MotionVectorOut[id.xy] = prevUV - curUV;
+}

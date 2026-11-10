@@ -18,7 +18,7 @@ public struct PathLight
 /// <summary>
 /// 场景光源收集管理器。
 /// 在游戏开始时收集场景中的 Light 组件，组装为 32B 对齐的 PathLight 数组，
-/// 供 RenderBufferManager 上传至 GPU 供 PathTrace.compute 使用。
+/// 由 ModelManager 随场景数据一并推送到 native Vulkan 插件（VPT_SceneUpdate.lights）。
 ///
 /// 光源类型映射：
 ///   LightType.Point       → type 0（点光源，带平方反比衰减）
@@ -45,11 +45,14 @@ public class LightManager : MonoBehaviour
             return;
         }
         Instance = this;
+        // 在 Awake 中收集光源，确保 ModelManager.Start() → PushToNative() 时 Lights 已就绪
+        // （Unity 不保证不同 MonoBehaviour 的 Start() 执行顺序）
+        CollectLights();
     }
 
     private void Start()
     {
-        CollectLights();
+        // CollectLights 已在 Awake 中调用，此处不再重复
     }
 
     private void OnDestroy()
