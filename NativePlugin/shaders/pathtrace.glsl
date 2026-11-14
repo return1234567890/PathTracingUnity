@@ -458,6 +458,18 @@ vec3 btdfEval(VPT_Material mat, vec3 N, vec3 T, vec3 B,
     }
 }
 
+// ── Base color sampling (tint * texture, RGBA) ──
+// URP Lit final base color is _BaseColor * _BaseMap, including alpha.
+// Both the main path and the transparent shadow traversal use this so that
+// opacity (transmission) and glass tint stay consistent.
+vec4 sampleBaseColor(VPT_Material mat, vec2 uvT)
+{
+    vec4 c = mat.albedo;
+    if ((mat.flags & MAT_HAS_BASE) != 0u && mat.baseTexID != TEX_NONE)
+        c *= texture(baseColorTex, vec3(uvT, float(mat.baseTexID)));
+    return c;
+}
+
 // ── Transparent shadow traversal: accumulate transmission through all layers ──
 // Returns rgb transmission: (1,1,1)=fully transparent, (0,0,0)=fully occluded
 vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT)
@@ -501,13 +513,25 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT)
         vec3 P = origin + dir * hitT;
 
         // ── 4. Opaque material: fully occluded, terminate ──
-        if ((mat.flags & MAT_IS_TRANSPARENT) == 0u || mat.transmission <= MIN_TRANSMISSION)
+        if ((mat.flags & MAT_IS_TRANSPARENT) == 0u)
+            return vec3(0.0);
+
+        // 与主路径一致：用命中点的重心坐标插值 UV，采样 _BaseMap 的 RGBA。
+        // alpha 决定该层透射率，RGB 用作玻璃染色；否则阴影不会带彩色玻璃的颜色，
+        // 且只读 SSBO 的 mat.transmission（C# 侧为 0）会永远判成全遮挡。
+        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+        vec2 hitUV = v0.uv * (1.0 - bary.x - bary.y) + v1.uv * bary.x + v2.uv * bary.y;
+        vec2 uvT = hitUV * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
+        vec4 base = sampleBaseColor(mat, uvT);
+
+        float trans = 1.0 - base.a;
+        if (trans <= MIN_TRANSMISSION)
             return vec3(0.0);
 
         // ── 5. Compute per-layer transmission (5 factors) ──
 
         // Factor A: base transmission
-        vec3 layerT = vec3(mat.transmission);
+        vec3 layerT = vec3(trans);
 
         // Factor B: Fresnel reflection loss
         float cosTheta = abs(dot(dir, Ngeo));
@@ -515,12 +539,12 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT)
         layerT *= (1.0 - fresnel);
 
         // Factor C: color tint
-        layerT *= mat.albedo.rgb;
+        layerT *= base.rgb;
 
         // Factor D: volume absorption (Beer's law) — only when propagating inside
         if (mat.thinWalled == 0u && isInside)
         {
-            vec3 absorbColor = max(mat.albedo.rgb, vec3(0.001));
+            vec3 absorbColor = max(base.rgb, vec3(0.001));
             vec3 absCoeff = -log(absorbColor) / max(mat.ior * 2.0, 0.1);
             layerT *= exp(-hitT * absCoeff);
             isInside = !isInside;
@@ -859,8 +883,10 @@ void main()
             // Sample textures and overwrite mat fields so BSDF functions use textured values
             vec3 emission = mat.emissionColor.rgb;
 
-            if ((mat.flags & MAT_HAS_BASE) != 0u && mat.baseTexID != TEX_NONE)
-                mat.albedo.rgb *= texture(baseColorTex, vec3(finalUV, float(mat.baseTexID))).rgb;
+            // ★ URP Lit 语义：_BaseColor * _BaseMap，RGBA 全乘。
+            // alpha 必须一起乘进来，否则 mat.albedo.a 恒为 _BaseColor.a(=1)，
+            // 后面的 transmission = 1 - albedo.a 会恒为 0（不透明）。
+            mat.albedo = sampleBaseColor(mat, finalUV);
 
             if ((mat.flags & MAT_HAS_MR) != 0u && mat.metalRoughTexID != TEX_NONE)
             {
