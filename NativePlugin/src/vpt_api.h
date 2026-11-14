@@ -98,6 +98,18 @@ extern "C" {
     /// 获取渲染回调函数指针（供 C# IssuePluginEvent 使用）
     UNITY_INTERFACE_EXPORT void* UNITY_INTERFACE_API VPT_GetRenderCallback();
 
+    // ── GPU 分段计时（vkCmdWriteTimestamp，调试用） ──────
+
+    /// 取回最近一帧完成的 GPU 分段耗时（毫秒）。
+    /// outMs 长度至少 7，索引：0 skin / 1 refit / 2 tlas / 3 pathtrace /
+    ///                          4 motion / 5 dlss / 6 total
+    /// 返回 1 = 有新数据（本帧取走），0 = 暂无（GPU 还没跑完，1~2 帧后才有）
+    UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API
+    VPT_GpuTimer_GetStats(float* outMs, int32_t maxCount, uint32_t* outFrameId);
+
+    /// 开关 GPU 计时（默认随初始化开启；关闭后不再写 timestamp）
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_GpuTimer_SetEnabled(int32_t enabled);
+
     // ── DLSS NGX 接口（Ray Reconstruction） ──────────────
 
     /// 初始化 NGX DLSS Ray Reconstruction feature

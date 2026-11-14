@@ -10,6 +10,7 @@
 #include "vpt_dispatch.h"
 #include "vpt_env.h"
 #include "vpt_dlss.h"
+#include "vpt_gpu_timer.h"
 
 #include <cstdio>
 
@@ -82,6 +83,9 @@ VPT_Initialize()
         fprintf(stderr, "[VPT] ConfigureEvent: PATHTRACE + DLSS events configured (EnsureOutside + QueueAccess_DontCare).\n");
     }
 
+    // GPU 分段计时：查询池建在 Unity 的 VkDevice 上（不支持时静默关闭）
+    VPTGpuTimer::Init(inst.device, inst.physicalDevice, inst.queueFamilyIndex);
+
     fprintf(stderr, "[VPT] VPT_Initialize succeeded. Device ready for RayQuery.\n");
     fflush(stderr);
     return 0;
@@ -97,6 +101,7 @@ VPT_Destroy()
     VPTDispatch::DestroyPathTracePipeline(VPT_GetInstance().device);
     VPTDispatch::DestroySharedResources(VPT_GetInstance().device);
     VPT_DLSS_Destroy_Internal();
+    VPTGpuTimer::Shutdown();
     VPTScene::DestroyResources();
     VPTEnv::DestroyResources();
     VPT_SetInitialized(false);
@@ -243,6 +248,19 @@ extern "C" UNITY_INTERFACE_EXPORT void* UNITY_INTERFACE_API
 VPT_GetRenderCallback()
 {
     return (void*)&VPT_RenderCallback;
+}
+
+// ── GPU 分段计时 ──────────────────────────────────────────
+extern "C" UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API
+VPT_GpuTimer_GetStats(float* outMs, int32_t maxCount, uint32_t* outFrameId)
+{
+    return VPTGpuTimer::GetStats(outMs, maxCount, outFrameId) ? 1 : 0;
+}
+
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
+VPT_GpuTimer_SetEnabled(int32_t enabled)
+{
+    VPTGpuTimer::SetEnabled(enabled != 0);
 }
 
 // ══════════════════════════════════════════════════════════════

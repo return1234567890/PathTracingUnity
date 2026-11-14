@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
@@ -26,6 +27,13 @@ using UnityEngine.Rendering.Universal;
 /// </summary>
 public class PathTraceRendererFeature : ScriptableRendererFeature
 {
+    [Header("生效范围")]
+    [Tooltip("仅对 Game 相机执行路径追踪：Scene View / 预览相机直接跳过。\n" +
+             "必须保持开启——否则 Scene View 会额外跑一份完整 PT，且两个相机分辨率不同会让\n" +
+             "PathTraceRenderPass 的 RenderTarget 与 DLSS feature 每帧互相踩状态、反复重建。\n" +
+             "关闭后所有使用本 Renderer 的相机都会执行 PT（仅调试用）。")]
+    public bool onlyGameCamera = true;
+
     [Header("路径追踪")]
     [Tooltip("DLSS 辅助数据计算着色器（只含 MotionVector kernel：G-buffer → 运动矢量 + 深度）。\n" +
              "仅在启用 DLSS 时需要；留空则关闭 DLSS 后仍可正常显示 PT 结果。")]
@@ -69,6 +77,14 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
 
     [Tooltip("质量模式：0=Quality(1.5x) 1=Balanced(1.7x) 2=Performance(2x) 3=UltraPerformance(3x)")]
     [Range(0, 3)] public int dlssQualityMode = 1;
+
+    [Header("GPU 计时（调试）")]
+    [Tooltip("每帧读取 native 侧 vkCmdWriteTimestamp 的分段耗时，并按间隔把平均占比打印到 Console。\n" +
+             "分段：蒙皮 / BLAS refit / TLAS / 路径追踪 / MotionVector / DLSS-RR。")]
+    public bool logGpuTiming = true;
+
+    [Tooltip("每隔多少帧汇总打印一次 GPU 分段平均耗时")]
+    [Range(10, 300)] public int gpuTimingLogInterval = 60;
 
     /// <summary>按质量模式计算精确渲染尺寸（输出像素 -> 渲染像素）。</summary>
     /// <remarks>RR 严格要求渲染分辨率精确匹配预设倍率（1.5/1.7/2/3x），否则 CreateFeature
@@ -129,6 +145,14 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
 
     public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
     {
+        // ── 生效范围：只让 Game 相机跑 PT ──
+        // 编辑器 Play 模式下 Scene View 相机同样会走 Renderer Feature。若不过滤：
+        //   1) PT 会被跑两遍（Game + Scene View），编辑器下 GPU 时间直接翻倍；
+        //   2) 两相机分辨率不同 → EnsureRTs 每帧释放重建 7 张 RT、
+        //      DLSS 每帧 Destroy + 重新 Init NGX（含 vkQueueWaitIdle），产生 ms 级尖峰。
+        if (onlyGameCamera && renderingData.cameraData.cameraType != CameraType.Game)
+            return;
+
         if (ModelManager.Instance == null)
             return;
 
@@ -220,6 +244,19 @@ public class PathTraceRenderPass : ScriptableRenderPass
 
     private bool _hasPrev;         // 是否已渲染过上一帧（DLSS reset 标志）
     private bool _warnedNoMotionVector;  // motionVectorShader 缺失只告警一次
+
+    // ── GPU 分段计时（native vkCmdWriteTimestamp → 每帧轮询，约 2 帧延迟） ──
+    private const int GpuStageCount = 7;
+    private static readonly string[] GpuStageNames =
+    {
+        "蒙皮", "BLAS refit", "TLAS", "路径追踪", "MotionVector", "DLSS-RR", "合计"
+    };
+    private readonly float[] _gpuMs = new float[GpuStageCount];
+    private readonly double[] _gpuSum = new double[GpuStageCount];
+    private int _gpuSamples;
+    private int _gpuEmptyFrames;
+    private bool _gpuTimingWarned;
+    private GCHandle _gpuPinned;
 
     /// <summary>当前 URP renderer 引用，由 feature 在 AddRenderPasses 中注入。</summary>
     public ScriptableRenderer Renderer { get; set; }
@@ -445,10 +482,63 @@ public class PathTraceRenderPass : ScriptableRenderPass
         context.ExecuteCommandBuffer(cmd);
         CommandBufferPool.Release(cmd);
 
+        // ── GPU 分段计时：轮询 native 侧结果（结果比当前帧晚 1~2 帧）──
+        if (_feature.logGpuTiming)
+            SampleGpuTiming();
+
         // ── 更新上一帧矩阵 ──
         _prevView = curView;
         _prevProj = curProj;
         _hasPrev = true;
+    }
+
+    /// <summary>
+    /// 轮询 native 的 GPU 分段耗时（vkCmdWriteTimestamp），累计后按间隔打印平均值与占比。
+    /// native 侧用 availability 位非阻塞读取，结果比当前帧晚 1~2 帧。
+    /// </summary>
+    private void SampleGpuTiming()
+    {
+        if (!_gpuPinned.IsAllocated)
+            _gpuPinned = GCHandle.Alloc(_gpuMs, GCHandleType.Pinned);
+
+        if (NativeBridge.VPT_GpuTimer_GetStats(_gpuPinned.AddrOfPinnedObject(),
+                                               GpuStageCount, out _) == 0)
+        {
+            // 连续多帧拿不到：多半是 native 侧不支持 timestamp（或旧 DLL 没重编）
+            if (!_gpuTimingWarned && ++_gpuEmptyFrames > 180)
+            {
+                _gpuTimingWarned = true;
+                Debug.LogWarning("[PT-GPU] 180 帧内没有收到 native 的 GPU 计时数据：" +
+                                 "确认已重新编译并替换 VulkanPathTracePlugin.dll，且 GPU/驱动支持 timestamp query。");
+            }
+            return;   // GPU 还没跑完，下一帧再取
+        }
+
+        _gpuEmptyFrames = 0;
+
+        for (int i = 0; i < GpuStageCount; i++)
+            _gpuSum[i] += _gpuMs[i];
+
+        if (++_gpuSamples < Mathf.Max(1, _feature.gpuTimingLogInterval))
+            return;
+
+        double total = _gpuSum[(int)NativeBridge.GpuStage.Total] / _gpuSamples;
+        var sb = new System.Text.StringBuilder(192);
+        sb.Append("[PT-GPU] ").Append(_gpuSamples).Append(" 帧平均 ")
+          .Append(total.ToString("F2")).Append(" ms | ");
+        for (int i = 0; i < GpuStageCount - 1; i++)
+        {
+            double ms = _gpuSum[i] / _gpuSamples;
+            double pct = total > 0.0001 ? ms / total * 100.0 : 0.0;
+            sb.Append(GpuStageNames[i]).Append(' ').Append(ms.ToString("F2")).Append("ms (")
+              .Append(pct.ToString("F0")).Append("%) | ");
+        }
+        sb.Append(GpuStageNames[GpuStageCount - 1]).Append(' ')
+          .Append(total.ToString("F2")).Append(" ms");
+        Debug.Log(sb.ToString());
+
+        Array.Clear(_gpuSum, 0, _gpuSum.Length);
+        _gpuSamples = 0;
     }
 
     /// <summary>将 Unity Matrix4x4 转换为行主序 float[16]</summary>
@@ -473,6 +563,9 @@ public class PathTraceRenderPass : ScriptableRenderPass
             NativeBridge.VPT_DLSS_Destroy();
             _dlssInitialized = false;
         }
+
+        if (_gpuPinned.IsAllocated)
+            _gpuPinned.Free();
 
         ReleaseRTs();
     }

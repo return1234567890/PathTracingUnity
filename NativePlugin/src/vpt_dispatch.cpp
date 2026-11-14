@@ -8,6 +8,7 @@
 #include "vpt_internal.h"
 #include "vpt_scene.h"
 #include "vpt_env.h"
+#include "vpt_gpu_timer.h"
 #include "pathtrace_spv.h"
 
 #include <cstdio>
@@ -912,14 +913,20 @@ void VPTDispatch::RenderCallback(int eventID)
 
     VkDevice device = VPT_GetInstance().device;
 
+    // ── GPU 计时：T0（本帧开始），随后每个阶段结束各打一个点 ──
+    VPTGpuTimer::BeginFrame(cmd);
+
     // ── 骨骼动画：GPU 蒙皮 dispatch（若有更新，须先于 refit/TLAS，蒙皮 compute 就地写统一顶点缓冲）──
     VPTScene::RecordGPUSkinningIfNeeded(cmd);
+    VPTGpuTimer::Mark(cmd);   // T1: 蒙皮结束
 
     // ── 骨骼动画：变形顶点上传 + BLAS refit（若有更新，需先于 TLAS 重建）──
     VPTScene::RecordBLASRefitIfNeeded(cmd);
+    VPTGpuTimer::Mark(cmd);   // T2: BLAS refit 结束
 
     // ── 动态场景：每帧 TLAS 重建（若本帧有实例更新，优先于 dispatch 录制）──
     VPTScene::RecordTLASUpdateIfNeeded(cmd);
+    VPTGpuTimer::Mark(cmd);   // T3: TLAS 重建结束
 
     // ── Barrier 1: UBO host write → compute read + 3 images → GENERAL ──
     VkBufferMemoryBarrier uboBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
@@ -976,6 +983,8 @@ void VPTDispatch::RenderCallback(int eventID)
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 0, nullptr, 0, nullptr, 5, imgBarriers);
+
+    VPTGpuTimer::Mark(cmd);   // T4: 路径追踪 dispatch 结束
 }
 
 bool VPTDispatch::IsDispatchPending() { return s_DispatchPending; }

@@ -12,6 +12,7 @@
 #include "vpt_dlss.h"
 #include "vpt_internal.h"
 #include "vpt_dispatch.h"  // EVENT_PATHTRACE
+#include "vpt_gpu_timer.h"
 
 #include "IUnityInterface.h"
 #include "IUnityGraphics.h"
@@ -692,6 +693,8 @@ void VPT_DLSS_RenderCallback()
         return;
     }
 
+    VPTGpuTimer::Mark(cmd);   // T5: DLSS 段开始（T4→T5 之间是 C# 侧的 MotionVector compute）
+
     // ── 包装 NGX 资源（共享） ──
     VkImageSubresourceRange subRange{};
     subRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -768,6 +771,8 @@ void VPT_DLSS_RenderCallback()
 
     result = NGX_VULKAN_EVALUATE_DLSSD_EXT(
         cmd, s_DLSSHandle, s_DLSSParams, &rrEval);
+
+    VPTGpuTimer::Mark(cmd);   // T6: DLSS Evaluate 结束（本帧最后一个标记）
 
     if (result != NVSDK_NGX_Result_Success)
         fprintf(stderr, "[VPT-DLSS] RR EvaluateFeature failed: 0x%x\n", result);

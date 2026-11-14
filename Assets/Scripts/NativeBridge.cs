@@ -513,4 +513,33 @@ public static class NativeBridge
             Marshal.FreeHGlobal(ptr);
         }
     }
+
+    // ── GPU 分段计时（vkCmdWriteTimestamp，调试用） ──────────
+
+    /// <summary>GPU 分段索引（与 native VPTGpuTimer::Stage 一一对应）</summary>
+    public enum GpuStage
+    {
+        Skin = 0,         // 开始 → GPU 蒙皮
+        BlasRefit = 1,    // 蒙皮 → BLAS refit
+        Tlas = 2,         // refit → TLAS 重建
+        PathTrace = 3,    // TLAS → PT dispatch 结束
+        MotionVector = 4, // PT → DLSS 回调开始
+        Dlss = 5,         // DLSS Evaluate
+        Total = 6,        // 开始 → 最后一个标记
+    }
+
+    /// <summary>
+    /// 取回最近一帧完成的 GPU 分段耗时（毫秒）。
+    /// native 侧结果要 1~2 帧后才可用，返回 0 表示暂无新数据（不是错误）。
+    /// </summary>
+    /// <param name="outMs">至少 7 个 float 的非托管缓冲（调用方 pin 住）</param>
+    /// <param name="maxCount">缓冲长度</param>
+    /// <param name="frameId">结果对应的帧序号（native 内部递增 ID）</param>
+    /// <returns>1=有新数据，0=暂无</returns>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern int VPT_GpuTimer_GetStats(IntPtr outMs, int maxCount, out uint frameId);
+
+    /// <summary>开关 native 侧 GPU 计时（关闭后不再写 timestamp）</summary>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_GpuTimer_SetEnabled(int enabled);
 }
