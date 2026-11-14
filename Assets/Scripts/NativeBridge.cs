@@ -10,7 +10,8 @@ using UnityEngine;
 /// 使用流程:
 ///   1. Unity 启动后调用 VPT_Initialize()，检查 Vulkan RT Core 支持
 ///   2. ModelManager 场景构建后调用 VPT_UpdateScene() 推送数据
-///   3. PathTraceRendererFeature 每帧调用 VPT_DispatchPathTrace()
+///   3. PathTraceRendererFeature 每帧调用 PrepareDispatch() 并 IssuePluginEvent
+///      （旧的一次性 VPT_DispatchPathTrace 直连路径已删除，见 §7.6/§10⑦）
 ///   4. 应用退出时调用 VPT_Destroy()
 /// </summary>
 public static class NativeBridge
@@ -97,30 +98,6 @@ public static class NativeBridge
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_SetDeformableRebuildInterval(uint interval);
 
-    /// <summary>执行路径追踪 dispatch（阶段4）</summary>
-    /// <param name="outputPtr">输出 RT 原生指针</param>
-    /// <param name="gbuf0Ptr">G-Buffer0 (pos+depth) RT 原生指针</param>
-    /// <param name="gbuf1Ptr">G-Buffer1 (normal+rough) RT 原生指针</param>
-    /// <param name="diffuseAlbedoPtr">Diffuse Albedo RT 原生指针（RR 材质分解）</param>
-    /// <param name="specularAlbedoPtr">Specular Albedo RT 原生指针（RR 材质分解）</param>
-    /// <param name="baseColorPtr">BaseColor Texture2DArray 原生指针</param>
-    /// <param name="metallicRoughPtr">MetallicSmooth Texture2DArray 原生指针</param>
-    /// <param name="normalPtr">Normal Texture2DArray 原生指针</param>
-    /// <param name="emissivePtr">Emissive Texture2DArray 原生指针</param>
-    /// <param name="width">渲染宽度</param>
-    /// <param name="height">渲染高度</param>
-    /// <param name="cameraData">指向 VPT_CameraData 结构的指针</param>
-    /// <param name="lightCount">场景光源数量</param>
-    /// <param name="samplesPerPixel">每帧采样数</param>
-    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
-    public static extern void VPT_DispatchPathTrace(
-        IntPtr outputPtr, IntPtr gbuf0Ptr, IntPtr gbuf1Ptr,
-        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr,
-        IntPtr baseColorPtr, IntPtr metallicRoughPtr, IntPtr normalPtr, IntPtr emissivePtr,
-        int width, int height,
-        IntPtr cameraData,
-        int lightCount, int samplesPerPixel);
-
     // ── Plan B: Two-phase dispatch (eliminates vkQueueWaitIdle) ──────────
 
     /// <summary>渲染事件 ID：路径追踪 dispatch</summary>
@@ -132,7 +109,6 @@ public static class NativeBridge
     /// <summary>
     /// Phase 1: 准备路径追踪 dispatch（在 IssuePluginEvent 之前调用）。
     /// 访问 Unity 纹理、填充 UBO、更新描述符集，不提交命令缓冲。
-    /// 参数与 VPT_DispatchPathTrace 完全一致。
     /// </summary>
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_PrepareDispatch(
@@ -151,60 +127,6 @@ public static class NativeBridge
     public static extern IntPtr VPT_GetRenderCallback();
 
     // ── 便捷方法 ──────────────────────────────────────────
-
-    /// <summary>
-    /// 执行路径追踪 dispatch，直接写入 5 张 Unity RenderTexture 的 VkImage。
-    /// 同时绑定 4 张 Texture2DArray 供 shader 采样。
-    /// 无 CPU 回读 — compute shader 通过 imageStore 直接写入 GPU 显存。
-    /// </summary>
-    /// <param name="outputRT">输出 RT（ARGBHalf）</param>
-    /// <param name="gbuf0RT">G-Buffer0 RT（ARGBFloat, pos+depth）</param>
-    /// <param name="gbuf1RT">G-Buffer1 RT（ARGBHalf, normal+rough）</param>
-    /// <param name="diffuseAlbedoRT">Diffuse Albedo RT（ARGBHalf, albedo*(1-metallic)）</param>
-    /// <param name="specularAlbedoRT">Specular Albedo RT（ARGBHalf, EnvBRDFApprox）</param>
-    /// <param name="baseColorArr">BaseColor Texture2DArray</param>
-    /// <param name="metallicRoughArr">MetallicSmooth Texture2DArray</param>
-    /// <param name="normalArr">Normal Texture2DArray</param>
-    /// <param name="emissiveArr">Emissive Texture2DArray</param>
-    /// <param name="width">渲染宽度</param>
-    /// <param name="height">渲染高度</param>
-    /// <param name="cameraData">已填充好的相机数据</param>
-    /// <param name="lightCount">场景光源数量</param>
-    /// <param name="samplesPerPixel">每帧采样数（SPP）</param>
-    public static void DispatchPathTrace(
-        UnityEngine.RenderTexture outputRT, UnityEngine.RenderTexture gbuf0RT, UnityEngine.RenderTexture gbuf1RT,
-        UnityEngine.RenderTexture diffuseAlbedoRT, UnityEngine.RenderTexture specularAlbedoRT,
-        UnityEngine.Texture2DArray baseColorArr, UnityEngine.Texture2DArray metallicRoughArr,
-        UnityEngine.Texture2DArray normalArr, UnityEngine.Texture2DArray emissiveArr,
-        int width, int height, ref VPT_CameraData cameraData,
-        int lightCount, int samplesPerPixel)
-    {
-        IntPtr outputPtr = outputRT.GetNativeTexturePtr();
-        IntPtr gbuf0Ptr  = gbuf0RT.GetNativeTexturePtr();
-        IntPtr gbuf1Ptr  = gbuf1RT.GetNativeTexturePtr();
-        IntPtr diffuseAlbedoPtr  = diffuseAlbedoRT.GetNativeTexturePtr();
-        IntPtr specularAlbedoPtr = specularAlbedoRT.GetNativeTexturePtr();
-
-        IntPtr baseColorPtr    = baseColorArr    != null ? baseColorArr.GetNativeTexturePtr()    : IntPtr.Zero;
-        IntPtr metallicRoughPtr = metallicRoughArr != null ? metallicRoughArr.GetNativeTexturePtr() : IntPtr.Zero;
-        IntPtr normalPtr       = normalArr       != null ? normalArr.GetNativeTexturePtr()       : IntPtr.Zero;
-        IntPtr emissivePtr     = emissiveArr     != null ? emissiveArr.GetNativeTexturePtr()     : IntPtr.Zero;
-
-        int camSize = Marshal.SizeOf<VPT_CameraData>();
-        IntPtr camPtr = Marshal.AllocHGlobal(camSize);
-        try
-        {
-            Marshal.StructureToPtr(cameraData, camPtr, false);
-            VPT_DispatchPathTrace(outputPtr, gbuf0Ptr, gbuf1Ptr,
-                diffuseAlbedoPtr, specularAlbedoPtr,
-                baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
-                width, height, camPtr, lightCount, samplesPerPixel);
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(camPtr);
-        }
-    }
 
     /// <summary>
     /// Plan B: 准备路径追踪 dispatch 并返回渲染回调指针。

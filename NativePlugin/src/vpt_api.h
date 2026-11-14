@@ -52,22 +52,6 @@ extern "C" {
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_SetDeformableRebuildInterval(
         uint32_t interval);
 
-    /// 执行路径追踪 dispatch（阶段4）
-    /// outputPtr/gbuf0Ptr/gbuf1Ptr: Unity RenderTexture 的原生指针（输出/G-Buffer）
-    /// diffuseAlbedoPtr/specularAlbedoPtr: DLSS RR albedo G-buffer RT 指针
-    /// baseColorPtr/metallicRoughPtr/normalPtr/emissivePtr: Unity Texture2DArray 的原生指针
-    /// width/height: 渲染尺寸
-    /// cameraData: 指向 VPT_CameraData 结构的指针
-    /// lightCount: 场景光源数量（NEE 用）
-    /// samplesPerPixel: 每帧采样数（SPP）
-    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_DispatchPathTrace(
-        void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
-        void* diffuseAlbedoPtr, void* specularAlbedoPtr,
-        void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
-        int32_t width, int32_t height,
-        const VPT_CameraData* cameraData,
-        int32_t lightCount, int32_t samplesPerPixel);
-
     /// 查询设备 RT Core 支持状态
     /// 返回: 1=支持 VK_KHR_ray_query, 0=不支持
     UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_QueryRayQuerySupport();

@@ -2,7 +2,7 @@
 //
 // 阶段1: 初始化/销毁 + 扩展查询
 // 阶段2: VPT_UpdateScene → vpt_scene 场景数据上传 + BLAS/TLAS
-// 阶段3: VPT_DispatchPathTrace → Slang compute pipeline
+// 阶段3: 路径追踪只走 Plan B（VPT_PrepareDispatch + VPT_RenderCallback）
 
 #include "vpt_api.h"
 #include "vpt_internal.h"
@@ -62,7 +62,9 @@ VPT_Initialize()
     }
 
     VPT_SetInitialized(true);
-    VPTDispatch::InitSharedResources(inst.device);
+
+    // 环境光占位资源（1×1 黑色 + 全零 alias 表）先建好，保证 binding 16/17 永远可绑
+    VPTEnv::InitFallback(inst.device, inst.physicalDevice);
     VPTDispatch::InitPathTracePipeline(inst.device, inst.physicalDevice);
 
     // ── Configure rendering event for Plan B (CommandRecordingState) ──
@@ -99,11 +101,10 @@ VPT_Destroy()
         return;
 
     VPTDispatch::DestroyPathTracePipeline(VPT_GetInstance().device);
-    VPTDispatch::DestroySharedResources(VPT_GetInstance().device);
     VPT_DLSS_Destroy_Internal();
     VPTGpuTimer::Shutdown();
     VPTScene::DestroyResources();
-    VPTEnv::DestroyResources();
+    VPTEnv::Shutdown();          // HDR 贴图 + 占位资源 + sampler
     VPT_SetInitialized(false);
     fprintf(stderr, "[VPT] VPT_Destroy: resources released.\n");
 }
@@ -159,33 +160,6 @@ VPT_SetDeformableRebuildInterval(uint32_t interval)
         return;
 
     VPTScene::SetDeformableRebuildInterval(interval);
-}
-
-// ── VPT_DispatchPathTrace（阶段3实现）─────────────────────
-extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
-VPT_DispatchPathTrace(
-    void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
-    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
-    void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
-    int32_t width, int32_t height,
-    const VPT_CameraData* cameraData,
-    int32_t lightCount, int32_t samplesPerPixel)
-{
-    if (!VPT_IsInitialized() || !cameraData || !outputPtr || !gbuf0Ptr || !gbuf1Ptr
-        || !diffuseAlbedoPtr || !specularAlbedoPtr)
-        return;
-    if (!VPTDispatch::IsPathTraceReady())
-        VPTDispatch::InitPathTracePipeline(VPT_GetInstance().device, VPT_GetInstance().physicalDevice);
-    if (!VPTDispatch::IsPathTraceReady())
-    {
-        fprintf(stderr, "[VPT] VPT_DispatchPathTrace: pipeline not ready\n");
-        return;
-    }
-    VPTDispatch::DispatchPathTrace(outputPtr, gbuf0Ptr, gbuf1Ptr,
-        diffuseAlbedoPtr, specularAlbedoPtr,
-        baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
-        width, height, *cameraData,
-        (uint32_t)lightCount, (uint32_t)samplesPerPixel);
 }
 
 // ── VPT_QueryRayQuerySupport ──────────────────────────────

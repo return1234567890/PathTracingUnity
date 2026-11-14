@@ -559,6 +559,8 @@ static bool EnsureTLASResources(VkDevice device, VkPhysicalDevice gpu, uint32_t 
 }
 
 // CPU 侧：把实例数据写入指定槽位的 host 映射内存（零分配、零同步）
+static bool s_InvalidBlasIDWarned = false;   // 越界 blasID 只告警一次（避免每帧刷屏）
+
 static void WriteInstanceData(const VPT_InstanceData* instances, int32_t instanceCount, uint32_t ringIdx)
 {
     VkDeviceSize instOff = (VkDeviceSize)ringIdx * s_InstanceCapacity * sizeof(VkAccelerationStructureInstanceKHR);
@@ -569,13 +571,32 @@ static void WriteInstanceData(const VPT_InstanceData* instances, int32_t instanc
     auto* infoData = reinterpret_cast<InstanceInfo*>(
         (uint8_t*)s_InstanceInfoStagingMapped + infoOff);
 
+    const uint32_t blasCount = (uint32_t)s_BLASes.size();
+    if (blasCount == 0) return;   // 没有 BLAS 就没有实例可写，避免退化到 0 号也越界
+
     for (int32_t i = 0; i < instanceCount; i++)
     {
         const VPT_InstanceData& src = instances[i];
         VkAccelerationStructureInstanceKHR& dst = vkInstances[i];
 
+        // ── blasID 边界检查（§10⑤）：越界 = 越界读 + 野 AS 地址，
+        //    vkCmdBuildAccelerationStructuresKHR 拿到垃圾 device address 会直接崩驱动。
+        //    处理策略：告警一次 + 退化到第 0 个 BLAS（画面错但不会崩）。
+        uint32_t blasID = src.blasID;
+        if (blasID >= blasCount || blasID >= s_MeshVertexOffsets.size())
+        {
+            if (!s_InvalidBlasIDWarned)
+            {
+                fprintf(stderr, "[VPT] WARN: instance %d has invalid blasID %u "
+                                "(blasCount=%u); clamping to 0.\n",
+                        i, src.blasID, blasCount);
+                s_InvalidBlasIDWarned = true;
+            }
+            blasID = 0;
+        }
+
         VkAccelerationStructureDeviceAddressInfoKHR addrInfo{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR };
-        addrInfo.accelerationStructure = s_BLASes[src.blasID].handle;
+        addrInfo.accelerationStructure = s_BLASes[blasID].handle;
         dst.accelerationStructureReference = pfn_vkGetAccelerationStructureDeviceAddressKHR(s_Device, &addrInfo);
 
         memcpy(&dst.transform, src.transform, sizeof(float) * 12);
@@ -589,8 +610,8 @@ static void WriteInstanceData(const VPT_InstanceData* instances, int32_t instanc
         memcpy(infoData[i].transformRow0, &src.transform[0], sizeof(float) * 4);
         memcpy(infoData[i].transformRow1, &src.transform[4], sizeof(float) * 4);
         memcpy(infoData[i].transformRow2, &src.transform[8], sizeof(float) * 4);
-        infoData[i].vertexOffset = s_MeshVertexOffsets[src.blasID];
-        infoData[i].indexOffset  = s_MeshIndexOffsets[src.blasID];
+        infoData[i].vertexOffset = s_MeshVertexOffsets[blasID];
+        infoData[i].indexOffset  = s_MeshIndexOffsets[blasID];
         infoData[i].materialID   = src.materialID;
         infoData[i].pad          = 0;
     }

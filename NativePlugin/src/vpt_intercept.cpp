@@ -52,35 +52,36 @@ static VkResult VKAPI_CALL InterceptedCreateDevice(
         return false;
     };
 
-    auto AddIfMissing = [&](const char* name) {
+    // 返回值表示「这条扩展最终是否在启用列表里」（已由 Unity 启用也算）
+    auto AddIfMissing = [&](const char* name) -> bool {
         for (const char* ext : extensions)
-            if (strcmp(ext, name) == 0) return;
-        if (IsSupported(name))
-            extensions.push_back(name);
-        else
-            fprintf(stderr, "[VPT] WARN: GPU doesn't support %s\n", name);
+            if (strcmp(ext, name) == 0) return true;
+        if (IsSupported(name)) { extensions.push_back(name); return true; }
+        fprintf(stderr, "[VPT] WARN: GPU doesn't support %s\n", name);
+        return false;
     };
 
-    // 按依赖顺序添加
-    AddIfMissing(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
-    AddIfMissing(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
-    AddIfMissing(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
-    AddIfMissing(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    // 按依赖顺序添加（deferred_host_operations → BDA → AS → ray_query）
+    const bool hasDeferred = AddIfMissing(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+    const bool hasBda      = AddIfMissing(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+    const bool hasAccel    = AddIfMissing(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    const bool hasRayQuery = AddIfMissing(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    (void)hasDeferred;  // 前两个扩展没有对应 feature 结构，仅扩展名即可
 
     // 3. 构建特性链 (pNext chain)
-    //    特性必须通过 pNext 显式启用
+    //    特性必须通过 pNext 显式启用：只启用扩展名不会自动打开 feature 位。
+    //    只为本机可用的扩展链入对应结构 —— 否则在不支持 AS 的设备上
+    //    vkCreateDevice 会因 VK_ERROR_FEATURE_NOT_PRESENT 直接失败。
     VkPhysicalDeviceBufferDeviceAddressFeaturesKHR bdaFeatures{};
     bdaFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;
     bdaFeatures.bufferDeviceAddress = VK_TRUE;
 
     VkPhysicalDeviceAccelerationStructureFeaturesKHR accelFeatures{};
     accelFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
-    accelFeatures.pNext = &bdaFeatures;
     accelFeatures.accelerationStructure = VK_TRUE;
 
     VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
     rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
-    rayQueryFeatures.pNext = &accelFeatures;
     rayQueryFeatures.rayQuery = VK_TRUE;
 
     // 4. 组装修改后的 VkDeviceCreateInfo
@@ -88,15 +89,47 @@ static VkResult VKAPI_CALL InterceptedCreateDevice(
     createInfo.enabledExtensionCount = (uint32_t)extensions.size();
     createInfo.ppEnabledExtensionNames = extensions.data();
 
-    // 将特性链插入 pNext 头部
-    // 结构顺序: rayQuery -> accel -> bda -> (Unity 原有 pNext 链)
-    rayQueryFeatures.pNext = (void*)createInfo.pNext;
-    createInfo.pNext = &rayQueryFeatures;
+    // 5. 把我们的特性链插到 pNext 头部，**链尾接回 Unity 原有 pNext 链**
+    //    结构顺序: rayQuery -> accel -> bda -> (Unity 原有 pNext 链)
+    //    ⚠ 关键点：只能改「我们自己这条链」的尾指针；把 rayQueryFeatures.pNext
+    //    直接指向 Unity 原链会把 accelFeatures/bdaFeatures 从链上摘掉。
+    //
+    //    另外，同一 sType 在 pNext 链里出现两次属于规范违背（验证层报
+    //    duplicate structure），所以 Unity 已经链了同类结构时跳过我们自己那份。
+    auto ChainHas = [](const void* pNext, VkStructureType type) -> bool {
+        const VkBaseInStructure* p = reinterpret_cast<const VkBaseInStructure*>(pNext);
+        for (int guard = 0; p != nullptr && guard < 64; guard++)
+        {
+            if (p->sType == type) return true;
+            p = p->pNext;
+        }
+        return false;
+    };
 
-    fprintf(stderr, "[VPT] InterceptedCreateDevice: %u extensions (orig %u), RT features injected\n",
-            (uint32_t)extensions.size(), pCreateInfo->enabledExtensionCount);
+    void* chainHead = const_cast<void*>(createInfo.pNext);   // 先指向 Unity 原链
+    if (hasBda && !ChainHas(pCreateInfo->pNext, bdaFeatures.sType))
+    {
+        bdaFeatures.pNext = chainHead;
+        chainHead = &bdaFeatures;
+    }
+    if (hasAccel && !ChainHas(pCreateInfo->pNext, accelFeatures.sType))
+    {
+        accelFeatures.pNext = chainHead;
+        chainHead = &accelFeatures;
+    }
+    if (hasRayQuery && !ChainHas(pCreateInfo->pNext, rayQueryFeatures.sType))
+    {
+        rayQueryFeatures.pNext = chainHead;
+        chainHead = &rayQueryFeatures;
+    }
+    createInfo.pNext = chainHead;
 
-    // 5. 调用真正的 vkCreateDevice（打印最终启用的扩展列表，供 NGX 扩展需求对比）
+    fprintf(stderr, "[VPT] InterceptedCreateDevice: %u extensions (orig %u), features injected "
+                    "(bda=%d accel=%d rayQuery=%d)\n",
+            (uint32_t)extensions.size(), pCreateInfo->enabledExtensionCount,
+            (int)hasBda, (int)hasAccel, (int)hasRayQuery);
+
+    // 6. 调用真正的 vkCreateDevice（打印最终启用的扩展列表，供 NGX 扩展需求对比）
     fprintf(stderr, "[VPT] Device extensions enabled (%u):\n", (uint32_t)extensions.size());
     for (const char* ext : extensions)
         fprintf(stderr, "[VPT]   %s\n", ext);

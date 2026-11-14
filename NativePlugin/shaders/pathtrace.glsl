@@ -34,12 +34,12 @@ layout(set = 0, binding = 4, std140, row_major) uniform CameraUBO {
     mat4 projInv;        // inverse projection
     vec4 posFov;         // xyz = camera position, w = fov
     vec4 jitterNearFar;  // xy = jitter, z = near plane, w = far plane
-    ivec4 frameMaxDepth; // x = frameCount, y = maxDepth
+    ivec4 frameMaxDepth; // x = frameCount, y = maxDepth, z = envReady(1=HDR 已上传)
     vec4 ambientPad;     // xyz = ambient color, w = pad
     uint lightCount;
     uint samplesPerPixel;
     float envIntensity;   // HDR env intensity multiplier
-    float envRotation;    // HDR env rotation in radians
+    float envRotation;    // HDR env 绕 Y 轴旋转，单位弧度（C# 侧已 Deg2Rad，UBO 原样存）
 } cam;
 
 // ── SSBOs ─────────────────────────────────────────────────────
@@ -766,9 +766,7 @@ vec2 sphericalUV(vec3 dir)
 void main()
 {
     uvec2 pixel = gl_GlobalInvocationID.xy;
-    uint width  = uint(cam.posFov.w > 0.0 ? cam.posFov.w : 0.0); // placeholder, use actual width
-    // We store resolution in jitterNearFar? No. Let's use a simpler approach:
-    // The actual width/height come from the image extents.
+    // 分辨率只从输出图尺寸取（cam.posFov.w 是 fov，不是宽度）
     ivec2 imgSize = imageSize(outputImg);
     if (pixel.x >= uint(imgSize.x) || pixel.y >= uint(imgSize.y)) return;
     uint w = uint(imgSize.x);
@@ -791,6 +789,8 @@ void main()
     uint  frameCount = uint(cam.frameMaxDepth.x);
     uint  spp        = max(cam.samplesPerPixel, 1u);
     vec3  ambient    = cam.ambientPad.xyz;
+    // HDR 未上传时（占位图是 1×1 黑色）走常数 ambient 回退，详见 §10②
+    bool  hasEnv     = (cam.frameMaxDepth.z != 0);
     uint  lightCount = cam.lightCount;
 
     vec3 finalRadiance = vec3(0.0);
@@ -829,8 +829,11 @@ void main()
                     imageStore(specularAlbedoImg, ivec2(pixel.x, int(h) - 1 - int(pixel.y)),
                                vec4(0.5, 0.5, 0.5, 1.0));
                 }
-                // HDR env lookup via sphericalUV；若 envHdrTex 未绑定则回退常数 ambient
-                vec3 envColor = texture(envHdrTex, sphericalUV(rayDir)).rgb * cam.envIntensity;
+                // HDR env lookup via sphericalUV；HDR 未上传时回退常数 ambient，
+                // 不再依赖「未写描述符」的未定义行为（binding 16 始终绑占位图）。
+                vec3 envColor = hasEnv
+                    ? texture(envHdrTex, sphericalUV(rayDir)).rgb * cam.envIntensity
+                    : ambient;
                 radiance += throughput * envColor;
                 break;
             }
@@ -962,12 +965,14 @@ void main()
                              * float(lightCount) * 2.0;
                 }
             }
-            else
+            else if (hasEnv)
             {
                 // ── HDR 环境光分支：importance 采样（alias method）──
                 // 用 environmentSample 取代 uniform 半球 + 常数 ambient。
                 // 返回 vec4(radiance, pdf)，radiance 已含 envIntensity，方向含 envRotation。
                 // 贡献: bsdf × NdotL × (radiance/pdf) × shadowTrans × 2.0（coin weight 1/0.5）
+                // HDR 未上传时该分支直接跳过：环境贡献已由 miss 分支的常数 ambient 承担，
+                // 再走一遍占位图只会得到 0 贡献（并让 pdf 变成 1e-6 的除法）。
                 vec3 envRand = vec3(rand(seed), rand(seed), rand(seed));
                 vec3 toL;
                 vec4 envSample = environmentSample(envHdrTex, envRand, toL);

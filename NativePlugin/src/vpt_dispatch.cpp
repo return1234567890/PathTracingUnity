@@ -16,16 +16,7 @@
 #include <vector>
 
 // ═══════════════════════════════════════════════════════════
-//  Shared GPU state (created once)
-// ═══════════════════════════════════════════════════════════
-
-// 命令池：供直连 dispatch 路径（DispatchPathTrace）复用，重置而非逐帧创建/销毁
-static VkCommandPool  s_CmdPool         = VK_NULL_HANDLE;
-
-static bool s_Ready = false;
-
-// ═══════════════════════════════════════════════════════════
-//  PathTrace pipeline state (Phase 3)
+//  PathTrace pipeline state (Phase 3) 与 ImageView 缓存
 // ═══════════════════════════════════════════════════════════
 static VkDescriptorSetLayout s_PathDSLayout   = VK_NULL_HANDLE;
 static VkPipelineLayout      s_PathPipeLayout = VK_NULL_HANDLE;
@@ -39,8 +30,11 @@ static bool s_PathReady = false;
 
 // Cached ImageViews for 5 output textures (recreated when VkImage changes)
 struct ImageViewCache {
-    VkImageView view = VK_NULL_HANDLE;
-    VkImage     image = VK_NULL_HANDLE;
+    VkImageView   view   = VK_NULL_HANDLE;
+    VkImage       image  = VK_NULL_HANDLE;
+    // 该图在本插件看来当前所处的布局（Phase 1 从 AccessTexture 取回，
+    // Phase 2 的 barrier 用它当 oldLayout；切到 SHADER_READ_ONLY 后同步更新）。
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 // [0]=output, [1]=gbuffer0, [2]=gbuffer1, [3]=diffuseAlbedo(RR), [4]=specularAlbedo(RR)
 static ImageViewCache s_OutputViews[5];
@@ -120,40 +114,8 @@ struct PathTraceCameraUBO
 };
 
 // ═══════════════════════════════════════════════════════════
-//  Shared resource initialization
-// ═══════════════════════════════════════════════════════════
-
-void VPTDispatch::InitSharedResources(VkDevice device)
-{
-    if (s_Ready) return;
-
-    // 命令池（复用：重置而非逐帧创建/销毁，直连 dispatch 路径使用）
-    VkCommandPoolCreateInfo poolCI{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    poolCI.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    poolCI.queueFamilyIndex = VPT_GetInstance().queueFamilyIndex;
-    VkResult res = vkCreateCommandPool(device, &poolCI, nullptr, &s_CmdPool);
-    if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] Command pool create failed: %d\n", res); return; }
-
-    s_Ready = true;
-}
-
-// ═══════════════════════════════════════════════════════════
-//  Cleanup
-// ═══════════════════════════════════════════════════════════
-
-void VPTDispatch::DestroySharedResources(VkDevice device)
-{
-    if (!s_Ready) return;
-    vkDeviceWaitIdle(device);
-
-    if (s_CmdPool) { vkDestroyCommandPool(device, s_CmdPool, nullptr); s_CmdPool = VK_NULL_HANDLE; }
-
-    s_Ready = false;
-}
-
-// ═══════════════════════════════════════════════════════════
 //  PathTrace pipeline initialization (Phase 3)
-//  10 bindings: TLAS + 3 images + UBO + 5 SSBOs
+//  18 bindings: TLAS + 5 images + UBO + 6 SSBOs + 5 samplers + 1 env SSBO
 // ═══════════════════════════════════════════════════════════
 
 void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
@@ -261,6 +223,12 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
 
 // ═══════════════════════════════════════════════════════════
 //  Helper: access Unity texture and ensure ImageView exists
+//
+//  ObserveOnly：Unity 只回报句柄，不插 barrier（同步由插件负责）。
+//  图片布局由插件自己跟踪：每次 dispatch 结束都会把它恢复到
+//  SHADER_READ_ONLY_OPTIMAL，所以下一帧的 oldLayout 就是那个值；
+//  只有换了 VkImage 句柄（RT 重建/分辨率变化）才退回 UNDEFINED。
+//  硬编码 UNDEFINED 会「丢弃已有内容」（§10④）。
 // ═══════════════════════════════════════════════════════════
 static bool EnsureImageView(IUnityGraphicsVulkan* vulkan, VkDevice device,
                            void* nativeTex, int slot)
@@ -298,8 +266,14 @@ static bool EnsureImageView(IUnityGraphicsVulkan* vulkan, VkDevice device,
             fprintf(stderr, "[VPT] Path: vkCreateImageView slot %d failed: %d\n", slot, res);
             return false;
         }
-        s_OutputViews[slot].image = vkImg.image;
+        s_OutputViews[slot].image  = vkImg.image;
+        s_OutputViews[slot].layout = VK_IMAGE_LAYOUT_UNDEFINED;   // 新句柄：内容无意义，允许丢弃
     }
+
+    // 注意：这里**不**采信 vkImg.layout。Unity 的布局跟踪不包含插件在
+    // AccessTexture(ObserveOnly) 之外做的布局转换，所以它可能永远停在 UNDEFINED
+    // （例如 _outputRT 只被 NGX 通过插件自己的 view 读取时），
+    // 用了它等于没修「每帧丢弃内容」。插件自己记录的布局才是可信的那份。
     return true;
 }
 
@@ -356,311 +330,10 @@ static bool EnsureTextureArrayView(
 }
 
 // ═══════════════════════════════════════════════════════════
-//  DispatchPathTrace — multi-bounce PBR path tracing
-// ═══════════════════════════════════════════════════════════
-
-void VPTDispatch::DispatchPathTrace(
-    void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
-    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
-    void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
-    int32_t width, int32_t height,
-    const VPT_CameraData& cameraData,
-    uint32_t lightCount, uint32_t samplesPerPixel)
-{
-    if (!s_PathReady || !outputPtr || !gbuf0Ptr || !gbuf1Ptr || !diffuseAlbedoPtr || !specularAlbedoPtr
-        || width <= 0 || height <= 0)
-        return;
-
-    const UnityVulkanInstance& inst = VPT_GetInstance();
-    VkDevice device = inst.device;
-    IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
-
-    VkAccelerationStructureKHR tlas = VPTScene::GetTLAS();
-    if (tlas == VK_NULL_HANDLE)
-    {
-        fprintf(stderr, "[VPT] DispatchPathTrace: TLAS not ready\n");
-        return;
-    }
-
-    // ── Access 5 Unity RenderTextures as VkImages (write) ──
-    if (!EnsureImageView(vulkan, device, outputPtr, 0)) return;
-    if (!EnsureImageView(vulkan, device, gbuf0Ptr,  1)) return;
-    if (!EnsureImageView(vulkan, device, gbuf1Ptr,  2)) return;
-    if (!EnsureImageView(vulkan, device, diffuseAlbedoPtr,  3)) return;
-    if (!EnsureImageView(vulkan, device, specularAlbedoPtr, 4)) return;
-
-    // ── Access 4 Unity Texture2DArrays as VkImages (read) ──
-    if (baseColorPtr)    EnsureTextureArrayView(vulkan, device, baseColorPtr,    0);
-    if (metallicRoughPtr) EnsureTextureArrayView(vulkan, device, metallicRoughPtr, 1);
-    if (normalPtr)       EnsureTextureArrayView(vulkan, device, normalPtr,       2);
-    if (emissivePtr)     EnsureTextureArrayView(vulkan, device, emissivePtr,     3);
-
-    // ── Fill PathTraceCameraUBO from VPT_CameraData ──
-    PathTraceCameraUBO ubo{};
-    memcpy(ubo.viewInv,  cameraData.viewInv,  64);
-    memcpy(ubo.projInv,  cameraData.projInv,  64);
-    ubo.posFov[0] = cameraData.position[0];
-    ubo.posFov[1] = cameraData.position[1];
-    ubo.posFov[2] = cameraData.position[2];
-    ubo.posFov[3] = cameraData.fov;
-    ubo.jitterNearFar[0] = cameraData.jitter[0];
-    ubo.jitterNearFar[1] = cameraData.jitter[1];
-    ubo.jitterNearFar[2] = cameraData.nearPlane;
-    ubo.jitterNearFar[3] = cameraData.farPlane;
-    ubo.frameMaxDepth[0] = cameraData.frameCount;
-    ubo.frameMaxDepth[1] = cameraData.maxDepth;
-    ubo.frameMaxDepth[2] = 0;
-    ubo.frameMaxDepth[3] = 0;
-    ubo.ambientPad[0] = cameraData.ambientColor[0];
-    ubo.ambientPad[1] = cameraData.ambientColor[1];
-    ubo.ambientPad[2] = cameraData.ambientColor[2];
-    ubo.ambientPad[3] = cameraData.pad;
-    // lightCount and samplesPerPixel will be set by caller via cameraData... 
-    // Actually VPT_CameraData doesn't have lightCount/SPP, so we get from scene or use defaults
-    ubo.lightCount = lightCount;
-    ubo.samplesPerPixel = samplesPerPixel;
-    ubo.envIntensity = cameraData.envIntensity;
-    ubo.envRotation  = cameraData.envRotation;
-    // Safety: if light SSBO was never created (e.g. lights not pushed during scene update),
-    // force lightCount to 0 so the shader doesn't read from an invalid SSBO
-    if (VPTScene::GetLightBuffer() == VK_NULL_HANDLE)
-        ubo.lightCount = 0;
-    memcpy(s_PathUBOMapped, &ubo, sizeof(PathTraceCameraUBO));
-
-    // ── Update descriptor set: TLAS + 3 images + UBO + 5 SSBOs ──
-    VkWriteDescriptorSetAccelerationStructureKHR asInfo{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
-    asInfo.accelerationStructureCount = 1;
-    asInfo.pAccelerationStructures = &tlas;
-
-    VkDescriptorImageInfo imgInfos[5] = {};
-    for (int i = 0; i < 5; i++)
-    {
-        imgInfos[i].sampler     = VK_NULL_HANDLE;
-        imgInfos[i].imageView   = s_OutputViews[i].view;
-        imgInfos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    }
-
-    VkDescriptorBufferInfo uboInfo{};
-    uboInfo.buffer = s_PathUBOBuffer;
-    uboInfo.offset = 0;
-    uboInfo.range  = sizeof(PathTraceCameraUBO);
-
-    VkBuffer ssboBuffers[5] = {
-        VPTScene::GetUnifiedVertexBuffer(),
-        VPTScene::GetUnifiedIndexBuffer(),
-        VPTScene::GetInstanceInfoBuffer(),
-        VPTScene::GetMaterialBuffer(),
-        VPTScene::GetLightBuffer()
-    };
-    VkDescriptorBufferInfo ssboInfos[5] = {};
-    for (int i = 0; i < 5; i++)
-    {
-        ssboInfos[i].buffer = ssboBuffers[i];
-        ssboInfos[i].offset = 0;
-        ssboInfos[i].range  = VK_WHOLE_SIZE;
-    }
-    // InstanceInfo 绑定当前 TLAS 环形槽位切片（动态场景每帧变化）
-    ssboInfos[2].offset = VPTScene::GetInstanceInfoOffset();
-
-    // ── Texture array descriptor info (4 combined image samplers) ──
-    VkDescriptorImageInfo texInfos[4] = {};
-    for (int i = 0; i < 4; i++)
-    {
-        texInfos[i].sampler     = s_TexSampler;
-        texInfos[i].imageView   = s_TexViews[i].view;
-        texInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    }
-
-    // ── HDR env descriptor info (binding 16/17) ──
-    VkDescriptorImageInfo envImgInfo{};
-    envImgInfo.sampler     = VPTEnv::GetEnvSampler();
-    envImgInfo.imageView   = VPTEnv::GetEnvImageView();
-    envImgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    VkDescriptorBufferInfo envAccelInfo{};
-    envAccelInfo.buffer = VPTEnv::GetEnvAccelBuffer();
-    envAccelInfo.offset = 0;
-    envAccelInfo.range  = VK_WHOLE_SIZE;
-
-    VkWriteDescriptorSet writes[18] = {};
-    // binding 0: TLAS
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].pNext = &asInfo;
-    writes[0].dstSet = s_PathDescSet;
-    writes[0].dstBinding = 0;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-
-    // bindings 1-3: storage images
-    for (int i = 0; i < 5; i++)
-    {
-        writes[1 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1 + i].dstSet = s_PathDescSet;
-        writes[1 + i].dstBinding = 1 + i;
-        writes[1 + i].descriptorCount = 1;
-        writes[1 + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        writes[1 + i].pImageInfo = &imgInfos[i];
-    }
-
-    // binding 4: UBO
-    writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[4].dstSet = s_PathDescSet;
-    writes[4].dstBinding = 4;
-    writes[4].descriptorCount = 1;
-    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    writes[4].pBufferInfo = &uboInfo;
-
-    // bindings 5-9: SSBOs
-    for (int i = 0; i < 5; i++)
-    {
-        writes[5 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[5 + i].dstSet = s_PathDescSet;
-        writes[5 + i].dstBinding = 5 + i;
-        writes[5 + i].descriptorCount = 1;
-        writes[5 + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[5 + i].pBufferInfo = &ssboInfos[i];
-    }
-
-    // bindings 10-13: texture arrays (combined image sampler)
-    for (int i = 0; i < 4; i++)
-    {
-        writes[10 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[10 + i].dstSet = s_PathDescSet;
-        writes[10 + i].dstBinding = 10 + i;
-        writes[10 + i].descriptorCount = 1;
-        writes[10 + i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[10 + i].pImageInfo = &texInfos[i];
-    }
-
-    // bindings 14-15: DLSS RR albedo G-buffers (storage images)
-    for (int i = 0; i < 2; i++)
-    {
-        writes[14 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[14 + i].dstSet = s_PathDescSet;
-        writes[14 + i].dstBinding = 14 + i;
-        writes[14 + i].descriptorCount = 1;
-        writes[14 + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        writes[14 + i].pImageInfo = &imgInfos[3 + i];
-    }
-
-    // binding 16/17: HDR env texture + EnvAccel SSBO（仅当 env 就绪时写入，避免 null 句柄崩溃）
-    uint32_t writeCount = 16;
-    if (VPTEnv::IsReady())
-    {
-        writes[16].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[16].dstSet = s_PathDescSet;
-        writes[16].dstBinding = 16;
-        writes[16].descriptorCount = 1;
-        writes[16].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[16].pImageInfo = &envImgInfo;
-
-        writes[17].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[17].dstSet = s_PathDescSet;
-        writes[17].dstBinding = 17;
-        writes[17].descriptorCount = 1;
-        writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[17].pBufferInfo = &envAccelInfo;
-
-        writeCount = 18;
-    }
-
-    vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);
-
-    // ── Command buffer ──
-    VkCommandBufferAllocateInfo allocCI{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    allocCI.commandPool = s_CmdPool;
-    allocCI.commandBufferCount = 1;
-    allocCI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device, &allocCI, &cmd);
-
-    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
-
-    // ── 骨骼动画：GPU 蒙皮 dispatch（若有更新，须先于 refit/TLAS，蒙皮 compute 就地写统一顶点缓冲）──
-    VPTScene::RecordGPUSkinningIfNeeded(cmd);
-
-    // ── 骨骼动画：变形顶点上传 + BLAS refit（若有更新，需先于 TLAS 重建）──
-    VPTScene::RecordBLASRefitIfNeeded(cmd);
-
-    // ── 动态场景：每帧 TLAS 重建（若本帧有实例更新，优先于 dispatch 录制）──
-    VPTScene::RecordTLASUpdateIfNeeded(cmd);
-
-    // Barrier 1: UBO host write → compute read
-    VkBufferMemoryBarrier uboBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
-    uboBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-    uboBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    uboBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    uboBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    uboBarrier.buffer = s_PathUBOBuffer;
-    uboBarrier.offset = 0;
-    uboBarrier.size = sizeof(PathTraceCameraUBO);
-
-    // Barrier 2: 3 images UNDEFINED → GENERAL
-    VkImageMemoryBarrier imgBarriers[5] = {};
-    for (int i = 0; i < 5; i++)
-    {
-        imgBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        imgBarriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        imgBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        imgBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        imgBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        imgBarriers[i].image = s_OutputViews[i].image;
-        imgBarriers[i].subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-        imgBarriers[i].subresourceRange.baseMipLevel   = 0;
-        imgBarriers[i].subresourceRange.levelCount     = 1;
-        imgBarriers[i].subresourceRange.baseArrayLayer = 0;
-        imgBarriers[i].subresourceRange.layerCount     = 1;
-        imgBarriers[i].srcAccessMask = 0;
-        imgBarriers[i].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    }
-
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 1, &uboBarrier, 5, imgBarriers);
-
-    // Dispatch
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_PathPipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        s_PathPipeLayout, 0, 1, &s_PathDescSet, 0, nullptr);
-
-    uint32_t gx = (width + 7) / 8;
-    uint32_t gy = (height + 7) / 8;
-    vkCmdDispatch(cmd, gx, gy, 1);
-
-    // Barrier 3: 3 images GENERAL → SHADER_READ_ONLY_OPTIMAL
-    for (int i = 0; i < 5; i++)
-    {
-        imgBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        imgBarriers[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        imgBarriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        imgBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    }
-
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 5, imgBarriers);
-
-    vkEndCommandBuffer(cmd);
-
-    // Submit + wait
-    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    VkResult qRes = vkQueueSubmit(inst.graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(inst.graphicsQueue);
-    if (qRes != VK_SUCCESS)
-        fprintf(stderr, "[VPT] DispatchPathTrace: vkQueueSubmit failed: %d\n", qRes);
-
-    vkFreeCommandBuffers(device, s_CmdPool, 1, &cmd);
-}
-
-// ═══════════════════════════════════════════════════════════
 //  Plan B: Two-phase dispatch (eliminates vkQueueWaitIdle)
-//  PrepareDispatch + RenderCallback replace DispatchPathTrace.
+//  Phase 1 = PrepareDispatch（CPU 侧准备），Phase 2 = RenderCallback（录制进 Unity 的 cb）。
+//  旧的 DispatchPathTrace 直连路径（自建 cb + vkQueueSubmit + vkQueueWaitIdle）已删除，
+//  避免同一份录入逻辑维护两份（见 §7.6）。
 // ═══════════════════════════════════════════════════════════
 
 // Pending dispatch state (set by PrepareDispatch, consumed by RenderCallback)
@@ -715,7 +388,8 @@ void VPTDispatch::PrepareDispatch(
     ubo.jitterNearFar[3] = cameraData.farPlane;
     ubo.frameMaxDepth[0] = cameraData.frameCount;
     ubo.frameMaxDepth[1] = cameraData.maxDepth;
-    ubo.frameMaxDepth[2] = 0;
+    // z = envReady：HDR 未上传时 shader 走常数 ambient 回退（而不是采样黑图）
+    ubo.frameMaxDepth[2] = VPTEnv::IsReady() ? 1 : 0;
     ubo.frameMaxDepth[3] = 0;
     ubo.ambientPad[0] = cameraData.ambientColor[0];
     ubo.ambientPad[1] = cameraData.ambientColor[1];
@@ -780,6 +454,8 @@ void VPTDispatch::PrepareDispatch(
     }
 
     // ── HDR env descriptor info (binding 16/17) ──
+    // VPTEnv 在真实贴图未就绪时返回 1×1 黑色占位图 + 全零 alias 表，
+    // 所以这里永远可以绑合法句柄（§10② 的坑）。
     VkDescriptorImageInfo envImgInfo{};
     envImgInfo.sampler     = VPTEnv::GetEnvSampler();
     envImgInfo.imageView   = VPTEnv::GetEnvImageView();
@@ -788,7 +464,7 @@ void VPTDispatch::PrepareDispatch(
     VkDescriptorBufferInfo envAccelInfo{};
     envAccelInfo.buffer = VPTEnv::GetEnvAccelBuffer();
     envAccelInfo.offset = 0;
-    envAccelInfo.range  = VK_WHOLE_SIZE;
+    envAccelInfo.range  = envAccelInfo.buffer != VK_NULL_HANDLE ? VK_WHOLE_SIZE : 0;
 
     VkWriteDescriptorSet writes[18] = {};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -846,9 +522,12 @@ void VPTDispatch::PrepareDispatch(
         writes[14 + i].pImageInfo = &imgInfos[3 + i];
     }
 
-    // binding 16/17: HDR env texture + EnvAccel SSBO（仅当 env 就绪时写入，避免 null 句柄崩溃）
+    // binding 16/17: HDR env texture + EnvAccel SSBO
+    // 始终写入：未上传 HDR 时绑的是 VPTEnv 的占位资源；只有占位资源创建失败
+    // （句柄为 null）才退回只写 16 个，避免给 vkUpdateDescriptorSets 传空句柄。
     uint32_t writeCount = 16;
-    if (VPTEnv::IsReady())
+    if (envImgInfo.imageView != VK_NULL_HANDLE && envImgInfo.sampler != VK_NULL_HANDLE
+        && envAccelInfo.buffer != VK_NULL_HANDLE)
     {
         writes[16].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[16].dstSet = s_PathDescSet;
@@ -865,6 +544,16 @@ void VPTDispatch::PrepareDispatch(
         writes[17].pBufferInfo = &envAccelInfo;
 
         writeCount = 18;
+    }
+    else
+    {
+        static bool s_WarnedNoEnv = false;
+        if (!s_WarnedNoEnv)
+        {
+            fprintf(stderr, "[VPT] WARN: env fallback resources missing (VPTEnv::InitFallback failed); "
+                            "binding 16/17 left unwritten — HDR env sampling is undefined.\n");
+            s_WarnedNoEnv = true;
+        }
     }
 
     vkUpdateDescriptorSets(device, writeCount, writes, 0, nullptr);
@@ -928,7 +617,10 @@ void VPTDispatch::RenderCallback(int eventID)
     VPTScene::RecordTLASUpdateIfNeeded(cmd);
     VPTGpuTimer::Mark(cmd);   // T3: TLAS 重建结束
 
-    // ── Barrier 1: UBO host write → compute read + 3 images → GENERAL ──
+    // ── Barrier 1: UBO host write → compute read + 5 images → GENERAL ──
+    // oldLayout 用插件自己跟踪的布局：每次 dispatch 结束都恢复成
+    // SHADER_READ_ONLY_OPTIMAL，所以稳态下就是它；只有新句柄（RT 重建/换分辨率）
+    // 才是 UNDEFINED（这时丢弃内容是正确的）。不再每帧丢弃上一帧内容 —— §10④。
     VkBufferMemoryBarrier uboBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
     uboBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
     uboBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -941,8 +633,10 @@ void VPTDispatch::RenderCallback(int eventID)
     VkImageMemoryBarrier imgBarriers[5] = {};
     for (int i = 0; i < 5; i++)
     {
+        const VkImageLayout oldLayout = s_OutputViews[i].layout;
+
         imgBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        imgBarriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imgBarriers[i].oldLayout = oldLayout;
         imgBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
         imgBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         imgBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -952,12 +646,19 @@ void VPTDispatch::RenderCallback(int eventID)
         imgBarriers[i].subresourceRange.levelCount     = 1;
         imgBarriers[i].subresourceRange.baseArrayLayer = 0;
         imgBarriers[i].subresourceRange.layerCount     = 1;
-        imgBarriers[i].srcAccessMask = 0;
+        // 旧布局若是 UNDEFINED（首次使用/新句柄），内容本就无意义，srcAccess 也须为 0；
+        // 否则同步上一轮读（Unity 的 compute / NGX / Blit）与本次写。
+        imgBarriers[i].srcAccessMask = (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+            ? 0
+            : VK_ACCESS_SHADER_READ_BIT;
         imgBarriers[i].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     }
 
     vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        // 上一轮的使用者是 Unity 的 compute（MotionVector）、NGX（calc stage=compute）
+        // 与 Blit（fragment 采样），所以 srcStage 覆盖 compute + fragment。
+        VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+            | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 0, nullptr, 1, &uboBarrier, 5, imgBarriers);
 
@@ -970,7 +671,7 @@ void VPTDispatch::RenderCallback(int eventID)
     uint32_t gy = (s_PendingHeight + 7) / 8;
     vkCmdDispatch(cmd, gx, gy, 1);
 
-    // ── Barrier 2: 3 images GENERAL → SHADER_READ_ONLY (for Unity compute reads) ──
+    // ── Barrier 2: 5 images GENERAL → SHADER_READ_ONLY (for Unity compute reads) ──
     for (int i = 0; i < 5; i++)
     {
         imgBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -983,6 +684,10 @@ void VPTDispatch::RenderCallback(int eventID)
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 0, nullptr, 0, nullptr, 5, imgBarriers);
+
+    // 记录本帧结束时这 5 张图的布局，供下一帧 barrier 的 oldLayout 使用
+    for (int i = 0; i < 5; i++)
+        s_OutputViews[i].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     VPTGpuTimer::Mark(cmd);   // T4: 路径追踪 dispatch 结束
 }
@@ -1001,7 +706,8 @@ void VPTDispatch::DestroyPathTracePipeline(VkDevice device)
     for (int i = 0; i < 5; i++)
     {
         if (s_OutputViews[i].view) { vkDestroyImageView(device, s_OutputViews[i].view, nullptr); s_OutputViews[i].view = VK_NULL_HANDLE; }
-        s_OutputViews[i].image = VK_NULL_HANDLE;
+        s_OutputViews[i].image  = VK_NULL_HANDLE;
+        s_OutputViews[i].layout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
     for (int i = 0; i < 4; i++)
     {
