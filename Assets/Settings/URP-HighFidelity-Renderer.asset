@@ -116,6 +116,7 @@ MonoBehaviour:
   m_Name: PathTraceRendererFeature
   m_EditorClassIdentifier: 
   m_Active: 1
+  onlyGameCamera: 1
   motionVectorShader: {fileID: 7200000, guid: b7f0d0256d3797a44bb3711ac875d1a7, type: 3}
   outputFormat: 2
   groupXY: 8
@@ -127,3 +128,5 @@ MonoBehaviour:
   envRotation: 0
   dlssEnabled: 1
   dlssQualityMode: 1
+  logGpuTiming: 1
+  gpuTimingLogInterval: 60
