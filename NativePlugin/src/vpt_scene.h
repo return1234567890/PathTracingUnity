@@ -10,8 +10,30 @@ namespace VPTScene {
     /// 加载 Vulkan 扩展函数指针（vkGetAccelerationStructureBuildSizesKHR 等）
     void LoadExtensionFunctions(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkDevice device);
 
-    /// 更新场景：上传 buffer + 构建 BLAS/TLAS（静态拓扑变化时调用，低频路径）
-    void UpdateScene(const VPT_SceneUpdate& su);
+    /// 推送场景数据（CPU 深拷贝，主线程可安全调用；不碰 Vulkan 设备/队列）。
+    /// 真正的 buffer 创建 + BLAS/TLAS 构建在 RecordSceneUpdateIfNeeded 中
+    /// 录进 Unity 的命令缓冲（Plant B 事件内、渲染线程上），因此这里只会
+    /// 拷贝调用方的指针数据 —— 返回后调用方可以立即释放/复用那些内存。
+    void PushScene(const VPT_SceneUpdate& su);
+
+    /// 是否有待处理的场景推送（供 dispatch 决定本帧是否需要取命令缓冲）
+    bool IsSceneUpdatePending();
+
+    /// 若存在待处理场景推送，向命令缓冲录制：等 GPU 空闲 → 拆旧资源 →
+    /// 上传 buffer → 构建 BLAS/TLAS。
+    /// 返回 true 表示本帧发生了场景重建（旧 TLAS 已销毁、descriptor 已过期，
+    /// 调用方本帧不得再 dispatch）。
+    bool RecordSceneUpdateIfNeeded(VkCommandBuffer cmd);
+
+    /// 若存在待处理的蒙皮 mesh 注册，向命令缓冲录制 staging 上传 + base 副本拷贝。
+    /// 必须在场景构建之后调用（依赖统一顶点缓冲的内容）。
+    void RecordSkinRegistrationIfNeeded(VkCommandBuffer cmd);
+
+    /// 取走"重建后需要做一次 GPU 同步探针"的标记。
+    /// 重建帧录制的命令由 Unity 提交，插件自己看不到 VkResult；下一帧在事件里
+    /// 做一次 vkDeviceWaitIdle 就能把"重建帧把 GPU 搞死了"这件事变成显式的
+    /// VK_ERROR_DEVICE_LOST（否则会静默带着死设备继续跑几十秒再卡死）。
+    bool TakeGpuSyncProbe();
 
     /// 动态场景：仅更新实例变换（每帧调用，刚体运动）
     /// 写入常驻 host 缓冲并标记 TLAS 待重建，实际 build 在下一次 dispatch 前录制
@@ -19,7 +41,9 @@ namespace VPTScene {
 
     /// 若本帧有实例更新，向命令缓冲录制：InstanceInfo staging→device 拷贝 + TLAS 重建 + barrier。
     /// 由 dispatch 路径（RenderCallback / 遗留 dispatch / debug depth）在绑定管线前调用。
-    void RecordTLASUpdateIfNeeded(VkCommandBuffer cmd);
+    /// 返回 true 表示实例容量扩容、TLAS 环形资源被重建（descriptor 里的旧 buffer
+    /// 句柄已失效，调用方本帧不得 dispatch）。
+    bool RecordTLASUpdateIfNeeded(VkCommandBuffer cmd);
 
     /// 若本帧有蒙皮更新，向命令缓冲录制：BLAS 原地 refit（mode=UPDATE）+ barrier 链。
     /// 必须在 RecordTLASUpdateIfNeeded 之前调用（TLAS 引用 BLAS 内容时 refit 需先行）。

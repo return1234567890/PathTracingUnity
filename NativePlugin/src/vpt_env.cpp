@@ -7,12 +7,14 @@
 #include "vpt_env.h"
 #include "vpt_internal.h"
 #include "vpt_scene.h"
+#include "vpt_trace.h"
 
 #include <cstdio>
 #include <cstring>
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 // ═══════════════════════════════════════════════════════════
 //  EnvAccel 结构体（与 GLSL shader 中的 EnvAccel 对齐：8B/元素）
@@ -39,6 +41,17 @@ static uint32_t s_EnvWidth    = 0;
 static uint32_t s_EnvHeight   = 0;
 static float    s_EnvIntegral = 1.0f;
 static bool     s_EnvReady    = false;
+
+// ── 延迟上传状态（Plan B：主线程只准备 CPU 数据，命令在渲染线程录制）──
+static std::vector<float>    s_PendingPixels;
+static std::vector<EnvAccel> s_PendingAccel;
+static uint32_t              s_PendingWidth  = 0;
+static uint32_t              s_PendingHeight = 0;
+static bool                  s_EnvPending    = false;
+static bool                  s_FallbackNeedsRecord = false;
+
+// 主线程（SetEnvironmentMap）与渲染线程（RecordPendingUploads）共享上述状态
+static std::recursive_mutex  s_EnvMutex;
 
 // ═══════════════════════════════════════════════════════════
 //  占位资源（HDR 未上传时 binding 16/17 仍要绑合法句柄）
@@ -199,8 +212,6 @@ bool VPTEnv::InitFallback(VkDevice device, VkPhysicalDevice gpu)
 
     if (!EnsureSampler(device)) return false;
 
-    const UnityVulkanInstance& inst = VPT_GetInstance();
-
     // ── 1. 1×1 RGBA32F 黑色图（device-local）──
     if (s_FallbackImage == VK_NULL_HANDLE)
     {
@@ -272,29 +283,356 @@ bool VPTEnv::InitFallback(VkDevice device, VkPhysicalDevice gpu)
         vkBindBufferMemory(device, s_FallbackAccelBuffer, s_FallbackAccelMemory, 0);
     }
 
-    // ── 3. 一次性提交：清黑 + 布局转 SHADER_READ_ONLY + 填 alias 表 ──
-    VkCommandPoolCreateInfo poolCI{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    poolCI.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolCI.queueFamilyIndex = inst.queueFamilyIndex;
-    VkCommandPool pool = VK_NULL_HANDLE;
-    VkResult res = vkCreateCommandPool(device, &poolCI, nullptr, &pool);
-    if (res != VK_SUCCESS)
+    // ── 3. View ──
+    if (s_FallbackImageView == VK_NULL_HANDLE)
     {
-        fprintf(stderr, "[VPTEnv] fallback vkCreateCommandPool failed: %d\n", res);
+        VkImageViewCreateInfo ivCI{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        ivCI.image    = s_FallbackImage;
+        ivCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ivCI.format   = VK_FORMAT_R32G32B32A32_SFLOAT;
+        ivCI.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        ivCI.subresourceRange.baseMipLevel   = 0;
+        ivCI.subresourceRange.levelCount     = 1;
+        ivCI.subresourceRange.baseArrayLayer = 0;
+        ivCI.subresourceRange.layerCount     = 1;
+        VkResult res = vkCreateImageView(device, &ivCI, nullptr, &s_FallbackImageView);
+        if (res != VK_SUCCESS)
+        {
+            fprintf(stderr, "[VPTEnv] fallback vkCreateImageView failed: %d\n", res);
+            s_FallbackImageView = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+
+    // ── 4. 清屏/布局转换/填 alias 表延后到 RecordPendingUploads（Unity 命令缓冲内） ──
+    // 这里只创建资源：初始化发生在主线程（VPT_Initialize），不能在主线程提交队列命令。
+    s_FallbackNeedsRecord = true;
+
+    fprintf(stderr, "[VPTEnv] fallback env resources created (record deferred to Unity command buffer).\n");
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  SetEnvironmentMap — CPU 侧准备（行翻转 + alias 表 + 深拷贝）
+//
+//  这里不碰任何 Vulkan 队列/设备：VkImage/VkBuffer 创建、staging 上传与
+//  布局转换全部由 RecordPendingUploads 录进 Unity 的命令缓冲（事件内、渲染线程）。
+// ═══════════════════════════════════════════════════════════
+void VPTEnv::SetEnvironmentMap(const float* pixels, uint32_t width, uint32_t height)
+{
+    std::lock_guard<std::recursive_mutex> guard(s_EnvMutex);
+
+    if (!pixels || width == 0 || height == 0) return;
+
+    // ── 复制像素数据（createEnvironmentAccel 会将 PDF 写入 alpha 通道）──
+    const size_t floatCount = (size_t)width * height * 4;
+    s_PendingPixels.resize(floatCount);
+    memcpy(s_PendingPixels.data(), pixels, floatCount * sizeof(float));
+
+    // 翻转行序：Unity GetPixels 从底行返回（row0=底部），
+    // Vulkan vkCmdCopyBufferToImage 将 row0 当顶部。翻转后 alias 表与纹理一致。
+    for (uint32_t y = 0; y < height / 2; y++)
+    {
+        float* rowTop = s_PendingPixels.data() + (size_t)y * width * 4;
+        float* rowBot = s_PendingPixels.data() + (size_t)(height - 1 - y) * width * 4;
+        std::swap_ranges(rowTop, rowTop + width * 4, rowBot);
+    }
+
+    // ── 构建 alias 表（CPU 端）──
+    float integral = 1.0f;
+    s_PendingAccel = createEnvironmentAccel(s_PendingPixels.data(), width, height, integral);
+    s_EnvIntegral   = integral;
+    s_PendingWidth  = width;
+    s_PendingHeight = height;
+    s_EnvPending    = true;
+
+    fprintf(stderr, "[VPTEnv] HDR env map queued: %ux%u, integral=%.4f "
+                    "(upload deferred to Unity command buffer)\n",
+            width, height, integral);
+    VPTTrace::Line("env: queued %ux%u (CPU prep done)", width, height);
+}
+
+bool VPTEnv::HasPendingUploads()
+{
+    std::lock_guard<std::recursive_mutex> guard(s_EnvMutex);
+    return s_EnvPending || s_FallbackNeedsRecord;
+}
+
+// 拆 HDR 贴图本身（不做 wait；调用方负责保证 GPU 空闲）
+static void DestroyEnvResourcesNoWait(VkDevice device)
+{
+    if (device == VK_NULL_HANDLE) return;
+    if (s_EnvImageView)   { vkDestroyImageView(device, s_EnvImageView, nullptr);   s_EnvImageView = VK_NULL_HANDLE; }
+    if (s_EnvImage)       { vkDestroyImage(device, s_EnvImage, nullptr);           s_EnvImage = VK_NULL_HANDLE; }
+    if (s_EnvImageMemory) { vkFreeMemory(device, s_EnvImageMemory, nullptr);       s_EnvImageMemory = VK_NULL_HANDLE; }
+    if (s_EnvAccelBuffer) { vkDestroyBuffer(device, s_EnvAccelBuffer, nullptr);    s_EnvAccelBuffer = VK_NULL_HANDLE; }
+    if (s_EnvAccelMemory) { vkFreeMemory(device, s_EnvAccelMemory, nullptr);       s_EnvAccelMemory = VK_NULL_HANDLE; }
+    s_EnvReady = false;
+}
+
+// host-visible staging（TRANSFER_SRC）
+static bool CreateHostStaging(VkDevice device, VkPhysicalDevice gpu, VkDeviceSize size,
+                              VkBuffer& outBuf, VkDeviceMemory& outMem)
+{
+    outBuf = VK_NULL_HANDLE;
+    outMem = VK_NULL_HANDLE;
+
+    VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.size        = size;
+    bci.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (!VPT_CheckVk(vkCreateBuffer(device, &bci, nullptr, &outBuf), "vkCreateBuffer(env staging)"))
+    {
+        outBuf = VK_NULL_HANDLE;
         return false;
     }
 
-    VkCommandBufferAllocateInfo cbAI{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    cbAI.commandPool        = pool;
-    cbAI.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbAI.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(device, &cbAI, &cmd);
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device, outBuf, &req);
+    VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    ai.allocationSize  = req.size;
+    ai.memoryTypeIndex = VPTScene::FindMemoryType(gpu, req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!VPT_CheckVk(vkAllocateMemory(device, &ai, nullptr, &outMem), "vkAllocateMemory(env staging)"))
+    {
+        vkDestroyBuffer(device, outBuf, nullptr);
+        outBuf = VK_NULL_HANDLE;
+        outMem = VK_NULL_HANDLE;
+        return false;
+    }
+    vkBindBufferMemory(device, outBuf, outMem, 0);
+    return true;
+}
 
-    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+bool VPTEnv::RecordPendingUploads(VkCommandBuffer cmd)
+{
+    std::lock_guard<std::recursive_mutex> guard(s_EnvMutex);
 
+    if (cmd == VK_NULL_HANDLE) return false;
+
+    // 二分排查开关：VPT_NO_ENV=1 跳过 HDR 环境贴图上传（继续用 1x1 黑色占位图）
+    if (VPT_EnvFlag("VPT_NO_ENV"))
+    {
+        if (s_EnvPending)
+        {
+            VPTTrace::Line("env: upload skipped by VPT_NO_ENV");
+            s_EnvPending = false;
+            s_PendingPixels.clear();
+            s_PendingAccel.clear();
+        }
+    }
+
+    const UnityVulkanInstance& inst = VPT_GetInstance();
+    VkDevice device = inst.device;
+    VkPhysicalDevice gpu = inst.physicalDevice;
+    if (device == VK_NULL_HANDLE) return false;
+
+    if (VPT_IsDeviceLost())
+    {
+        if (s_EnvPending || s_FallbackNeedsRecord)
+            fprintf(stderr, "[VPTEnv] pending upload dropped: device lost.\n");
+        s_EnvPending = false;
+        s_FallbackNeedsRecord = false;
+        s_PendingPixels.clear();
+        s_PendingAccel.clear();
+        return false;
+    }
+
+    // ── 1. 占位资源首次初始化：清黑 + 布局转 SHADER_READ_ONLY + 填零 alias 表 ──
+    if (s_FallbackNeedsRecord && s_FallbackImage != VK_NULL_HANDLE && s_FallbackAccelBuffer != VK_NULL_HANDLE)
+    {
+        s_FallbackNeedsRecord = false;
+
+        VkImageSubresourceRange range{};
+        range.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        range.baseMipLevel   = 0;
+        range.levelCount     = 1;
+        range.baseArrayLayer = 0;
+        range.layerCount     = 1;
+
+        VkImageMemoryBarrier toTransfer{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        toTransfer.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+        toTransfer.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.image               = s_FallbackImage;
+        toTransfer.subresourceRange    = range;
+        toTransfer.srcAccessMask       = 0;
+        toTransfer.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+
+        VkClearColorValue black{};
+        black.float32[0] = 0.0f; black.float32[1] = 0.0f;
+        black.float32[2] = 0.0f; black.float32[3] = 1.0f;   // alpha 存 pdf，占位无意义
+        vkCmdClearColorImage(cmd, s_FallbackImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            &black, 1, &range);
+
+        VkImageMemoryBarrier toShader{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        toShader.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toShader.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        toShader.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toShader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toShader.image               = s_FallbackImage;
+        toShader.subresourceRange    = range;
+        toShader.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toShader.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toShader);
+
+        EnvAccel zeroAccel{ 0u, 0.0f };
+        vkCmdUpdateBuffer(cmd, s_FallbackAccelBuffer, 0, sizeof(EnvAccel), &zeroAccel);
+
+        VkMemoryBarrier accelBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        accelBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        accelBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &accelBarrier, 0, nullptr, 0, nullptr);
+
+        fprintf(stderr, "[VPTEnv] fallback env resources recorded (1x1 black + zero alias table).\n");
+    }
+
+    if (!s_EnvPending)
+        return false;
+
+    s_EnvPending = false;
+
+    // ── 2. 旧贴图可能仍被在飞行帧采样：等 GPU 空闲后再拆 ──
+    VPTTrace::Stage("env:vkDeviceWaitIdle");
+    VPTTrace::Line("env: vkDeviceWaitIdle(before destroy) begin ...");
+    if (!VPT_CheckVk(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(env upload)"))
+    {
+        s_PendingPixels.clear();
+        s_PendingAccel.clear();
+        VPTTrace::Line("env: vkDeviceWaitIdle failed -> upload dropped");
+        return false;
+    }
+    VPTTrace::Line("env: vkDeviceWaitIdle done");
+
+    VPTTrace::Stage("env:create-resources");
+    DestroyEnvResourcesNoWait(device);
+
+    // 上一轮 staging：此刻 GPU 已空闲，可以安全释放
+    for (size_t i = 0; i < s_PendingStagingBufs.size(); i++)
+    {
+        if (s_PendingStagingBufs[i]) vkDestroyBuffer(device, s_PendingStagingBufs[i], nullptr);
+        if (s_PendingStagingMems[i]) vkFreeMemory(device, s_PendingStagingMems[i], nullptr);
+    }
+    s_PendingStagingBufs.clear();
+    s_PendingStagingMems.clear();
+
+    const uint32_t width  = s_PendingWidth;
+    const uint32_t height = s_PendingHeight;
+    const VkDeviceSize imageSize = (VkDeviceSize)width * height * 4 * sizeof(float);
+
+    // ── 3. VkImage（device-local）+ staging ──
+    VkImageCreateInfo imgCI{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    imgCI.imageType     = VK_IMAGE_TYPE_2D;
+    imgCI.format        = VK_FORMAT_R32G32B32A32_SFLOAT;
+    imgCI.extent.width  = width;
+    imgCI.extent.height = height;
+    imgCI.extent.depth  = 1;
+    imgCI.mipLevels     = 1;
+    imgCI.arrayLayers   = 1;
+    imgCI.samples       = VK_SAMPLE_COUNT_1_BIT;
+    imgCI.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    imgCI.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    imgCI.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+    imgCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (!VPT_CheckVk(vkCreateImage(device, &imgCI, nullptr, &s_EnvImage), "vkCreateImage(env)"))
+    {
+        s_EnvImage = VK_NULL_HANDLE;
+        s_PendingPixels.clear();
+        s_PendingAccel.clear();
+        return false;
+    }
+
+    VkMemoryRequirements memReq;
+    vkGetImageMemoryRequirements(device, s_EnvImage, &memReq);
+    VkMemoryAllocateInfo imgAlloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    imgAlloc.allocationSize  = memReq.size;
+    imgAlloc.memoryTypeIndex = VPTScene::FindMemoryType(gpu, memReq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!VPT_CheckVk(vkAllocateMemory(device, &imgAlloc, nullptr, &s_EnvImageMemory), "vkAllocateMemory(env image)"))
+    {
+        vkDestroyImage(device, s_EnvImage, nullptr);
+        s_EnvImage = VK_NULL_HANDLE;
+        s_EnvImageMemory = VK_NULL_HANDLE;
+        s_PendingPixels.clear();
+        s_PendingAccel.clear();
+        return false;
+    }
+    vkBindImageMemory(device, s_EnvImage, s_EnvImageMemory, 0);
+
+    VkBuffer       imgStaging    = VK_NULL_HANDLE;
+    VkDeviceMemory imgStagingMem = VK_NULL_HANDLE;
+    if (!CreateHostStaging(device, gpu, imageSize, imgStaging, imgStagingMem))
+    {
+        DestroyEnvResourcesNoWait(device);
+        s_PendingPixels.clear();
+        s_PendingAccel.clear();
+        return false;
+    }
+
+    void* mapped = nullptr;
+    vkMapMemory(device, imgStagingMem, 0, imageSize, 0, &mapped);
+    memcpy(mapped, s_PendingPixels.data(), (size_t)imageSize);
+    vkUnmapMemory(device, imgStagingMem);
+
+    // ── 4. EnvAccel SSBO（device-local）+ staging ──
+    const VkDeviceSize accelSize = (VkDeviceSize)width * height * sizeof(EnvAccel);
+
+    VkBufferCreateInfo dbCI{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    dbCI.size        = accelSize;
+    dbCI.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    dbCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (!VPT_CheckVk(vkCreateBuffer(device, &dbCI, nullptr, &s_EnvAccelBuffer), "vkCreateBuffer(env accel)"))
+    {
+        s_EnvAccelBuffer = VK_NULL_HANDLE;
+        vkDestroyBuffer(device, imgStaging, nullptr);
+        vkFreeMemory(device, imgStagingMem, nullptr);
+        DestroyEnvResourcesNoWait(device);
+        s_PendingPixels.clear();
+        s_PendingAccel.clear();
+        return false;
+    }
+
+    VkMemoryRequirements dReq;
+    vkGetBufferMemoryRequirements(device, s_EnvAccelBuffer, &dReq);
+    VkMemoryAllocateInfo dAlloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    dAlloc.allocationSize  = dReq.size;
+    dAlloc.memoryTypeIndex = VPTScene::FindMemoryType(gpu, dReq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!VPT_CheckVk(vkAllocateMemory(device, &dAlloc, nullptr, &s_EnvAccelMemory), "vkAllocateMemory(env accel)"))
+    {
+        vkDestroyBuffer(device, imgStaging, nullptr);
+        vkFreeMemory(device, imgStagingMem, nullptr);
+        DestroyEnvResourcesNoWait(device);
+        s_PendingPixels.clear();
+        s_PendingAccel.clear();
+        return false;
+    }
+    vkBindBufferMemory(device, s_EnvAccelBuffer, s_EnvAccelMemory, 0);
+
+    VkBuffer       accelStaging    = VK_NULL_HANDLE;
+    VkDeviceMemory accelStagingMem = VK_NULL_HANDLE;
+    if (!CreateHostStaging(device, gpu, accelSize, accelStaging, accelStagingMem))
+    {
+        vkDestroyBuffer(device, imgStaging, nullptr);
+        vkFreeMemory(device, imgStagingMem, nullptr);
+        DestroyEnvResourcesNoWait(device);
+        s_PendingPixels.clear();
+        s_PendingAccel.clear();
+        return false;
+    }
+
+    void* amapped = nullptr;
+    vkMapMemory(device, accelStagingMem, 0, accelSize, 0, &amapped);
+    memcpy(amapped, s_PendingAccel.data(), (size_t)accelSize);
+    vkUnmapMemory(device, accelStagingMem);
+
+    // ── 5. 录制：布局转换 → 图像拷贝 → 转 SHADER_READ_ONLY → SSBO 拷贝 + barrier ──
     VkImageSubresourceRange range{};
     range.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
     range.baseMipLevel   = 0;
@@ -307,33 +645,37 @@ bool VPTEnv::InitFallback(VkDevice device, VkPhysicalDevice gpu)
     toTransfer.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toTransfer.image               = s_FallbackImage;
+    toTransfer.image               = s_EnvImage;
     toTransfer.subresourceRange    = range;
     toTransfer.srcAccessMask       = 0;
     toTransfer.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &toTransfer);
 
-    VkClearColorValue black{};
-    black.float32[0] = 0.0f; black.float32[1] = 0.0f;
-    black.float32[2] = 0.0f; black.float32[3] = 1.0f;   // alpha 存 pdf，占位用 1 也无意义
-    vkCmdClearColorImage(cmd, s_FallbackImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        &black, 1, &range);
+    VkBufferImageCopy copyRegion{};
+    copyRegion.bufferOffset = 0;
+    copyRegion.imageSubresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.mipLevel       = 0;
+    copyRegion.imageSubresource.baseArrayLayer = 0;
+    copyRegion.imageSubresource.layerCount     = 1;
+    copyRegion.imageExtent = { width, height, 1 };
+    vkCmdCopyBufferToImage(cmd, imgStaging, s_EnvImage,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
 
     VkImageMemoryBarrier toShader{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
     toShader.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     toShader.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     toShader.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toShader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toShader.image               = s_FallbackImage;
+    toShader.image               = s_EnvImage;
     toShader.subresourceRange    = range;
     toShader.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
     toShader.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &toShader);
 
-    EnvAccel zeroAccel{ 0u, 0.0f };
-    vkCmdUpdateBuffer(cmd, s_FallbackAccelBuffer, 0, sizeof(EnvAccel), &zeroAccel);
+    VkBufferCopy accelCopy{ 0, 0, accelSize };
+    vkCmdCopyBuffer(cmd, accelStaging, s_EnvAccelBuffer, 1, &accelCopy);
 
     VkMemoryBarrier accelBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     accelBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -341,296 +683,41 @@ bool VPTEnv::InitFallback(VkDevice device, VkPhysicalDevice gpu)
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 1, &accelBarrier, 0, nullptr, 0, nullptr);
 
-    vkEndCommandBuffer(cmd);
+    // staging 保留到下一次上传 / Shutdown（拷贝是本帧录进命令缓冲的）
+    s_PendingStagingBufs.push_back(imgStaging);
+    s_PendingStagingMems.push_back(imgStagingMem);
+    s_PendingStagingBufs.push_back(accelStaging);
+    s_PendingStagingMems.push_back(accelStagingMem);
 
-    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers    = &cmd;
-    res = vkQueueSubmit(inst.graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(inst.graphicsQueue);
-    if (res != VK_SUCCESS)
-        fprintf(stderr, "[VPTEnv] fallback vkQueueSubmit failed: %d\n", res);
-
-    vkFreeCommandBuffers(device, pool, 1, &cmd);
-    vkDestroyCommandPool(device, pool, nullptr);
-
-    // ── 4. View ──
-    if (s_FallbackImageView == VK_NULL_HANDLE)
+    // ── 6. ImageView + sampler ──
+    VkImageViewCreateInfo ivCI{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    ivCI.image    = s_EnvImage;
+    ivCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    ivCI.format   = VK_FORMAT_R32G32B32A32_SFLOAT;
+    ivCI.subresourceRange = range;
+    if (!VPT_CheckVk(vkCreateImageView(device, &ivCI, nullptr, &s_EnvImageView), "vkCreateImageView(env)"))
     {
-        VkImageViewCreateInfo ivCI{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        ivCI.image    = s_FallbackImage;
-        ivCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        ivCI.format   = VK_FORMAT_R32G32B32A32_SFLOAT;
-        ivCI.subresourceRange = range;
-        res = vkCreateImageView(device, &ivCI, nullptr, &s_FallbackImageView);
-        if (res != VK_SUCCESS)
-        {
-            fprintf(stderr, "[VPTEnv] fallback vkCreateImageView failed: %d\n", res);
-            s_FallbackImageView = VK_NULL_HANDLE;
-            return false;
-        }
+        s_EnvImageView = VK_NULL_HANDLE;
+        DestroyEnvResourcesNoWait(device);
+        s_PendingPixels.clear();
+        s_PendingAccel.clear();
+        return false;
     }
 
-    fprintf(stderr, "[VPTEnv] fallback env resources ready (1x1 black + zero alias table).\n");
-    return true;
-}
-
-// ═══════════════════════════════════════════════════════════
-//  SetEnvironmentMap — 主入口
-// ═══════════════════════════════════════════════════════════
-void VPTEnv::SetEnvironmentMap(const float* pixels, uint32_t width, uint32_t height)
-{
-    if (!pixels || width == 0 || height == 0) return;
-
-    const UnityVulkanInstance& inst = VPT_GetInstance();
-    VkDevice device = inst.device;
-    VkPhysicalDevice gpu = inst.physicalDevice;
-
-    // 销毁上轮资源
-    DestroyResources();
-    vkDeviceWaitIdle(device);
-
-    // ── 构建 alias 表（CPU 端）──
-    // 复制像素数据（createEnvironmentAccel 会将 PDF 写入 alpha 通道）
-    VkDeviceSize pixelCount = VkDeviceSize(width) * height * 4;
-    std::vector<float> pixelData(pixelCount);
-    memcpy(pixelData.data(), pixels, static_cast<size_t>(pixelCount * sizeof(float)));
-
-    // 翻转行序：Unity GetPixels 从底行返回（row0=底部），
-    // Vulkan vkCmdCopyBufferToImage 将 row0 当顶部。翻转后 alias 表与纹理一致。
-    for (uint32_t y = 0; y < height / 2; y++)
-    {
-        float* rowTop = pixelData.data() + y * width * 4;
-        float* rowBot = pixelData.data() + (height - 1 - y) * width * 4;
-        std::swap_ranges(rowTop, rowTop + width * 4, rowBot);
-    }
-
-    float integral = 1.0f;
-    std::vector<EnvAccel> envAccel = createEnvironmentAccel(pixelData.data(), width, height, integral);
-    s_EnvIntegral = integral;
-
-    // ── 创建 command buffer ──
-    VkCommandPoolCreateInfo poolCI{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    poolCI.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolCI.queueFamilyIndex = inst.queueFamilyIndex;
-    VkCommandPool pool;
-    VkResult res = vkCreateCommandPool(device, &poolCI, nullptr, &pool);
-    if (res != VK_SUCCESS)
-    {
-        fprintf(stderr, "[VPTEnv] vkCreateCommandPool failed: %d\n", res);
-        return;
-    }
-
-    VkCommandBufferAllocateInfo allocCI{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    allocCI.commandPool = pool;
-    allocCI.commandBufferCount = 1;
-    allocCI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device, &allocCI, &cmd);
-
-    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
-
-    s_PendingStagingBufs.clear();
-    s_PendingStagingMems.clear();
-
-    // 前置声明：避免 goto 跳过变量初始化（C2362）
-    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-
-    // ── 1. 创建 RGBA32F VkImage + staging 上传 ──
-    VkDeviceSize imageSize = VkDeviceSize(width) * height * 4 * sizeof(float);
-
-    {
-        VkImageCreateInfo imgCI{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-        imgCI.imageType     = VK_IMAGE_TYPE_2D;
-        imgCI.format        = VK_FORMAT_R32G32B32A32_SFLOAT;
-        imgCI.extent.width  = width;
-        imgCI.extent.height = height;
-        imgCI.extent.depth  = 1;
-        imgCI.mipLevels     = 1;
-        imgCI.arrayLayers   = 1;
-        imgCI.samples       = VK_SAMPLE_COUNT_1_BIT;
-        imgCI.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        imgCI.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        imgCI.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-        imgCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-        res = vkCreateImage(device, &imgCI, nullptr, &s_EnvImage);
-        if (res != VK_SUCCESS) { fprintf(stderr, "[VPTEnv] vkCreateImage failed: %d\n", res); goto cleanup_pool; }
-
-        VkMemoryRequirements memReq;
-        vkGetImageMemoryRequirements(device, s_EnvImage, &memReq);
-        VkMemoryAllocateInfo imgAlloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        imgAlloc.allocationSize = memReq.size;
-        imgAlloc.memoryTypeIndex = VPTScene::FindMemoryType(gpu, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        res = vkAllocateMemory(device, &imgAlloc, nullptr, &s_EnvImageMemory);
-        if (res != VK_SUCCESS) { fprintf(stderr, "[VPTEnv] vkAllocateMemory image failed: %d\n", res); goto cleanup_pool; }
-        vkBindImageMemory(device, s_EnvImage, s_EnvImageMemory, 0);
-
-        // staging buffer for image
-        VkBuffer       imgStaging = VK_NULL_HANDLE;
-        VkDeviceMemory imgStagingMem = VK_NULL_HANDLE;
-        VkBufferCreateInfo ibci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        ibci.size = imageSize;
-        ibci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        ibci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        vkCreateBuffer(device, &ibci, nullptr, &imgStaging);
-        VkMemoryRequirements isReq;
-        vkGetBufferMemoryRequirements(device, imgStaging, &isReq);
-        VkMemoryAllocateInfo isAlloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        isAlloc.allocationSize = isReq.size;
-        isAlloc.memoryTypeIndex = VPTScene::FindMemoryType(gpu, isReq.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkAllocateMemory(device, &isAlloc, nullptr, &imgStagingMem);
-        vkBindBufferMemory(device, imgStaging, imgStagingMem, 0);
-
-        void* mapped = nullptr;
-        vkMapMemory(device, imgStagingMem, 0, imageSize, 0, &mapped);
-        memcpy(mapped, pixelData.data(), static_cast<size_t>(imageSize));
-        vkUnmapMemory(device, imgStagingMem);
-
-        // layout transition UNDEFINED → TRANSFER_DST
-        VkImageMemoryBarrier toTransfer{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toTransfer.image = s_EnvImage;
-        toTransfer.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-        toTransfer.subresourceRange.baseMipLevel   = 0;
-        toTransfer.subresourceRange.levelCount     = 1;
-        toTransfer.subresourceRange.baseArrayLayer = 0;
-        toTransfer.subresourceRange.layerCount     = 1;
-        toTransfer.srcAccessMask = 0;
-        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &toTransfer);
-
-        // copy buffer → image
-        VkBufferImageCopy copyRegion{};
-        copyRegion.bufferOffset = 0;
-        copyRegion.imageSubresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-        copyRegion.imageSubresource.mipLevel       = 0;
-        copyRegion.imageSubresource.baseArrayLayer = 0;
-        copyRegion.imageSubresource.layerCount     = 1;
-        copyRegion.imageExtent = { width, height, 1 };
-        vkCmdCopyBufferToImage(cmd, imgStaging, s_EnvImage,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
-
-        // layout transition TRANSFER_DST → SHADER_READ_ONLY
-        VkImageMemoryBarrier toShader{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-        toShader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toShader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        toShader.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toShader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toShader.image = s_EnvImage;
-        toShader.subresourceRange = toTransfer.subresourceRange;
-        toShader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toShader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &toShader);
-
-        s_PendingStagingBufs.push_back(imgStaging);
-        s_PendingStagingMems.push_back(imgStagingMem);
-    }
-
-    // ── 2. 创建 EnvAccel SSBO + staging 上传 ──
-    {
-        VkDeviceSize accelSize = VkDeviceSize(width) * height * sizeof(EnvAccel);
-
-        // device-local 目标
-        VkBufferCreateInfo dbCI{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        dbCI.size = accelSize;
-        dbCI.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        dbCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        vkCreateBuffer(device, &dbCI, nullptr, &s_EnvAccelBuffer);
-        VkMemoryRequirements dReq;
-        vkGetBufferMemoryRequirements(device, s_EnvAccelBuffer, &dReq);
-        VkMemoryAllocateInfo dAlloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        dAlloc.allocationSize = dReq.size;
-        dAlloc.memoryTypeIndex = VPTScene::FindMemoryType(gpu, dReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        vkAllocateMemory(device, &dAlloc, nullptr, &s_EnvAccelMemory);
-        vkBindBufferMemory(device, s_EnvAccelBuffer, s_EnvAccelMemory, 0);
-
-        // staging
-        VkBuffer       accelStaging = VK_NULL_HANDLE;
-        VkDeviceMemory accelStagingMem = VK_NULL_HANDLE;
-        VkBufferCreateInfo asCI{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        asCI.size = accelSize;
-        asCI.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        asCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        vkCreateBuffer(device, &asCI, nullptr, &accelStaging);
-        VkMemoryRequirements asReq;
-        vkGetBufferMemoryRequirements(device, accelStaging, &asReq);
-        VkMemoryAllocateInfo asAlloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        asAlloc.allocationSize = asReq.size;
-        asAlloc.memoryTypeIndex = VPTScene::FindMemoryType(gpu, asReq.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkAllocateMemory(device, &asAlloc, nullptr, &accelStagingMem);
-        vkBindBufferMemory(device, accelStaging, accelStagingMem, 0);
-
-        void* amapped = nullptr;
-        vkMapMemory(device, accelStagingMem, 0, accelSize, 0, &amapped);
-        memcpy(amapped, envAccel.data(), static_cast<size_t>(accelSize));
-        vkUnmapMemory(device, accelStagingMem);
-
-        VkBufferCopy copyRegion{ 0, 0, accelSize };
-        vkCmdCopyBuffer(cmd, accelStaging, s_EnvAccelBuffer, 1, &copyRegion);
-
-        s_PendingStagingBufs.push_back(accelStaging);
-        s_PendingStagingMems.push_back(accelStagingMem);
-    }
-
-    vkEndCommandBuffer(cmd);
-
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    res = vkQueueSubmit(inst.graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(inst.graphicsQueue);
-    if (res != VK_SUCCESS)
-        fprintf(stderr, "[VPTEnv] vkQueueSubmit failed: %d\n", res);
-
-    // 销毁 staging buffers（GPU 已 idle）
-    for (size_t i = 0; i < s_PendingStagingBufs.size(); i++)
-    {
-        if (s_PendingStagingBufs[i]) vkDestroyBuffer(device, s_PendingStagingBufs[i], nullptr);
-        if (s_PendingStagingMems[i]) vkFreeMemory(device, s_PendingStagingMems[i], nullptr);
-    }
-    s_PendingStagingBufs.clear();
-    s_PendingStagingMems.clear();
-
-    vkFreeCommandBuffers(device, pool, 1, &cmd);
-
-cleanup_pool:
-    vkDestroyCommandPool(device, pool, nullptr);
-
-    // ── 3. 创建 ImageView ──
-    if (s_EnvImage != VK_NULL_HANDLE)
-    {
-        VkImageViewCreateInfo ivCI{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        ivCI.image = s_EnvImage;
-        ivCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        ivCI.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        ivCI.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-        ivCI.subresourceRange.baseMipLevel   = 0;
-        ivCI.subresourceRange.levelCount     = 1;
-        ivCI.subresourceRange.baseArrayLayer = 0;
-        ivCI.subresourceRange.layerCount     = 1;
-        res = vkCreateImageView(device, &ivCI, nullptr, &s_EnvImageView);
-        if (res != VK_SUCCESS)
-            fprintf(stderr, "[VPTEnv] vkCreateImageView failed: %d\n", res);
-    }
-
-    // ── 4. Sampler（已由 InitFallback/EnsureSampler 建好则复用）──
     EnsureSampler(device);
 
     s_EnvWidth  = width;
     s_EnvHeight = height;
-    s_EnvReady  = (s_EnvImage != VK_NULL_HANDLE && s_EnvImageView != VK_NULL_HANDLE &&
-                   s_EnvAccelBuffer != VK_NULL_HANDLE);
-    fprintf(stderr, "[VPTEnv] HDR env map created: %ux%u, integral=%.4f, ready=%d\n",
+    s_EnvReady  = true;
+
+    s_PendingPixels.clear();
+    s_PendingAccel.clear();
+
+    fprintf(stderr, "[VPTEnv] HDR env map recorded: %ux%u, integral=%.4f, ready=%d\n",
             width, height, s_EnvIntegral, (int)s_EnvReady);
+    VPTTrace::Line("env: recorded %ux%u OK", width, height);
+    VPTTrace::Stage("env:done");
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -638,30 +725,46 @@ cleanup_pool:
 // ═══════════════════════════════════════════════════════════
 void VPTEnv::DestroyResources()
 {
+    std::lock_guard<std::recursive_mutex> guard(s_EnvMutex);
+
     const UnityVulkanInstance& inst = VPT_GetInstance();
     VkDevice device = inst.device;
     if (device == VK_NULL_HANDLE) return;
-    vkDeviceWaitIdle(device);
 
-    if (s_EnvImageView)   { vkDestroyImageView(device, s_EnvImageView, nullptr);   s_EnvImageView = VK_NULL_HANDLE; }
-    if (s_EnvImage)       { vkDestroyImage(device, s_EnvImage, nullptr);           s_EnvImage = VK_NULL_HANDLE; }
-    if (s_EnvImageMemory) { vkFreeMemory(device, s_EnvImageMemory, nullptr);       s_EnvImageMemory = VK_NULL_HANDLE; }
-    if (s_EnvAccelBuffer) { vkDestroyBuffer(device, s_EnvAccelBuffer, nullptr);    s_EnvAccelBuffer = VK_NULL_HANDLE; }
-    if (s_EnvAccelMemory) { vkFreeMemory(device, s_EnvAccelMemory, nullptr);       s_EnvAccelMemory = VK_NULL_HANDLE; }
-    s_EnvReady = false;
+    // 设备已丢失时 vkDeviceWaitIdle 可能长时间不返回，直接跳过等待
+    if (!VPT_IsDeviceLost())
+        VPT_CheckVk(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(VPTEnv::DestroyResources)");
+
+    DestroyEnvResourcesNoWait(device);
+
+    s_EnvPending = false;
+    s_FallbackNeedsRecord = false;
+    s_PendingPixels.clear();
+    s_PendingAccel.clear();
 }
 
 // ═══════════════════════════════════════════════════════════
-//  Shutdown — 拆全部（HDR 贴图 + 占位资源 + sampler）
+//  Shutdown — 拆全部（HDR 贴图 + 占位资源 + sampler + staging）
 // ═══════════════════════════════════════════════════════════
 void VPTEnv::Shutdown()
 {
+    std::lock_guard<std::recursive_mutex> guard(s_EnvMutex);
+
     DestroyResources();
 
     const UnityVulkanInstance& inst = VPT_GetInstance();
     VkDevice device = inst.device;
     if (device == VK_NULL_HANDLE) return;
-    vkDeviceWaitIdle(device);
+    if (!VPT_IsDeviceLost())
+        VPT_CheckVk(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(VPTEnv::Shutdown)");
+
+    for (size_t i = 0; i < s_PendingStagingBufs.size(); i++)
+    {
+        if (s_PendingStagingBufs[i]) vkDestroyBuffer(device, s_PendingStagingBufs[i], nullptr);
+        if (s_PendingStagingMems[i]) vkFreeMemory(device, s_PendingStagingMems[i], nullptr);
+    }
+    s_PendingStagingBufs.clear();
+    s_PendingStagingMems.clear();
 
     if (s_FallbackImageView)   { vkDestroyImageView(device, s_FallbackImageView, nullptr);   s_FallbackImageView = VK_NULL_HANDLE; }
     if (s_FallbackImage)       { vkDestroyImage(device, s_FallbackImage, nullptr);           s_FallbackImage = VK_NULL_HANDLE; }

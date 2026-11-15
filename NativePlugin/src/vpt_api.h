@@ -18,7 +18,7 @@ extern "C" {
     /// 更新场景数据
     /// sceneUpdate: 指向 VPT_SceneUpdate 结构的指针
     ///   - meshes: VPT_MeshData 数组（每个 mesh 描述顶点/索引/材质）
-    ///   - materials: VPT_Material 数组（96B/元素）
+    ///   - materials: VPT_Material 数组（128B/元素）
     ///   - lights: VPT_Light 数组（32B/元素）
     ///   - instances: VPT_InstanceData 数组（含 blasID + 3x4 变换矩阵）
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_UpdateScene(
@@ -96,12 +96,49 @@ extern "C" {
 
     // ── DLSS NGX 接口（Ray Reconstruction） ──────────────
 
+    /// 查询设备状态（GPU 复位 / VK_ERROR_DEVICE_LOST 后置 1）
+    /// 返回: 0=正常, 1=设备已丢失（此时插件已停止一切 GPU 工作，需重进 Play 恢复）
+    UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_GetDeviceStatus();
+
+    /// native 诊断日志（VPT-trace-native.log）的完整路径，用于把两个日志对起来看。
+    ///
+    /// ⚠ 生命周期（重要，与旧注释的说法不同）：该指针**不是**进程生命周期内有效。
+    ///   它指向插件内部 VPTTrace 的 std::string 缓冲区，只在「下一次
+    ///   VPTTrace::Shutdown() + Init()」（即卸载并重新加载插件）之前有效；
+    ///   那条路径一旦重新赋值并触发缓冲区重新分配，先前拿到的指针就是悬垂指针
+    ///   （use-after-free）。实现见 vpt_trace.cpp / vpt_trace.h 的 VPTTrace::Path()。
+    ///
+    /// 调用约定：拿到返回指针后必须**立即拷贝**成自己的字符串，禁止缓存该指针、
+    ///   禁止跨线程长期持有、禁止存进结构体。C# 侧 Marshal.PtrToStringAnsi 属于立即拷贝，
+    ///   符合约定；若将来改成缓存 IntPtr 再延后转 string，就必须重新审视本约定。
+    ///
+    /// 未初始化（Init 尚未执行）时返回空串 ""，不是 nullptr —— 调用方判空串即可。
+    UNITY_INTERFACE_EXPORT const char* UNITY_INTERFACE_API VPT_GetTracePath();
+
+    // ── 暂停 / 恢复（C# 重建场景前必须调用）───────────────────────────
+    // BuildScene() 会 DestroyImmediate 掉 PT 正在采样的 Texture2DArray 并重传贴图，
+    // 这些资源操作若与在飞帧重叠，GPU 会 fault（实测 TDR）。正确顺序：
+    //   VPT_PausePT(); 等 VPT_IsPaused()==1; 做重建; VPT_ResumePT();
+
+    /// 请求暂停：下一次 PT 事件里等 GPU 空闲后进入 paused 状态
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_PausePT();
+
+    /// 恢复渲染
+    UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_ResumePT();
+
+    /// 返回 1 表示已暂停且 GPU 已空闲（可以安全地销毁/重建 GPU 资源）
+    UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_IsPaused();
+
     /// 初始化 NGX DLSS Ray Reconstruction feature
     /// renderW/H: 渲染尺寸; outputW/H: 输出尺寸; qualityMode: 0=Q 1=B 2=P 3=UP
-    /// 返回: 0=成功, -1=不可用, -2=RR 不支持
+    /// 返回: 0=已接受（创建排队中，用 VPT_DLSS_QueryStatus 查询结果）,
+    ///       -1=不可用, -2=RR 不支持
     UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_DLSS_Init(
         int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
         int32_t qualityMode);
+
+    /// 查询延迟创建的结果: 1=已就绪, 0=排队中/未创建, -1=创建失败
+    UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_DLSS_QueryStatus();
 
     /// 销毁 NGX DLSS feature
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_DLSS_Destroy();

@@ -21,11 +21,19 @@
 
 namespace VPTEnv {
 
-    /// 设置 HDR 环境贴图
-    /// pixels: RGBA32F 数据（每像素 4 float，width*height 个像素）
-    /// width/height: equirect 贴图尺寸
-    /// 在原生侧创建 VkImage + alias 表 + SSBO。可重复调用（先销毁上轮资源）。
+    /// 设置 HDR 环境贴图（CPU 侧：行翻转 + alias 表构建 + 深拷贝，可在主线程调用）。
+    /// 真正的 VkImage/VkBuffer 创建与上传在 RecordPendingUploads 中录制进
+    /// Unity 的命令缓冲。可重复调用（覆盖上一轮待处理数据）。
     void SetEnvironmentMap(const float* pixels, uint32_t width, uint32_t height);
+
+    /// 是否有待处理的上传/占位资源初始化
+    bool HasPendingUploads();
+
+    /// 把待处理的上传（HDR 贴图、占位资源首次清屏/布局转换）录制进命令缓冲。
+    /// 由 Plan B 事件在渲染线程上调用；内部会在需要时等待 GPU 空闲再拆旧资源。
+    /// 返回 true 表示本帧替换了 HDR 贴图资源（descriptor 里的旧句柄已失效，
+    /// 调用方本帧不得再 dispatch）。
+    bool RecordPendingUploads(VkCommandBuffer cmd);
 
     /// 创建占位资源（1×1 黑色图 + 全零 alias 表 + 共享 sampler）。
     /// 在 VPT_Initialize 中调用一次；幂等，失败返回 false（此时 getter 返回空句柄，

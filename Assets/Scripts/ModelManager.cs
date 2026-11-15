@@ -44,11 +44,12 @@ public struct VertexGpuData
     // 16 + 16 + 16 + 16 + 16 = 80B
 }
 
-/// <summary>材质数组元素（按 materialID 索引，96B）。</summary>
+/// <summary>材质数组元素（按 materialID 索引，128B）。</summary>
 /// <remarks>
 /// 金属度工作流：metallic 线性插值 F0；roughness = 1 - URP _Smoothness，钳制 [0.02,1]。
 /// 扩展字段：emissionColor / 4个纹理slice索引 / flags / uvScaleOffset。
 /// 纹理索引 0xFFFFFFFF = 无纹理（使用 uniform 值）。
+/// 96B~128B 为体积（Volume）透射参数，与 native VPT_Material / GLSL 严格一致。
 /// </remarks>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct PathMaterial
@@ -73,10 +74,46 @@ public struct PathMaterial
     public float   diffuseTransmission; // 4B - 漫透射因子 [0,1]（纸张/布料等）
     public uint    thinWalled;          // 4B - 1=薄壁（无体积衰减），0=实体
     // -- 16B --
-    // 合计 96B
+    // ── 新增 32B 体积透射参数（96B ~ 128B）──
+    public Vector4 attenuationColor;    // 16B - 体积吸收色（线性 RGB），与 baseColor 相乘
+    public float   attenuationDistance; // 4B - 世界空间衰减距离（米）；<=0 无吸收
+    public uint    volumeFlags;         // 4B - 预留
+    public float   thickness;           // 4B - 世界空间厚度（米）；0 = 非体积
+    public float   padVolume;           // 4B - 16B 对齐填充
+    // -- 32B --
+    // 合计 128B
 }
 
-/// <summary>PathMaterial flags 位掩码（与 HLSL 一致）。</summary>
+/// <summary>
+/// 逐材质的体积（Volume）玻璃参数。
+/// </summary>
+/// <remarks>
+/// URP Lit 没有声明 _Thickness 等自定义属性，Material.GetFloat 读不到材质资产里
+/// 手写的未知属性（实测 Unity 2022.3：HasProperty=false，值丢失），所以体积参数
+/// 统一维护在 ModelManager 的这张表里，由 ModelManager 在收集材质时合并进 PathMaterial。
+/// 后续若换成自定义玻璃 Shader（属性真实存在于 Shader），也会读取 _Thickness /
+/// _AttenuationColor / _AttenuationDistance 作为默认值，本表可覆盖。
+/// </remarks>
+[Serializable]
+public class VolumeGlassMaterialParams
+{
+    [Tooltip("目标透明材质（玻璃）。留空则该条目被忽略。")]
+    public Material material;
+
+    [Tooltip("世界空间厚度（米）。<= 0 表示该材质仍走 thin-walled（薄壁）分支。\n" +
+             "教堂彩色玻璃实测 12mm（见方案 §0.2）。")]
+    public float thickness = 0.012f;
+
+    [Tooltip("世界空间衰减距离（米）。<= 0 表示无吸收（纯清玻璃）。\n" +
+             "建议 = thickness：单次穿过玻璃的透射率 ≈ attenuationColor。")]
+    public float attenuationDistance = 0.012f;
+
+    [Tooltip("体积吸收色（线性 RGB），与 baseColor 相乘。\n" +
+             "白色 = 直接使用贴图颜色（彩色玻璃马赛克逐像素着色），单色玻璃可直接填颜色。")]
+    public Color attenuationColor = Color.white;
+}
+
+/// <summary>PathMaterial flags 位掩码（与 HLSL/GLSL 一致）。</summary>
 public static class MaterialFlags
 {
     public const uint MAT_HAS_BASE       = 1u;
@@ -84,6 +121,8 @@ public static class MaterialFlags
     public const uint MAT_HAS_NORMAL     = 4u;
     public const uint MAT_HAS_EMISS      = 8u;
     public const uint MAT_IS_TRANSPARENT = 16u;  // bit4: 材质启用透射
+    public const uint MAT_IS_VOLUME      = 32u;  // bit5: 有厚度玻璃 → Beer-Lambert 体积分支
+    public const uint MAT_IS_THIN_WALLED = 64u;  // bit6: 零厚度薄壁 → 保留原 double-tint 语义
     public const uint TEX_NONE          = 0xFFFFFFFFu;
 }
 
@@ -103,6 +142,17 @@ public class ModelManager : MonoBehaviour
 
     [Tooltip("是否在构建完成后打印各数组统计信息")]
     public bool logBuildStats = true;
+
+    [Header("体积玻璃（Volume Transmission）")]
+    [Tooltip("总开关：关闭后所有透明材质回到 thin-walled（薄壁）行为，用于快速回退。\n" +
+             "开启时才允许 thickness > 0 的材质走 volume 分支。")]
+    public bool useVolumeGlass = true;
+
+    [Tooltip("逐材质体积参数表：thickness > 0 的透明材质走 volume 分支（Beer-Lambert 逐段吸收，\n" +
+             "颜色只乘一次）；thickness <= 0 的材质保持原薄壁 double-tint 行为。\n" +
+             "URP Lit 未声明自定义属性，材质资产里手写 _Thickness 读不到，故参数集中在这张表里。\n" +
+             "改动后重新进 Play 生效（构建只在 Start 时做一次；Play 中改这里不会重建）。")]
+    public List<VolumeGlassMaterialParams> volumeGlassMaterials = new List<VolumeGlassMaterialParams>();
 
     [Header("骨骼动画")]
     [Tooltip("refit 质量衰减对策（阶段3）：refit 是原地包络微调，大幅变形多帧后 BVH 遍历效率下降；\n"
@@ -165,6 +215,17 @@ public class ModelManager : MonoBehaviour
         BuildScene();
     }
 
+    // ── 关于"运行中重建场景" ──────────────────────────────────────
+    // 早期版本在 OnValidate 里延迟 0.25s 调 BuildScene()，用于在 Play 中边拖
+    // Inspector 边看体积玻璃参数效果。2026-11-15 定位到它是卡死根因，已整体移除：
+    //   · BuildScene() 第一步是 TextureArrays.Dispose()（DestroyImmediate 掉 4 个
+    //     Texture2DArray），而 PT 的 compute shader 正在采样这 4 个数组；
+    //   · 在飞帧还在读它们时释放 → GPU fault → nvlddmkm 153(TDR) → 编辑器卡死；
+    //   · 实测：OnValidate → BuildScene 开始后 29ms 就发生 TDR（11 次重建里命中 1 次）。
+    // 现在体积玻璃参数只在 Start() 的首次 BuildScene 里打包，改完重新进 Play 生效。
+    // 如果以后确实需要"运行中重建"，必须用 NativeBridge.VPT_PausePT() 等
+    // VPT_IsPaused()==1（GPU 已空闲）再做 GPU 资源操作，最后 VPT_ResumePT()。
+
     private void OnDestroy()
     {
         OnDestroyNative();
@@ -172,18 +233,69 @@ public class ModelManager : MonoBehaviour
             Instance = null;
         TextureArrays?.Dispose();
         TextureArrays = null;
+        foreach (var retired in _retiredTextureArrays) retired.Mgr?.Dispose();
+        _retiredTextureArrays.Clear();
+    }
+
+    // ── 旧纹理数组的延迟销毁 ──────────────────────────────
+    // TextureArrayManager.Dispose() 用 DestroyImmediate 释放 Texture2DArray，
+    // 而 PT shader 会采样它们（binding 10~13）。现在 Play 中不再重建，理论上一轮
+    // Play 只会构建一次；这里保留"退役 0.5s 后再销毁"的保险，避免将来任何
+    // 在 Play 中重跑的路径又把正在被采样的数组立刻释放掉。
+    private struct RetiredTextureArrays
+    {
+        public TextureArrayManager Mgr;
+        public float Time;
+        public int Frame;
+    }
+
+    private readonly List<RetiredTextureArrays> _retiredTextureArrays = new List<RetiredTextureArrays>();
+
+    private void RetireTextureArrays()
+    {
+        if (TextureArrays == null) return;
+        _retiredTextureArrays.Add(new RetiredTextureArrays
+        {
+            Mgr = TextureArrays,
+            Time = Time.realtimeSinceStartup,
+            Frame = Time.frameCount
+        });
+        TextureArrays = null;
+    }
+
+    private void Update()
+    {
+        if (_retiredTextureArrays.Count == 0) return;
+
+        for (int i = _retiredTextureArrays.Count - 1; i >= 0; i--)
+        {
+            RetiredTextureArrays r = _retiredTextureArrays[i];
+            if (Time.realtimeSinceStartup - r.Time < 0.5f) continue;
+            if (Time.frameCount - r.Frame < 3) continue;
+
+            r.Mgr?.Dispose();
+            _retiredTextureArrays.RemoveAt(i);
+            VptTrace.Line("Retired TextureArrays disposed (held " +
+                          (Time.realtimeSinceStartup - r.Time).ToString("F2") + "s)");
+        }
     }
 
     // ── 构建主流程 ──────────────────────────────────────
 
     /// <summary>
     /// 收集场景模型与材质，登记 BLAS 区间与实例，并推送数据到 native 插件。
-    /// 在 Start 中自动调用；场景变更后可手动调用重建。
+    /// 只在 Start() 里调用一次（进 Play 时构建）。运行中不再重建：见上方
+    /// "关于运行中重建场景"的说明（那正是之前卡死的根因）。
     /// </summary>
     public void BuildScene()
     {
-        // 释放旧纹理数组
-        TextureArrays?.Dispose();
+        // 卡死诊断（<项目根>/Logs/VPT-trace-csharp.log）
+        VptTrace.Beat();
+        VptTrace.Stage("BuildScene");
+        VptTrace.Line("BuildScene: begin");
+
+        // 旧纹理数组不能立即 Dispose：PT shader 可能还在采样（在飞帧）。
+        RetireTextureArrays();
         TextureArrays = new TextureArrayManager();
 
         // 临时容器
@@ -197,6 +309,17 @@ public class ModelManager : MonoBehaviour
         CleanupSkinnedTrackers();
         HasScene = false;
 
+        // —— 体积玻璃参数表：按材质查询，未命中的透明材质保持 thin-walled ——
+        var volumeParams = new Dictionary<Material, VolumeGlassMaterialParams>();
+        if (useVolumeGlass && volumeGlassMaterials != null)
+        {
+            foreach (VolumeGlassMaterialParams vp in volumeGlassMaterials)
+            {
+                if (vp != null && vp.material != null && vp.thickness > 0f)
+                    volumeParams[vp.material] = vp;
+            }
+        }
+
         // 1. 收集场景中的 MeshFilter
         MeshFilter[] filters = FindObjectsOfType<MeshFilter>();
         int collectedInstanceCount = 0;
@@ -207,6 +330,19 @@ public class ModelManager : MonoBehaviour
             Mesh mesh = mf.sharedMesh;
             if (mesh == null) mesh = mf.mesh;
             if (mesh == null) continue;
+
+            // Read/Write 关闭的 mesh 读不到几何：mesh.vertices / mesh.triangles 会报错并返回空数组，
+            // 但 mesh.vertexCount 仍返回真实值 → 会登记出一个「有顶点、0 三角形」的 BLAS 条目。
+            // 这类条目会被 native 当作退化 mesh 跳过（vpt_scene.cpp 的 SKIP degenerate 分支），
+            // 而 s_BLASes 是按 push_back 顺序索引的 → 后续所有实例的 blasID 集体错位，
+            // 表现是「实例位置正确、命中的几何是别的 mesh」，极难定位。
+            // 所以在登记之前就挡掉，保持「blasID == 登记顺序 == mesh 索引」这个不变量。
+            if (!mesh.isReadable)
+            {
+                Debug.LogWarning($"[ModelManager] '{mesh.name}' 未开启 Read/Write，已跳过路径追踪。" +
+                                 "如需参与请在该模型的导入设置里勾选 Read/Write。", mf);
+                continue;
+            }
 
             // Tag 过滤
             if (!string.IsNullOrEmpty(targetTag) && targetTag != "Untagged")
@@ -223,12 +359,25 @@ public class ModelManager : MonoBehaviour
             // —— 1a. 为每个唯一 mesh 登记 BLAS 区间（去重）——
             if (!meshToBlas.TryGetValue(mesh, out int blasId))
             {
+                // 退化 mesh 一律不登记 BLAS：空 mesh（vertexCount == 0）、点云/线框拓扑、
+                // 只有材质槽没有几何（triangles 为空）都属于这一类。
+                // 一旦登记，native 会跳过它构建 AS，而 s_BLASes 按下标索引 → 后续实例
+                // 全部指向错误的几何。跳过 = 该物体在 PT 里不出现（光栅画面仍在），
+                // 是明确且可诊断的降级。
+                int[] tris = mesh.triangles;
+                if (mesh.vertexCount == 0 || tris.Length < 3)
+                {
+                    Debug.LogWarning($"[ModelManager] 退化 mesh '{mesh.name}' 已跳过路径追踪" +
+                                     $"（顶点={mesh.vertexCount}, 索引={tris.Length}）。", mf);
+                    continue;
+                }
+
                 // 几何追加到全局数组（object-space），并登记该 BLAS 占用的区间
                 int vertBase = globalVerts.Count;
                 int triBase  = globalTris.Count;
                 AppendVertices(globalVerts, mesh);
-                int triCount = AppendTriangles(globalTris, mesh);
-                blasId = RegisterBlas(vertBase, mesh.vertexCount, triBase, triCount);
+                AppendTriangles(globalTris, tris);   // 复用上面已取到的索引数组，避免二次复制
+                blasId = RegisterBlas(vertBase, mesh.vertexCount, triBase, tris.Length / 3);
                 meshToBlas[mesh] = blasId;
             }
 
@@ -239,7 +388,8 @@ public class ModelManager : MonoBehaviour
             {
                 materialId = materials.Count;
                 matToId[mat] = materialId;
-                materials.Add(GetMaterial(mat, TextureArrays));
+                volumeParams.TryGetValue(mat, out VolumeGlassMaterialParams volume);
+                materials.Add(GetMaterial(mat, TextureArrays, volume));
             }
 
             // —— 1c. 登记实例 ——
@@ -362,7 +512,8 @@ public class ModelManager : MonoBehaviour
                 {
                     skinnedMaterialId = materials.Count;
                     matToId[mat] = skinnedMaterialId;
-                    materials.Add(GetMaterial(mat, TextureArrays));
+                    volumeParams.TryGetValue(mat, out VolumeGlassMaterialParams volumeSkinned);
+                    materials.Add(GetMaterial(mat, TextureArrays, volumeSkinned));
                 }
 
                 // —— 实例：transform 用 SMR 自身（蒙皮关节矩阵把顶点拉回 SMR 局部空间）——
@@ -408,15 +559,41 @@ public class ModelManager : MonoBehaviour
         // 4. 统计
         if (logBuildStats)
         {
+            // 体积/薄壁材质计数：确认 volume 分支是否真的落到材质数据上
+            //（体积材质=0 说明体积参数表没命中、thickness<=0 或总开关被关掉）
+            int volumeMatCount = 0, thinMatCount = 0;
+            foreach (PathMaterial m in Materials)
+            {
+                if ((m.flags & MaterialFlags.MAT_IS_VOLUME) != 0u) volumeMatCount++;
+                else if ((m.flags & MaterialFlags.MAT_IS_THIN_WALLED) != 0u) thinMatCount++;
+            }
+
             Debug.Log(
                 "[ModelManager] 构建完成：" +
                 $"BLAS={_blasRecords.Count}, 实例={collectedInstanceCount}, 材质={Materials.Length}, " +
+                $"体积材质={volumeMatCount}, 薄壁材质={thinMatCount}, " +
                 $"蒙皮实例={skinnedInstanceCount}, " +
                 $"三角形={GlobalTriangles.Length}, 顶点={GlobalVertices.Length}");
+
+            // 打印实际生效的体积参数（确认 Inspector 改动被重新打包）
+            if (volumeGlassMaterials != null)
+            {
+                foreach (VolumeGlassMaterialParams vp in volumeGlassMaterials)
+                {
+                    if (vp == null || vp.material == null) continue;
+                    Debug.Log($"[ModelManager] 体积玻璃：'{vp.material.name}' thickness={vp.thickness}m, " +
+                              $"attenuationDistance={vp.attenuationDistance}m, color={vp.attenuationColor} " +
+                              $"(useVolumeGlass={useVolumeGlass})");
+                }
+            }
         }
 
         // 5. 推送场景数据到 Native Vulkan 插件（BLAS/TLAS 构建）
+        VptTrace.Stage("BuildScene:PushToNative");
         PushToNative();
+
+        VptTrace.Line("BuildScene: done");
+        VptTrace.Stage("idle");
     }
 
     // ── BLAS / 实例登记 helper ───────────────────────────
@@ -453,8 +630,9 @@ public class ModelManager : MonoBehaviour
     /// 其次 _Color/_Glossiness（旧版/内置），最后 fallback。
     /// roughness 钳制到 [0.02, 1] 防止镜面退化导致除零。
     /// 纹理提取：通过 texMgr 注册 Texture2D 获得 slice 索引，写入 PathMaterial。
+    /// volume：体积玻璃参数（来自 ModelManager.volumeGlassMaterials 表；null = 走 thin-walled）。
     /// </summary>
-    private static PathMaterial GetMaterial(Material mat, TextureArrayManager texMgr)
+    private PathMaterial GetMaterial(Material mat, TextureArrayManager texMgr, VolumeGlassMaterialParams volume)
     {
         PathMaterial pm;
         pm.albedo = Vector4.one;
@@ -473,6 +651,12 @@ public class ModelManager : MonoBehaviour
         pm.ior = 1.5f;
         pm.diffuseTransmission = 0f;
         pm.thinWalled = 0u;
+        // ── 体积参数初始化：thickness = 0 → 非体积（默认不改变现有行为）──
+        pm.attenuationColor = Vector4.one;
+        pm.attenuationDistance = 0f;
+        pm.volumeFlags = 0u;
+        pm.thickness = 0f;
+        pm.padVolume = 0f;
 
         if (mat == null) return pm;
 
@@ -592,12 +776,50 @@ public class ModelManager : MonoBehaviour
         else
             pm.uvScaleOffset = new Vector4(1f, 1f, 0f, 0f);
 
+        // ── 体积（Volume）玻璃参数 ──
+        // 默认 thickness = 0 → thin-walled（现有材质不回归）。
+        // 优先级：ModelManager.volumeGlassMaterials 表 > 材质属性
+        //（后者仅当 Shader 真的声明了 _Thickness 等属性时可读，URP Lit 上没有）。
+        float thickness = 0f;
+        float attenuationDistance = 0f;
+        Color attenuationColor = Color.white;
+
+        if (mat.HasProperty("_Thickness"))
+            thickness = Mathf.Max(0f, mat.GetFloat("_Thickness"));
+        if (mat.HasProperty("_AttenuationDistance"))
+            attenuationDistance = mat.GetFloat("_AttenuationDistance");
+        if (mat.HasProperty("_AttenuationColor"))
+            attenuationColor = mat.GetColor("_AttenuationColor");
+
+        if (volume != null)
+        {
+            thickness = Mathf.Max(0f, volume.thickness);
+            attenuationDistance = volume.attenuationDistance;
+            attenuationColor = volume.attenuationColor;
+        }
+
+        pm.thickness = thickness;
+        pm.attenuationDistance = attenuationDistance;
+        pm.attenuationColor = attenuationColor;
+        pm.volumeFlags = 0u;
+
         // ── 透射参数：基于 URP Surface Type + albedo alpha ──
-        // Surface Type = Transparent 时启用半透明 BSDF
+        // Surface Type = Transparent 时启用半透明 BSDF；
+        // thickness > 0 且总开关打开 → volume（Beer-Lambert，颜色只乘一次），
+        // 否则保持 thin-walled（薄壁，原 double-tint 语义）。
         if (mat.HasProperty("_Surface") && mat.GetFloat("_Surface") > 0.5f)
         {
             flags |= MaterialFlags.MAT_IS_TRANSPARENT;
-            pm.thinWalled = 1u; // 薄壁模式（默认，无体积吸收）
+            if (useVolumeGlass && thickness > 0f)
+            {
+                flags |= MaterialFlags.MAT_IS_VOLUME;
+                pm.thinWalled = 0u;
+            }
+            else
+            {
+                flags |= MaterialFlags.MAT_IS_THIN_WALLED;
+                pm.thinWalled = 1u; // 薄壁模式（无体积吸收）
+            }
         }
         // transmission = 1 - albedo.a（HLSL 侧 applyMaterialTextures 后用最终 alpha 覆盖）
         pm.transmission = 1.0f - pm.albedo.w;
@@ -638,12 +860,13 @@ public class ModelManager : MonoBehaviour
     }
 
     /// <summary>
-    /// 把 mesh 的三角形索引追加到全局三角形数组（保持原始顺序，值=object 局部顶点索引），
+    /// 把三角形索引追加到全局三角形数组（保持原始顺序，值=object 局部顶点索引），
     /// 返回追加的三角形数量。
+    /// 索引数组由调用方传入：调用方本来要先取它做退化判断（<3 个索引就整条跳过），
+    /// 传进来可避免 mesh.triangles 被复制两次。
     /// </summary>
-    private static int AppendTriangles(List<PathTriangle> globalTris, Mesh mesh)
+    private static int AppendTriangles(List<PathTriangle> globalTris, int[] tris)
     {
-        int[] tris = mesh.triangles;
         for (int i = 0; i < tris.Length; i += 3)
         {
             globalTris.Add(new PathTriangle
@@ -707,6 +930,10 @@ public class ModelManager : MonoBehaviour
     /// </summary>
     public void PushToNative()
     {
+        VptTrace.Beat();
+        VptTrace.Stage("PushToNative");
+        VptTrace.Line("PushToNative: begin");
+
         // 确保插件已初始化（首次调用触发 DLL 加载 + UnityPluginLoad + VPT_Initialize）
         if (!NativeBridge.TryInitialize())
         {
@@ -716,6 +943,13 @@ public class ModelManager : MonoBehaviour
         }
 
         _nativePushPending = false;
+
+        // GPU 设备已丢失（TDR）：native 侧不会再有任何事件回调，推送只会占着内存
+        if (NativeBridge.VPT_GetDeviceStatus() == 1)
+        {
+            Debug.LogWarning("[ModelManager] GPU 设备已丢失，跳过场景推送；请退出 Play 后重新进入。");
+            return;
+        }
 
         // 释放上次的 pinned handle 和非托管分配
         foreach (var h in _nativePins) if (h.IsAllocated) h.Free();
@@ -776,7 +1010,7 @@ public class ModelManager : MonoBehaviour
         var meshPin = GCHandle.Alloc(meshDataArr, GCHandleType.Pinned);
         _nativePins.Add(meshPin);
 
-        // 4. 材质数据（PathMaterial 96B 直接兼容）
+        // 4. 材质数据（PathMaterial 128B 与 native VPT_Material 严格一致）
         var matPin = GCHandle.Alloc(Materials, GCHandleType.Pinned);
         _nativePins.Add(matPin);
 
@@ -832,10 +1066,12 @@ public class ModelManager : MonoBehaviour
         };
 
         NativeBridge.UpdateScene(ref sceneUpdate);
+        VptTrace.Line("PushToNative: VPT_UpdateScene returned (queued in native)");
 
         // 8. 骨骼动画：GPU 蒙皮静态数据注册（一次性，须在 UpdateScene 之后：
         //    native 侧自统一顶点缓冲复制 bind-pose base 副本）。
         //    bindposes 不上传——每帧折算进关节矩阵。
+        VptTrace.Stage("PushToNative:skin-register");
         int skinRegistered = 0;
         foreach (var tr in _skinnedTracker)
         {
@@ -890,6 +1126,10 @@ public class ModelManager : MonoBehaviour
                   $"{Materials.Length} mats, {lightCount} lights, " +
                   $"{vptInstances.Length} instances, " +
                   $"蒙皮注册={skinRegistered}");
+        VptTrace.Line("PushToNative: done (" + meshDataArr.Length + " meshes, " +
+                      Materials.Length + " mats, " + vptInstances.Length + " instances, skin=" +
+                      skinRegistered + ")");
+        VptTrace.Stage("idle");
     }
 
     // ═════════════════════════════════════════════════════════

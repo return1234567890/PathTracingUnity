@@ -4,7 +4,7 @@
 // VPT 共享数据结构（C#/C++ 跨语言，内存布局严格对齐）
 //
 // C# 侧对应:
-//   PathMaterial  → VPT_Material  (96B)
+//   PathMaterial  → VPT_Material  (128B)
 //   PathLight     → VPT_Light     (32B)
 //   VertexGpuData → VPT_Vertex    (80B)
 //   InstanceRecord → VPT_Instance  (136B + padding → 144B)
@@ -37,14 +37,15 @@ struct VPT_Vertex
 };
 static_assert(sizeof(VPT_Vertex) == 80, "VPT_Vertex must be 80 bytes");
 
-/// 材质结构（96B，与 PathMaterial 一致）
+/// 材质结构（128B，与 PathMaterial 一致）
 struct VPT_Material
 {
     float    albedo[4];         // 16B - base color tint (rgba)
     float    metallic;          // 4B
     float    roughness;         // 4B
     float    bumpScale;         // 4B - normal map strength
-    uint32_t flags;             // 4B - bit0:hasBaseMap, bit1:hasMetalRough, bit2:hasNormal, bit3:hasEmissive, bit4:transparent
+    uint32_t flags;             // 4B - bit0:hasBaseMap, bit1:hasMetalRough, bit2:hasNormal, bit3:hasEmissive,
+                                //       bit4:transparent, bit5:volume, bit6:thinWalled
     // -- 32B --
     float    emissionColor[4];  // 16B - emissive tint (rgba)
     uint32_t baseTexID;        // 4B - BaseColorArray slice (0xFFFFFFFF=none)
@@ -59,9 +60,16 @@ struct VPT_Material
     float    diffuseTransmission;// 4B
     uint32_t thinWalled;        // 4B
     // -- 16B --
-    // 合计 96B
+    // ── 体积透射（96B ~ 128B）──
+    float    attenuationColor[4]; // 16B - 体积吸收色（线性 RGB），与 baseColor 相乘
+    float    attenuationDistance; // 4B - 世界空间衰减距离（米）；<=0 无吸收
+    uint32_t volumeFlags;         // 4B - 预留
+    float    thickness;           // 4B - 世界空间厚度（米）；0 = 非体积
+    float    padVolume;           // 4B - 16B 对齐填充
+    // -- 32B --
+    // 合计 128B
 };
-static_assert(sizeof(VPT_Material) == 96, "VPT_Material must be 96 bytes");
+static_assert(sizeof(VPT_Material) == 128, "VPT_Material must be 128 bytes");
 
 /// 光源结构（32B，与 PathLight 一致）
 struct VPT_Light

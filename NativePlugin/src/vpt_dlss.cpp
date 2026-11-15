@@ -13,6 +13,7 @@
 #include "vpt_internal.h"
 #include "vpt_dispatch.h"  // EVENT_PATHTRACE
 #include "vpt_gpu_timer.h"
+#include "vpt_trace.h"
 
 #include "IUnityInterface.h"
 #include "IUnityGraphics.h"
@@ -24,6 +25,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
+#include <mutex>
 #include <windows.h>
 
 #ifdef VPT_DLSS_ENABLED
@@ -46,6 +49,42 @@ static bool                 s_NGXInitialized = false;
 static NVSDK_NGX_Handle*    s_DLSSHandle      = nullptr;
 static NVSDK_NGX_Parameter* s_DLSSParams      = nullptr;
 static bool                 s_DLSSReady       = false;
+
+// ── 延迟创建（Plan B）：C# 侧只排队，创建在 Unity 命令缓冲里录制 ──
+static bool     s_PendingCreate = false;
+static int32_t  s_InitStatus    = 0;   // 0=未创建/排队中, 1=ready, -1=失败
+static int32_t  s_PendingQuality = 1;
+
+// 主线程不能安全销毁仍可能被在飞帧引用的 ImageView：先排队，
+// 在事件回调里等 GPU 空闲后再销毁。
+static std::vector<VkImageView> s_DeferredViewDestroy;
+static VkDevice                s_DeferredViewDevice = VK_NULL_HANDLE;
+
+// C# 主线程（Init/Destroy/Prepare）与渲染线程（RecordPendingCreate/RenderCallback）
+// 共享上面的状态：用一把锁串行化（recursive：Destroy 会在 Init 内部被调用）。
+static std::recursive_mutex    s_DlssMutex;
+
+static void FlushDeferredViewDestroy(VkDevice device)
+{
+    if (s_DeferredViewDestroy.empty())
+        return;
+
+    // 设备换了（重进 Play / 设备重建）：旧句柄在新设备上无效，直接丢弃
+    if (device == VK_NULL_HANDLE || device != s_DeferredViewDevice)
+    {
+        s_DeferredViewDestroy.clear();
+        s_DeferredViewDevice = VK_NULL_HANDLE;
+        return;
+    }
+
+    if (!VPT_IsDeviceLost())
+        VPT_CheckVk(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(dlss deferred view destroy)");
+
+    for (VkImageView v : s_DeferredViewDestroy)
+        vkDestroyImageView(device, v, nullptr);
+    s_DeferredViewDestroy.clear();
+    s_DeferredViewDevice = VK_NULL_HANDLE;
+}
 
 // 缓存的 ImageView（当 Unity VkImage 变化时重建）
 struct DLSSImageViewCache {
@@ -86,6 +125,9 @@ static bool EnsureDLSSImageView(IUnityGraphicsVulkan* vulkan, VkDevice device,
                                 VkImageLayout layout, VkAccessFlags access,
                                 const char* name)
 {
+    // name 都是字面量，可直接作为"当前阶段"给看门狗用
+    VPTTrace::Stage(name);
+
     UnityVulkanImage vkImg{};
     bool ok = vulkan->AccessTexture(nativeTex, UnityVulkanWholeImage,
         layout,
@@ -136,6 +178,18 @@ int32_t VPT_DLSS_Init_Internal(
     int32_t outputW, int32_t outputH,
     int32_t qualityMode)
 {
+    std::lock_guard<std::recursive_mutex> guard(s_DlssMutex);
+
+    // 二分排查开关：VPT_NO_DLSS=1 完全跳过 NGX（不 Init / 不 Create / 不 Evaluate）
+    if (VPT_EnvFlag("VPT_NO_DLSS"))
+    {
+        fprintf(stderr, "[VPT-DLSS] VPT_NO_DLSS=1 -> DLSS disabled by env.\n");
+        VPTTrace::Line("DLSS init: skipped by VPT_NO_DLSS");
+        s_PendingCreate = false;
+        s_InitStatus    = -1;
+        return -1;
+    }
+
     if (s_DLSSReady)
     {
         // 尺寸/模式变化时销毁重建
@@ -170,6 +224,8 @@ int32_t VPT_DLSS_Init_Internal(
     // ── 1. NGX Vulkan Init（仅一次） ──
     if (!s_NGXInitialized)
     {
+        VPTTrace::Stage("dlss:ngx-init");
+        VPTTrace::Line("DLSS init: NVSDK_NGX_VULKAN_Init begin (dataPath=%S)", dataPath);
         fprintf(stderr, "[VPT-DLSS] NGX data path: %S\n", dataPath);
         fprintf(stderr, "[VPT-DLSS] VkInstance=%p VkPhysicalDevice=%p VkDevice=%p\n",
                 (void*)inst.instance, (void*)inst.physicalDevice, (void*)inst.device);
@@ -237,11 +293,13 @@ int32_t VPT_DLSS_Init_Internal(
             inst.instance, inst.physicalDevice, inst.device,
             gipa, gdpa, &featureInfo,
             NVSDK_NGX_Version_API);
+        VPTTrace::Line("DLSS init: NVSDK_NGX_VULKAN_Init returned 0x%x", (unsigned)result);
         fprintf(stderr, "[VPT-DLSS] NVSDK_NGX_VULKAN_Init (appId=%llu) result: 0x%x\n",
                 (unsigned long long)VPT_DLSS_APP_ID, result);
         if (result != NVSDK_NGX_Result_Success)
         {
             fprintf(stderr, "[VPT-DLSS] NVSDK_NGX_VULKAN_Init failed.\n");
+            VPTTrace::Line("DLSS init: NGX init FAILED 0x%x", (unsigned)result);
             return -1;
         }
         s_NGXInitialized = true;
@@ -251,6 +309,8 @@ int32_t VPT_DLSS_Init_Internal(
     // ── 1.5 查询 NGX 能力 ──
     // RR 查询 SuperSamplingDenoising_Available
     {
+        VPTTrace::Stage("dlss:capability");
+        VPTTrace::Line("DLSS init: capability query begin ...");
         // ── 扩展需求诊断：查询 RR 需要的 Vulkan 设备/instance 扩展 ──
         // CreateFeature 参数矩阵已全部排除（12 组全 0xbad00005），
         // 新假设：Unity VkDevice 未启用 RR 所需的设备扩展。
@@ -326,6 +386,7 @@ int32_t VPT_DLSS_Init_Internal(
             if (!rrAvailable)
             {
                 fprintf(stderr, "[VPT-DLSS] Ray Reconstruction not supported on this GPU/driver.\n");
+                VPTTrace::Line("DLSS init: RR not available on this GPU/driver");
                 NVSDK_NGX_VULKAN_DestroyParameters(capParams);
                 return -2; // RR 不支持
             }
@@ -392,12 +453,74 @@ int32_t VPT_DLSS_Init_Internal(
         return -1;
     }
 
-    // ── 3. 映射 qualityMode ──
-    fprintf(stderr, "[VPT-DLSS] CreateFeature params: render=%dx%d output=%dx%d quality=%d\n",
+    // ── 3. 记录待创建参数 ──
+    // NGX_VULKAN_CREATE_DLSSD 需要往一个 VkCommandBuffer 里录制初始化命令。
+    // 本函数由 C# 在 URP 的 Execute 里调用（主线程），而 Unity 的 VkQueue 属于
+    // 渲染线程：自建 cb + vkQueueSubmit 会和 Unity 抢同一条队列（实测直接
+    // GPU 挂死 → TDR → VK_ERROR_DEVICE_LOST）。
+    // 因此这里只排队，真正的 Create 交给 Plan B 事件里的
+    // VPT_DLSS_RecordPendingCreate（用 Unity 当前的 command buffer）。
+    s_PendingCreate  = true;
+    s_InitStatus     = 0;          // 0 = 已排队，等待事件内创建
+    s_PendingRenderW  = renderW;
+    s_PendingRenderH  = renderH;
+    s_PendingOutputW  = outputW;
+    s_PendingOutputH  = outputH;
+    s_PendingQuality  = qualityMode;
+
+    fprintf(stderr, "[VPT-DLSS] CreateFeature queued: render=%dx%d output=%dx%d quality=%d "
+                    "(deferred to Unity command buffer)\n",
             renderW, renderH, outputW, outputH, qualityMode);
-    // C# 约定: 0=Quality 1=Balanced 2=Performance 3=UltraPerf
+    fflush(stderr);
+    VPTTrace::Line("DLSS init: queued create %dx%d -> %dx%d q=%d", renderW, renderH, outputW, outputH, qualityMode);
+    return 0;
+}
+
+int32_t VPT_DLSS_GetStatus()
+{
+    std::lock_guard<std::recursive_mutex> guard(s_DlssMutex);
+    return s_InitStatus;
+}
+
+bool VPT_DLSS_HasPendingCreate()
+{
+    std::lock_guard<std::recursive_mutex> guard(s_DlssMutex);
+    return s_PendingCreate;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  延迟创建：在 Unity 命令缓冲里录制 NGX CreateFeature
+// ═══════════════════════════════════════════════════════════
+
+int32_t VPT_DLSS_RecordPendingCreate(VkCommandBuffer cmd)
+{
+    std::lock_guard<std::recursive_mutex> guard(s_DlssMutex);
+    const VkDevice device = VPT_GetInstance().device;
+
+    // 先把主线程排队的 ImageView 释放掉（等 GPU 空闲后）
+    FlushDeferredViewDestroy(device);
+
+    if (!s_PendingCreate || cmd == VK_NULL_HANDLE)
+        return 0;
+
+    if (VPT_IsDeviceLost())
+    {
+        s_PendingCreate = false;
+        s_InitStatus    = -1;
+        fprintf(stderr, "[VPT-DLSS] pending create dropped: device lost.\n");
+        return -1;
+    }
+
+    s_PendingCreate = false;
+
+    if (device == VK_NULL_HANDLE || !s_DLSSParams)
+    {
+        s_InitStatus = -1;
+        return -1;
+    }
+
     NVSDK_NGX_PerfQuality_Value perfQuality;
-    switch (qualityMode)
+    switch (s_PendingQuality)
     {
         case 0: perfQuality = NVSDK_NGX_PerfQuality_Value_MaxQuality; break;
         case 1: perfQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
@@ -406,62 +529,10 @@ int32_t VPT_DLSS_Init_Internal(
         default: perfQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
     }
 
-    // 创建 one-shot command buffer 用于 feature 初始化
-    VkCommandPool cmdPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmdBuf = VK_NULL_HANDLE;
-    VkCommandPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    // RESET flag：RR 多组合重试时需多次 begin 同一 cmdBuf（begin 隐式重置）
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT
-                   | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    poolInfo.queueFamilyIndex = inst.queueFamilyIndex;
-    VkResult vr = vkCreateCommandPool(inst.device, &poolInfo, nullptr, &cmdPool);
-    fprintf(stderr, "[VPT-DLSS] vkCreateCommandPool: %d, pool=%p\n", vr, (void*)cmdPool);
-    if (vr != VK_SUCCESS)
-    {
-        fprintf(stderr, "[VPT-DLSS] vkCreateCommandPool failed.\n");
-        NVSDK_NGX_VULKAN_DestroyParameters(s_DLSSParams);
-        s_DLSSParams = nullptr;
-        return -1;
-    }
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = cmdPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    vr = vkAllocateCommandBuffers(inst.device, &allocInfo, &cmdBuf);
-    fprintf(stderr, "[VPT-DLSS] vkAllocateCommandBuffers: %d, cmdBuf=%p\n", vr, (void*)cmdBuf);
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vr = vkBeginCommandBuffer(cmdBuf, &beginInfo);
-    fprintf(stderr, "[VPT-DLSS] vkBeginCommandBuffer: %d\n", vr);
-
-    // ═══ RR: NVSDK_NGX_Feature_RayReconstruction ═══
-    // 根因（nvngx_dlssd_310_7_0.log）：
-    //   [NgxSwinDenoiser::CreateDldnInstance] Error: HDR Color required
-    // RR 的 Preset_D transformer 模型（SwinDenoiser）强制要求 IsHDR flag，
+    // RR 的 Preset_D transformer 模型（SwinDenoiser）强制要求 IsHDR，
     // 输入颜色须为线性 HDR（路径追踪 radiance 天然满足）。
-    //
-    // DepthInverted 排除（边缘抖动修复 2026-09-07）：
-    // 该 flag 语义是「深度缓冲为反向 z 排序（near 大 far 小）」，
-    // 只适用于 reversed-Z 的 NDC 深度。RR 用 Linear 深度
-    // （LinearDepthOut = curClip.w，near 小 far 大，非反向），
-    // 设置该 flag 会使 RR 深度一致性/disocclusion 检测方向颠倒，
-    // 边缘深度突变处时域历史被错误取舍 → 模型边缘抖动。
-    //
-    // AutoExposure 排除（亮处抖动修复 2026-09-07）：
-    // 官方参考 Linear 深度下 InFeatureCreateFlags = IsHDR | MVLowRes，
-    // 不含 AutoExposure。RR 输入是 1spp 逐帧独立噪声（NEE 随机选灯 +
-    // Halton jitter），全图亮度统计逐帧波动 → AutoExposure 估计出的曝光
-    // 逐帧波动（日志佐证：dlssd 创建了 AutoExposure / PrevAutoExposureTexture_0/1
-    // 内部纹理）。曝光是全图乘性作用，亮区绝对波动远大于暗区 →
-    // 「被光照到的像素抖、暗处不抖」。Streamline 官方文档亦注明
-    // "DLSS-RR will ignore DLSS options sharpness and useAutoExposure"。
-    // 移除后 evaluate 侧 InPreExposure/InExposureScale=1.0 即固定曝光。
-    // 首选组合 = 0x03（与官方参考完全一致），0x43（旧首选）与
-    // 0x4b（含 DepthInverted）降为备选对照。
+    // DepthInverted / AutoExposure 的取舍见 2026-09-07 的修复说明：
+    // 首选组合 = 0x03（与官方参考完全一致），0x43 / 0x4b 仅作备选。
     const int rrFlagCombos[] = {
         NVSDK_NGX_DLSS_Feature_Flags_IsHDR
       | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes,                    // 0x03 首选
@@ -475,20 +546,20 @@ int32_t VPT_DLSS_Init_Internal(
     };
     const int rrComboCount = (int)(sizeof(rrFlagCombos) / sizeof(rrFlagCombos[0]));
 
-    result = NVSDK_NGX_Result_Fail;
+    NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
     for (int fi = 0; fi < rrComboCount && result != NVSDK_NGX_Result_Success; fi++)
     {
         NVSDK_NGX_DLSSD_Create_Params rrParams{};
-        rrParams.InWidth             = (unsigned)renderW;
-        rrParams.InHeight            = (unsigned)renderH;
-        rrParams.InTargetWidth       = (unsigned)outputW;
-        rrParams.InTargetHeight      = (unsigned)outputH;
-        rrParams.InPerfQualityValue  = perfQuality;
+        rrParams.InWidth              = (unsigned)s_PendingRenderW;
+        rrParams.InHeight             = (unsigned)s_PendingRenderH;
+        rrParams.InTargetWidth        = (unsigned)s_PendingOutputW;
+        rrParams.InTargetHeight       = (unsigned)s_PendingOutputH;
+        rrParams.InPerfQualityValue   = perfQuality;
         rrParams.InFeatureCreateFlags = rrFlagCombos[fi];
         rrParams.InEnableOutputSubrects = false;
-        rrParams.InDenoiseMode       = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
-        rrParams.InRoughnessMode     = NVSDK_NGX_DLSS_Roughness_Mode_Packed;
-        rrParams.InUseHWDepth        = NVSDK_NGX_DLSS_Depth_Type_Linear;
+        rrParams.InDenoiseMode        = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
+        rrParams.InRoughnessMode      = NVSDK_NGX_DLSS_Roughness_Mode_Packed;
+        rrParams.InUseHWDepth         = NVSDK_NGX_DLSS_Depth_Type_Linear;
 
         fprintf(stderr, "[VPT-DLSS] RR create (flags=0x%x%s): W=%u H=%u TW=%u TH=%u PQ=%d\n",
                 rrParams.InFeatureCreateFlags,
@@ -498,47 +569,34 @@ int32_t VPT_DLSS_Init_Internal(
                 rrParams.InTargetWidth, rrParams.InTargetHeight, (int)perfQuality);
 
         s_DLSSHandle = nullptr;
+        VPTTrace::Stage("dlss:NGX-create-feature");
+        VPTTrace::Line("DLSS create: calling NGX_VULKAN_CREATE_DLSSD (flags=0x%x) ...",
+                       rrParams.InFeatureCreateFlags);
         result = NGX_VULKAN_CREATE_DLSSD_EXT1(
-            inst.device, cmdBuf,
+            device, cmd,
             0, 0,
             &s_DLSSHandle, s_DLSSParams, &rrParams);
+        VPTTrace::Line("DLSS create: returned 0x%x (handle=%p)", (unsigned)result, (void*)s_DLSSHandle);
         fprintf(stderr, "[VPT-DLSS]   -> 0x%x, handle=%p\n", result, (void*)s_DLSSHandle);
-
-        if (result != NVSDK_NGX_Result_Success)
-        {
-            // 结束本次记录并重新 begin（pool 带 RESET flag，begin 隐式重置）
-            vkEndCommandBuffer(cmdBuf);
-            vkBeginCommandBuffer(cmdBuf, &beginInfo);
-        }
     }
-
-    vr = vkEndCommandBuffer(cmdBuf);
-    fprintf(stderr, "[VPT-DLSS] vkEndCommandBuffer: %d\n", vr);
-
-    if (result == NVSDK_NGX_Result_Success)
-    {
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cmdBuf;
-        vkQueueSubmit(inst.graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-        vkQueueWaitIdle(inst.graphicsQueue);
-    }
-
-    vkFreeCommandBuffers(inst.device, cmdPool, 1, &cmdBuf);
-    vkDestroyCommandPool(inst.device, cmdPool, nullptr);
 
     if (result != NVSDK_NGX_Result_Success)
     {
         fprintf(stderr, "[VPT-DLSS] CreateFeature failed: 0x%x\n", result);
         NVSDK_NGX_VULKAN_DestroyParameters(s_DLSSParams);
         s_DLSSParams = nullptr;
+        s_DLSSReady  = false;
+        s_InitStatus = -1;
         return -1;
     }
 
-    s_DLSSReady = true;
+    s_DLSSReady  = true;
+    s_InitStatus = 1;
+
     fprintf(stderr, "[VPT-DLSS] DLSS RR feature created: %dx%d -> %dx%d (quality=%d)\n",
-            renderW, renderH, outputW, outputH, qualityMode);
+            s_PendingRenderW, s_PendingRenderH, s_PendingOutputW, s_PendingOutputH, s_PendingQuality);
+    fflush(stderr);
+    VPTTrace::Line("DLSS create: feature ready (%dx%d)", s_PendingRenderW, s_PendingRenderH);
     return 0;
 }
 
@@ -548,6 +606,7 @@ int32_t VPT_DLSS_Init_Internal(
 
 void VPT_DLSS_Destroy_Internal()
 {
+    std::lock_guard<std::recursive_mutex> guard(s_DlssMutex);
     VkDevice device = VPT_GetInstance().device;
 
     if (s_DLSSHandle)
@@ -564,9 +623,15 @@ void VPT_DLSS_Destroy_Internal()
     }
 
     // 清理缓存的 ImageView
+    // 注意：本函数在主线程调用，此时渲染线程可能还有在飞帧在用这些 view。
+    // 直接 vkDestroyImageView 会破坏在飞帧 → 同一类 GPU 挂死，因此延后到
+    // 事件回调里、等 GPU 空闲后再真正销毁（见 FlushDeferredViewDestroy）。
     auto cleanupView = [&](DLSSImageViewCache& c) {
         if (c.view && device != VK_NULL_HANDLE)
-            vkDestroyImageView(device, c.view, nullptr);
+        {
+            s_DeferredViewDestroy.push_back(c.view);
+            s_DeferredViewDevice = device;
+        }
         c.view = VK_NULL_HANDLE;
         c.image = VK_NULL_HANDLE;
     };
@@ -580,11 +645,16 @@ void VPT_DLSS_Destroy_Internal()
 
     s_DLSSReady = false;
     s_DLSSParams = nullptr;
+    s_PendingCreate = false;
+    s_InitStatus    = 0;
 
     // Shutdown NGX Core (device-level)
     if (s_NGXInitialized)
     {
+        VPTTrace::Stage("dlss:ngx-shutdown");
+        VPTTrace::Line("DLSS destroy: NVSDK_NGX_VULKAN_Shutdown1 begin ...");
         NVSDK_NGX_VULKAN_Shutdown1(device);
+        VPTTrace::Line("DLSS destroy: NGX shutdown done");
         s_NGXInitialized = false;
     }
 
@@ -605,8 +675,12 @@ void VPT_DLSS_PrepareRRDispatch_Internal(
     float jitterX, float jitterY, int32_t reset,
     const float* viewMatrix, const float* projMatrix)
 {
+    std::lock_guard<std::recursive_mutex> guard(s_DlssMutex);
     if (!s_DLSSReady || !colorLowPtr || !motionLowPtr || !linearDepthPtr || !outputHighPtr || !normalRoughPtr
         || !diffuseAlbedoPtr || !specularAlbedoPtr)
+        return;
+
+    if (VPT_IsDeviceLost())
         return;
 
     IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
@@ -670,10 +744,14 @@ void VPT_DLSS_PrepareRRDispatch_Internal(
 
 void VPT_DLSS_RenderCallback()
 {
+    std::lock_guard<std::recursive_mutex> guard(s_DlssMutex);
     if (!s_DlssDispatchPending || !s_DLSSReady)
         return;
 
     s_DlssDispatchPending = false;
+
+    if (VPT_IsDeviceLost())
+        return;
 
     IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
     if (!vulkan)
@@ -726,7 +804,6 @@ void VPT_DLSS_RenderCallback()
     NVSDK_NGX_Resource_VK normalRoughRes = NVSDK_NGX_Create_ImageView_Resource_VK(
         s_NormalRoughView.view, s_NormalRoughView.image, subRange,
         s_NormalRoughView.format, s_NormalRoughView.width, s_NormalRoughView.height, false);
-
     // RR albedo G-buffer（主 kernel 首命中写入的材质分解）
     NVSDK_NGX_Resource_VK diffuseAlbedoRes = NVSDK_NGX_Create_ImageView_Resource_VK(
         s_DiffuseAlbedoView.view, s_DiffuseAlbedoView.image, subRange,
@@ -769,8 +846,11 @@ void VPT_DLSS_RenderCallback()
     rrEval.pInWorldToViewMatrix = s_RRViewMatrix;
     rrEval.pInViewToClipMatrix  = s_RRProjMatrix;
 
+    VPTTrace::Stage("dlss:evaluate");
     result = NGX_VULKAN_EVALUATE_DLSSD_EXT(
         cmd, s_DLSSHandle, s_DLSSParams, &rrEval);
+    if (result != NVSDK_NGX_Result_Success)
+        VPTTrace::Line("DLSS evaluate: FAILED 0x%x", (unsigned)result);
 
     VPTGpuTimer::Mark(cmd);   // T6: DLSS Evaluate 结束（本帧最后一个标记）
 
@@ -797,5 +877,8 @@ void VPT_DLSS_Destroy_Internal() {}
 void VPT_DLSS_PrepareRRDispatch_Internal(void*, void*, void*, void*, void*, void*, void*, int32_t, int32_t, int32_t, int32_t, float, float, int32_t, const float*, const float*) {}
 void VPT_DLSS_RenderCallback() {}
 bool VPT_DLSS_IsReady() { return false; }
+int32_t VPT_DLSS_GetStatus() { return -1; }
+bool VPT_DLSS_HasPendingCreate() { return false; }
+int32_t VPT_DLSS_RecordPendingCreate(VkCommandBuffer) { return 0; }
 
 #endif // VPT_DLSS_ENABLED

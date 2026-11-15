@@ -70,6 +70,8 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
     [Range(0f, 360f)] public float envRotation = 0f;
 
     private bool _envMapPushed = false;
+    /// <summary>本 Play 会话是否已打印过 PT 配置（只打印一次，避免刷屏）。</summary>
+    private bool _loggedConfig = false;
 
     [Header("DLSS Ray Reconstruction")]
     [Tooltip("启用 DLSS RR（降噪+超分一体化）。关闭则直接输出 native 路径追踪的 1spp 原始结果。")]
@@ -125,12 +127,25 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
 
     private PathTraceRenderPass _pass;
     private bool _nativeInitialized;
+    /// <summary>GPU 设备丢失（TDR）后置位：停止一切 native 调用，等重进 Play。</summary>
+    private bool _nativeLost;
+    private bool _deviceLostLogged;
 
     /// <summary>Native 插件是否已就绪（供 Pass 检查）</summary>
-    public bool IsNativeReady => _nativeInitialized;
+    public bool IsNativeReady => _nativeInitialized && !_nativeLost;
 
     public override void Create()
     {
+        // 卡死诊断日志（<项目根>/Logs/VPT-trace-csharp.log，每行立即 flush）
+        VptTrace.Init();
+        VptTrace.Stage("Feature.Create");
+        VptTrace.Line("Feature.Create: pass created, dlssEnabled=" + dlssEnabled +
+                      ", quality=" + dlssQualityMode);
+
+        // 新的一次渲染管线实例 = 新的 Play 会话：清掉设备丢失状态
+        _nativeLost = false;
+        _deviceLostLogged = false;
+
         // 注入点必须用 AfterRenderingPostProcessing(600) 而非 AfterRendering(1000)：
         // URP 14 只把 event==AfterRenderingPostProcessing 的 pass 视为"后处理后的 pass"
         // （hasPassesAfterPostProcessing）。若用 AfterRendering，相机的 Post Processing 开启时
@@ -156,12 +171,52 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
         if (ModelManager.Instance == null)
             return;
 
+        VptTrace.Beat();
+        VptTrace.Stage("AddRenderPasses");
+
+        // ── 设备丢失（GPU 复位 / TDR）检测 ──
+        // native 侧检测到 VK_ERROR_DEVICE_LOST 后会停止一切 GPU 工作，这里同步停掉
+        // PT：继续 IssuePluginEvent / 重建场景只会在死设备上反复失败，甚至把编辑器卡住。
+        if (_nativeInitialized && !_nativeLost && NativeBridge.VPT_GetDeviceStatus() == 1)
+        {
+            _nativeLost = true;
+            VptTrace.Line("AddRenderPasses: NATIVE DEVICE LOST detected");
+            if (!_deviceLostLogged)
+            {
+                _deviceLostLogged = true;
+                Debug.LogError("[PathTrace] Vulkan 设备已丢失（GPU 复位 / TDR）：路径追踪已停止。" +
+                               "请退出 Play 后重新进入；若重进仍丢失，请重启编辑器。");
+            }
+        }
+        if (_nativeLost)
+            return;
+
         // 一次性初始化 Native Vulkan 插件
         if (!_nativeInitialized)
         {
+            VptTrace.Stage("AddRenderPasses:TryInitialize");
+            VptTrace.Line("AddRenderPasses: VPT_Initialize begin ...");
             _nativeInitialized = NativeBridge.TryInitialize();
+            VptTrace.Line("AddRenderPasses: VPT_Initialize -> " + _nativeInitialized);
+            if (_nativeInitialized)
+            {
+                VptTrace.Line("native trace log: " + NativeBridge.GetNativeTracePath());
+                VptTrace.Line("csharp trace log: " + VptTrace.Path);
+            }
             if (_nativeInitialized && NativeBridge.IsRayQuerySupported())
                 Debug.Log("[PathTrace] Native Vulkan plugin ready, RayQuery supported.");
+        }
+
+        // 一次性打印本帧生效的 PT 配置（排查“透过玻璃看不到对面”这类问题时要先知道
+        // RR/采样数/最大深度到底是多少；logGpuTiming 关闭时 Console 里没有任何 PT 配置信息）
+        if (_nativeInitialized && !_loggedConfig)
+        {
+            _loggedConfig = true;
+            Debug.Log($"[PathTrace] PT 配置：maxDepth={maxDepth}, spp={samplesPerPixel}, " +
+                      $"DLSS_RR={(dlssEnabled ? "开" : "关")}" +
+                      (dlssEnabled ? $"（quality={dlssQualityMode}）" : "") + ", " +
+                      $"env={(hdrEnvironment != null ? hdrEnvironment.name : "无（常数 ambient 回退）")}, " +
+                      $"envIntensity={envIntensity}, ambient={ambientColor}, outputFormat={outputFormat}");
         }
 
         // 如果插件刚就绪且有待推送数据，重新推送
@@ -182,10 +237,14 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
             }
             else
             {
+                VptTrace.Stage("AddRenderPasses:SetEnvironmentMap");
+                VptTrace.Line("AddRenderPasses: env map push begin ...");
                 bool ok = NativeBridge.SetEnvironmentMap(hdrEnvironment);
+                VptTrace.Line("AddRenderPasses: env map push -> " + ok);
                 if (ok)
                 {
-                    Debug.Log("[PathTrace] HDR environment map uploaded to native plugin.");
+                    Debug.Log("[PathTrace] HDR environment map queued to native plugin " +
+                              "(upload recorded on the render thread).");
                     _envMapPushed = true;
                 }
                 else
@@ -205,13 +264,23 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
 
     protected override void Dispose(bool disposing)
     {
+        VptTrace.Line("Feature.Dispose (disposing=" + disposing + ")");
         _pass?.Dispose();
         if (_nativeInitialized)
         {
-            NativeBridge.VPT_Destroy();
+            // 走 Shutdown 而不是直接 VPT_Destroy：同时清掉 NativeBridge 的初始化缓存，
+            // 保证重进 Play 时 TryInitialize 会真正重新初始化 native 管线。
+            NativeBridge.Shutdown();
             _nativeInitialized = false;
             _envMapPushed = false;
         }
+
+        // 停掉 C# 侧看门狗线程并关闭日志文件。
+        // 实测退出 Play 时 Unity 会走到这里（日志末尾能看到本函数打的 Feature.Dispose 行），
+        // 但 VptTrace 的静态状态不会随之重置：不在这里 Shutdown，看门狗线程会跨 Play 会话残留
+        //（关掉域重载时为每个会话累积一个线程；开域重载时线程可能对着已卸载的域执行）。
+        // Shutdown 后再有 Line() 调用是安全的：_writer == null 时直接 return。
+        VptTrace.Shutdown();
     }
 }
 
@@ -293,6 +362,15 @@ public class PathTraceRenderPass : ScriptableRenderPass
         if (mm == null || !mm.HasScene)
             return;
 
+        // 卡死诊断：每帧只更新"当前阶段" + 喂狗。
+        // 卡住时看门狗线程会把最后设置的 Stage 打出来，这就是死点，无需每帧写行
+        //（60fps 下 2 行/帧 ≈ 120 行/s，且 C# 日志没有轮转 → 文件会无限增长）。
+        VptTrace.Beat();
+        VptTrace.NextFrame();
+        VptTrace.Stage("Execute:enter");
+        if (VptTrace.Frame % 60 == 0)
+            VptTrace.Line("Execute alive, frame=" + VptTrace.Frame);
+
         // ── 1. 相机参数 ──
         Camera camera = renderingData.cameraData.camera;
         // ── DLSS 低分辨率渲染：dispatch / RT / uniform 均用低分辨率，
@@ -324,59 +402,96 @@ public class PathTraceRenderPass : ScriptableRenderPass
         Matrix4x4 prevViewProj = _prevProj * _prevView;
 
         // ── 维护所有 RT ──
+        VptTrace.Stage("Execute:EnsureRTs");
         EnsureRTs(w, h, camera.pixelWidth, camera.pixelHeight);
 
         // ── DLSS RR 初始化/重建 ──
-        // 当 DLSS 开关、质量模式、分辨率变化时触发重建
+        // 当 DLSS 开关、质量模式、分辨率变化时触发重建。
+        // 注意：NGX CreateFeature 现在由 native 在渲染事件里、用 Unity 的命令缓冲录制
+        // （VPT_DLSS_Init 只负责排队），所以这里多了"排队中"的中间态：
+        //   _dlssInitPending → 等 VPT_DLSS_QueryStatus 确认后再置 _dlssInitialized。
         if (_feature.dlssEnabled)
         {
-            bool needReinit = !_dlssInitialized
-                || _dlssRenderW != w || _dlssRenderH != h
-                || _dlssOutW != camera.pixelWidth || _dlssOutH != camera.pixelHeight
-                || _dlssQuality != _feature.dlssQualityMode;
+            bool needReinit = !_dlssInitialized && !_dlssInitPending
+                || (_dlssInitialized
+                    && (_dlssRenderW != w || _dlssRenderH != h
+                        || _dlssOutW != camera.pixelWidth || _dlssOutH != camera.pixelHeight
+                        || _dlssQuality != _feature.dlssQualityMode));
+
             if (needReinit)
             {
+                VptTrace.Stage("Execute:DLSS-Init");
+                VptTrace.Line("Execute: DLSS reinit begin (" + w + "x" + h + ")");
                 if (_dlssInitialized)
                     NativeBridge.VPT_DLSS_Destroy();
+                _dlssInitialized = false;
+                _dlssInitPending = false;
+                _dlssPendingW = w;
+                _dlssPendingH = h;
+                _dlssPendingOutW = camera.pixelWidth;
+                _dlssPendingOutH = camera.pixelHeight;
+                _dlssPendingQuality = _feature.dlssQualityMode;
 
                 int result = NativeBridge.VPT_DLSS_Init(
                     w, h, camera.pixelWidth, camera.pixelHeight, _feature.dlssQualityMode);
                 if (result == 0)
                 {
-                    _dlssInitialized = true;
-                    _dlssRenderW = w;
-                    _dlssRenderH = h;
-                    _dlssOutW = camera.pixelWidth;
-                    _dlssOutH = camera.pixelHeight;
-                    _dlssQuality = _feature.dlssQualityMode;
-                    Debug.Log($"[PathTrace] DLSS RR initialized: {w}x{h} -> {camera.pixelWidth}x{camera.pixelHeight} (quality={_feature.dlssQualityMode})");
+                    // 已排队：真正的创建在 native 的事件回调里完成
+                    _dlssInitPending = true;
                 }
                 else if (result == -2)
                 {
                     // RR 不支持（需 RTX 显卡 + 新版驱动）
                     Debug.LogWarning("[PathTrace] DLSS RR not supported on this GPU/driver, falling back to plain Blit.");
-                    _dlssInitialized = false;
                 }
                 else
                 {
                     Debug.LogWarning("[PathTrace] DLSS RR init failed, falling back to plain Blit.");
-                    _dlssInitialized = false;
+                }
+            }
+
+            // 轮询延迟创建结果
+            if (_dlssInitPending && !_dlssInitialized)
+            {
+                VptTrace.Stage("Execute:DLSS-QueryStatus");
+                int status = NativeBridge.VPT_DLSS_QueryStatus();
+                VptTrace.Line("Execute: DLSS status poll -> " + status);
+                if (status == 1)
+                {
+                    _dlssInitPending = false;
+                    _dlssInitialized = true;
+                    _dlssRenderW = _dlssPendingW;
+                    _dlssRenderH = _dlssPendingH;
+                    _dlssOutW = _dlssPendingOutW;
+                    _dlssOutH = _dlssPendingOutH;
+                    _dlssQuality = _dlssPendingQuality;
+                    Debug.Log($"[PathTrace] DLSS RR initialized: {_dlssRenderW}x{_dlssRenderH} -> " +
+                              $"{_dlssOutW}x{_dlssOutH} (quality={_dlssQuality})");
+                }
+                else if (status < 0)
+                {
+                    _dlssInitPending = false;
+                    Debug.LogWarning("[PathTrace] DLSS RR init failed (native CreateFeature), " +
+                                     "falling back to plain Blit.");
                 }
             }
         }
-        else if (_dlssInitialized)
+        else if (_dlssInitialized || _dlssInitPending)
         {
-            // DLSS 被关闭时销毁
+            // DLSS 被关闭（或关闭时还在排队创建）时销毁并清状态
             NativeBridge.VPT_DLSS_Destroy();
             _dlssInitialized = false;
+            _dlssInitPending = false;
         }
 
         // ── 动态场景：同步实例变换 → native 每帧重建 TLAS（必须在 PrepareDispatch 之前，
         //    使 descriptor 指向本帧槽位）──
+        VptTrace.Stage("Execute:SyncInstances");
         mm.SyncInstancesNative();
 
         // ── 骨骼动画：关节矩阵 → native 蒙皮 compute + BLAS refit（同样必须
         //    先于 PrepareDispatch，refit/TLAS 重建均在该帧命令流内录制）──
+        VptTrace.Stage("Execute:SyncSkinnedMeshes");
         mm.SyncSkinnedMeshesNative();
 
         int lightCount = (LightManager.Instance != null && LightManager.Instance.Lights != null)
@@ -420,6 +535,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
         // Phase 1: 准备 dispatch 参数（AccessTexture + UBO + DescriptorSet）
         // Phase 2: IssuePluginEvent 将 dispatch 录制进 Unity 的命令缓冲
         TextureArrayManager texArr = mm.TextureArrays;
+        VptTrace.Stage("Execute:PrepareDispatch");
         IntPtr callbackPtr = NativeBridge.PrepareDispatch(_outputRT, _gbuffer0, _gbuffer1,
             _diffuseAlbedoRT, _specularAlbedoRT,
             texArr != null ? texArr.BaseColorArray : null,
@@ -442,6 +558,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
 
         if (cs != null)
         {
+            VptTrace.Stage("Execute:MotionVector");
             int gx = (w + _feature.groupXY - 1) / _feature.groupXY;
             int gy = (h + _feature.groupXY - 1) / _feature.groupXY;
 
@@ -462,6 +579,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
         if (_feature.dlssEnabled && _dlssInitialized && cs != null)
         {
             // RR: 1spp 噪声 color + linearDepth + normalRough + albedo + 相机矩阵
+            VptTrace.Stage("Execute:DLSS-PrepareRRDispatch");
             float[] viewMat = MatrixToFloat16(curView);
             float[] projMat = MatrixToFloat16(curProj);
             IntPtr dlssPtr = NativeBridge.PrepareDLSSRRDispatch(
@@ -471,14 +589,17 @@ public class PathTraceRenderPass : ScriptableRenderPass
                 jitter.x, jitter.y, _hasPrev ? 0 : 1,
                 viewMat, projMat);
             cmd.IssuePluginEvent(dlssPtr, NativeBridge.EventDlss);
+            VptTrace.Stage("Execute:BlitDLSS");
             cmd.Blit(_dlssOutputRT, colorTarget);
         }
         else
         {
             // 未启用 DLSS（或初始化失败/辅助 shader 缺失）：直接输出 PT 结果
+            VptTrace.Stage("Execute:BlitPT");
             cmd.Blit(_outputRT, colorTarget);
         }
 
+        VptTrace.Stage("Execute:ExecuteCommandBuffer");
         context.ExecuteCommandBuffer(cmd);
         CommandBufferPool.Release(cmd);
 
@@ -490,6 +611,8 @@ public class PathTraceRenderPass : ScriptableRenderPass
         _prevView = curView;
         _prevProj = curProj;
         _hasPrev = true;
+
+        VptTrace.Stage("idle");
     }
 
     /// <summary>
@@ -583,6 +706,14 @@ public class PathTraceRenderPass : ScriptableRenderPass
     private int _dlssOutW = -1;
     private int _dlssOutH = -1;
     private int _dlssQuality = -1;
+
+    // native 侧延迟创建（CreateFeature 在渲染事件里录制）的中间态
+    private bool _dlssInitPending = false;
+    private int _dlssPendingW = -1;
+    private int _dlssPendingH = -1;
+    private int _dlssPendingOutW = -1;
+    private int _dlssPendingOutH = -1;
+    private int _dlssPendingQuality = -1;
 
     // ── 上一帧相机矩阵（DLSS 重投影用） ──
     private Matrix4x4 _prevView;

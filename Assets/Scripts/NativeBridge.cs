@@ -41,6 +41,16 @@ public static class NativeBridge
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_Destroy();
 
+    /// <summary>
+    /// 销毁 native 管线并清掉初始化缓存：下次 TryInitialize 会重新 VPT_Initialize。
+    /// 与直接调 VPT_Destroy 的区别是必须走这里，否则缓存会让重进 Play 时跳过初始化。
+    /// </summary>
+    public static void Shutdown()
+    {
+        VPT_Destroy();
+        _initSucceeded = false;
+    }
+
     /// <summary>查询设备是否支持 VK_KHR_ray_query</summary>
     /// <returns>1=支持, 0=不支持</returns>
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
@@ -179,7 +189,7 @@ public static class NativeBridge
     /// <param name="outputW">输出（全分）宽度</param>
     /// <param name="outputH">输出（全分）高度</param>
     /// <param name="qualityMode">0=Quality 1=Balanced 2=Performance 3=UltraPerf</param>
-    /// <returns>0=成功, -1=NGX不可用, -2=RR不支持</returns>
+    /// <returns>0=已接受（创建排队中，用 VPT_DLSS_QueryStatus 查结果）, -1=NGX不可用, -2=RR不支持</returns>
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern int VPT_DLSS_Init(
         int renderW, int renderH, int outputW, int outputH,
@@ -188,6 +198,62 @@ public static class NativeBridge
     /// <summary>销毁 NGX DLSS feature</summary>
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_DLSS_Destroy();
+
+    /// <summary>
+    /// 查询 DLSS RR feature 的延迟创建结果。
+    /// native 侧的 NGX CreateFeature 会录制进 Unity 的命令缓冲（渲染线程），
+    /// 因此 VPT_DLSS_Init 只代表"已排队"。
+    /// </summary>
+    /// <returns>1=已就绪, 0=排队中/未创建, -1=创建失败</returns>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern int VPT_DLSS_QueryStatus();
+
+    /// <summary>
+    /// 查询 Vulkan 设备状态。GPU 复位（TDR / VK_ERROR_DEVICE_LOST）后会返回 1，
+    /// 此时 native 已停止一切 GPU 工作，必须退出 Play 重新初始化才能恢复。
+    /// </summary>
+    /// <returns>0=正常, 1=设备已丢失</returns>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern int VPT_GetDeviceStatus();
+
+    /// <summary>native 诊断日志路径（VPT-trace-native.log），用于把两份日志对照着看。</summary>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    private static extern IntPtr VPT_GetTracePath();
+
+    // ── 暂停 / 恢复 ────────────────────────────────────────
+    // 说明：运行中重建场景（体积参数热调）已经移除，所以当前没有调用方。
+    // 保留这组接口是为了以后真的需要在 Play 中重建 / 大批量销毁 GPU 资源时，
+    // 有一个"先停 PT、等 GPU 空闲再动资源"的安全原语：
+    //   VPT_PausePT(); while (VPT_IsPaused()==0) yield return null;  // 动 GPU 资源
+    //   VPT_ResumePT();
+    // 背景：BuildScene 会 DestroyImmediate 掉 PT 正在采样的 Texture2DArray，
+    // 与在飞帧重叠会让 GPU fault（TDR，实测 nvlddmkm 153）。
+
+    /// <summary>请求暂停路径追踪。下一次 native 渲染事件里会等 GPU 空闲后进入 paused 状态。</summary>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_PausePT();
+
+    /// <summary>恢复路径追踪</summary>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern void VPT_ResumePT();
+
+    /// <summary>1 = 已暂停且 GPU 已空闲，此时可以安全销毁/重建 GPU 资源</summary>
+    [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
+    public static extern int VPT_IsPaused();
+
+    /// <summary>取 native 诊断日志路径（失败返回空串）。</summary>
+    public static string GetNativeTracePath()
+    {
+        try
+        {
+            IntPtr p = VPT_GetTracePath();
+            return p == IntPtr.Zero ? "" : (Marshal.PtrToStringAnsi(p) ?? "");
+        }
+        catch (Exception)
+        {
+            return "";
+        }
+    }
 
     /// <summary>
     /// Phase 1: 准备 DLSS RR Evaluate dispatch。
@@ -249,16 +315,24 @@ public static class NativeBridge
         return VPT_GetRenderCallback();
     }
 
-    /// <summary>安全初始化：自动检查 DLL 加载和 RT Core 支持</summary>
+    /// <summary>
+    /// 安全初始化：自动检查 DLL 加载和 RT Core 支持。
+    /// 成功结果缓存：ModelManager / RendererFeature 每帧都会调本方法，原实现每帧进一次
+    /// native 并打一条日志（实测一局 5 万+ 条、Editor.log 200MB+）。失败不缓存，保留重试机会。
+    /// </summary>
     /// <returns>true 表示初始化成功且支持 RayQuery</returns>
+    private static bool _initSucceeded;
+
     public static bool TryInitialize()
     {
+        if (_initSucceeded) return true;
         try
         {
             int result = VPT_Initialize();
             switch ((InitResult)result)
             {
                 case InitResult.Success:
+                    _initSucceeded = true;
                     Debug.Log("[NativeBridge] VPT_Initialize succeeded. RayQuery ready.");
                     return true;
                 case InitResult.VulkanDeviceNotFound:
@@ -304,7 +378,7 @@ public static class NativeBridge
     /// 调用方需确保贴图为 uncompressed HDR 格式（检查 import settings）。
     /// </summary>
     /// <param name="hdr">Unity 导入的 HDR Texture2D（equirectangular）</param>
-    /// <returns>true=成功上传</returns>
+    /// <returns>true=已交给 native 排队（真正上传在渲染事件里录制）</returns>
     public static bool SetEnvironmentMap(UnityEngine.Texture2D hdr)
     {
         if (hdr == null) return false;
@@ -382,7 +456,7 @@ public static class NativeBridge
     {
         public IntPtr meshes;          // 指向 VPT_MeshData 数组
         public int   meshCount;
-        public IntPtr materials;       // 指向 PathMaterial 数组（96B）
+        public IntPtr materials;       // 指向 PathMaterial 数组（128B）
         public int   materialCount;
         public IntPtr lights;           // 指向 PathLight 数组（32B）
         public int   lightCount;

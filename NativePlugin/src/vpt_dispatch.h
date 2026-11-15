@@ -50,4 +50,18 @@ namespace VPTDispatch {
     /// Whether a dispatch is pending (prepared but not yet executed by callback)
     bool IsDispatchPending();
 
+    // ── 暂停 / 恢复（供 C# 在重建场景前使用）──────────────────────────
+    // 背景：C# 的 BuildScene() 会 DestroyImmediate 掉 PT shader 正在采样的
+    // Texture2DArray，并重新上传贴图。这些 GPU 资源操作发生在主线程、而之前的
+    // PT dispatch 还在飞行中 → 释放后仍被采样 → GPU fault → TDR。
+    // 所以重建前先 RequestPause()：下一次 PT 事件里等 GPU 空闲后进入 paused，
+    // C# 看到 IsPaused() 再动 GPU 资源，完事后 RequestResume()。
+    void RequestPause();          // 请求暂停（下一帧事件生效）
+    void RequestResume();         // 恢复
+    bool IsPaused();              // 已暂停且 GPU 已空闲
+    bool IsPauseRequested();
+
+    /// 丢弃 Unity Texture2DArray 的 ImageView 缓存（场景重建后 Unity 会换新数组）
+    void InvalidateTextureViews();
+
 } // namespace VPTDispatch

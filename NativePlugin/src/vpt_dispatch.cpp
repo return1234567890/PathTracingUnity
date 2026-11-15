@@ -8,12 +8,15 @@
 #include "vpt_internal.h"
 #include "vpt_scene.h"
 #include "vpt_env.h"
+#include "vpt_dlss.h"
 #include "vpt_gpu_timer.h"
+#include "vpt_trace.h"
 #include "pathtrace_spv.h"
 
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <atomic>
 
 // ═══════════════════════════════════════════════════════════
 //  PathTrace pipeline state (Phase 3) 与 ImageView 缓存
@@ -218,7 +221,12 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
     if (res != VK_SUCCESS) { fprintf(stderr, "[VPT] Path: vkCreateSampler failed: %d\n", res); return; }
 
     s_PathReady = true;
-    fprintf(stderr, "[VPT] PathTrace pipeline initialized (18 bindings).\n");
+    // 构建指纹：用于在 Unity Console 里确认「当前进程加载的是哪一版 DLL / 内嵌 SPV」。
+    // 换 DLL 后没有重启 Unity 时，这里打印的仍然是旧值。
+    fprintf(stderr,
+            "[VPT] PathTrace pipeline initialized (18 bindings). shader SPV = %u bytes, "
+            "volume-glass build.\n",
+            g_PathTraceSpv_size);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -341,6 +349,39 @@ static int32_t  s_PendingWidth   = 0;
 static int32_t  s_PendingHeight  = 0;
 static bool     s_DispatchPending = false;
 
+// ── 暂停状态（C# 重建场景前用来"关掉 PT 并等 GPU 空闲"）──
+static std::atomic<bool> s_PauseRequested{ false };
+static std::atomic<bool> s_Paused{ false };
+
+void VPTDispatch::RequestPause()
+{
+    s_PauseRequested.store(true);
+    s_DispatchPending = false;
+    VPTTrace::Line("PT pause requested");
+}
+
+void VPTDispatch::RequestResume()
+{
+    s_PauseRequested.store(false);
+    s_Paused.store(false);
+    VPTTrace::Line("PT resumed");
+}
+
+bool VPTDispatch::IsPaused()         { return s_Paused.load(); }
+bool VPTDispatch::IsPauseRequested() { return s_PauseRequested.load(); }
+
+void VPTDispatch::InvalidateTextureViews()
+{
+    VkDevice device = VPT_GetInstance().device;
+    for (int i = 0; i < 4; i++)
+    {
+        if (s_TexViews[i].view && device != VK_NULL_HANDLE)
+            vkDestroyImageView(device, s_TexViews[i].view, nullptr);
+        s_TexViews[i].view  = VK_NULL_HANDLE;
+        s_TexViews[i].image = VK_NULL_HANDLE;
+    }
+}
+
 // ── Phase 1: PrepareDispatch ──────────────────────────────
 // Called from C# before cmd.IssuePluginEvent.
 // Accesses Unity textures (ObserveOnly), fills UBO, updates descriptor sets.
@@ -358,21 +399,41 @@ void VPTDispatch::PrepareDispatch(
         || width <= 0 || height <= 0)
         return;
 
+    // 暂停期间（C# 正在重建场景/销毁贴图）不碰 Unity 纹理
+    if (s_Paused.load() || s_PauseRequested.load())
+        return;
+
+    if (VPT_IsDeviceLost())
+        return;
+
     IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
     VkDevice device = VPT_GetInstance().device;
 
     // ── Access 5 Unity RenderTextures as VkImages (ObserveOnly: query handles only) ──
+    // 说明：AccessTexture 会进入 Unity 的纹理访问协议，若与渲染线程状态冲突会阻塞，
+    // 是主线程最容易卡住的位置之一 —— 每一个都单独记阶段。
+    VPTTrace::Stage("prepare:AccessTexture(output)");
     if (!EnsureImageView(vulkan, device, outputPtr, 0)) return;
+    VPTTrace::Stage("prepare:AccessTexture(gbuffer0)");
     if (!EnsureImageView(vulkan, device, gbuf0Ptr,  1)) return;
+    VPTTrace::Stage("prepare:AccessTexture(gbuffer1)");
     if (!EnsureImageView(vulkan, device, gbuf1Ptr,  2)) return;
+    VPTTrace::Stage("prepare:AccessTexture(diffuseAlbedo)");
     if (!EnsureImageView(vulkan, device, diffuseAlbedoPtr,  3)) return;
+    VPTTrace::Stage("prepare:AccessTexture(specularAlbedo)");
     if (!EnsureImageView(vulkan, device, specularAlbedoPtr, 4)) return;
 
     // ── Access 4 Unity Texture2DArrays as VkImages (read) ──
+    VPTTrace::Stage("prepare:AccessTextureArray(baseColor)");
     if (baseColorPtr)    EnsureTextureArrayView(vulkan, device, baseColorPtr,    0);
+    VPTTrace::Stage("prepare:AccessTextureArray(metallicRough)");
     if (metallicRoughPtr) EnsureTextureArrayView(vulkan, device, metallicRoughPtr, 1);
+    VPTTrace::Stage("prepare:AccessTextureArray(normal)");
     if (normalPtr)       EnsureTextureArrayView(vulkan, device, normalPtr,       2);
+    VPTTrace::Stage("prepare:AccessTextureArray(emissive)");
     if (emissivePtr)     EnsureTextureArrayView(vulkan, device, emissivePtr,     3);
+
+    VPTTrace::Stage("prepare:ubo+descriptors");
 
     // ── Fill PathTraceCameraUBO from VPT_CameraData ──
     PathTraceCameraUBO ubo{};
@@ -568,28 +629,108 @@ void VPTDispatch::PrepareDispatch(
 // Called by Unity during command buffer execution via IssuePluginEvent.
 // Gets Unity's VkCommandBuffer via CommandRecordingState, records
 // barriers + dispatch into it. No vkQueueSubmit / vkQueueWaitIdle.
+//
+// 这里同时承担所有"延迟到渲染线程"的 GPU 工作：
+//   · 场景推送（buffer 上传 + BLAS/TLAS 构建）
+//   · HDR 环境贴图上传 / 占位资源初始化
+//   · NGX DLSS Feature 创建
+//   · 蒙皮 mesh 注册
+// 即使本帧没有 dispatch，只要上面有排队的工作，也必须进来录制。
 
 void VPTDispatch::RenderCallback(int eventID)
 {
-    if (eventID != EVENT_PATHTRACE || !s_DispatchPending)
+    if (eventID != EVENT_PATHTRACE)
+        return;
+
+    // ── 暂停：C# 正在重建场景（要销毁 PT 正在采样的贴图数组）──
+    // 先把 GPU 排空、确认空闲，再让 C# 去动资源。
+    if (s_Paused.load())
+        return;
+
+    if (s_PauseRequested.load())
+    {
+        const VkDevice pauseDevice = VPT_GetInstance().device;
+        VPTTrace::Stage("event:pause-sync");
+        VPTTrace::Line("PT pause: vkDeviceWaitIdle begin ...");
+        const VkResult pr = vkDeviceWaitIdle(pauseDevice);
+        VPTTrace::Line("PT pause: vkDeviceWaitIdle -> %d", (int)pr);
+        VPT_CheckVk(pr, "vkDeviceWaitIdle(pause before scene rebuild)");
+        s_Paused.store(true);
+        s_DispatchPending = false;
+        VPTTrace::Stage("idle");
+        return;
+    }
+
+    const bool dispatchPending = s_DispatchPending;
+    const bool scenePending    = VPTScene::IsSceneUpdatePending();
+    const bool envPending      = VPTEnv::HasPendingUploads();
+    const bool dlssPending     = VPT_DLSS_HasPendingCreate();
+
+    VPTTrace::Stage("event:begin");
+    if (!dispatchPending && !scenePending && !envPending && !dlssPending)
         return;
 
     s_DispatchPending = false;  // consume pending state
 
-    if (!s_PathReady)
+    if (VPT_IsDeviceLost())
+    {
+        // 设备已丢失：什么都不录，也不再申请任何资源
+        fprintf(stderr, "[VPT] RenderCallback skipped: device lost.\n");
+        VPTTrace::Line("PT event: skipped (device lost)");
         return;
+    }
 
+    // 场景上传/环境贴图/DLSS 创建都不需要 PT pipeline；dispatch 由下方单独判定
     IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
     if (!vulkan)
         return;
 
+    // ── 设备变化检测（每 ~120 帧一次）──
+    // TDR 之后 Unity 的 Vulkan 后端有时会重建 VkDevice：我们缓存的所有句柄就全失效了。
+    // 这里主动比对一次，避免拿着旧 device 的资源往新设备上录制（那会直接把 GPU 挂死）。
+    if ((VPTTrace::Frame() % 120) == 0)
+    {
+        const UnityVulkanInstance& cached = VPT_GetInstance();
+        const UnityVulkanInstance  cur    = vulkan->Instance();
+        if (cur.device != cached.device || cur.physicalDevice != cached.physicalDevice)
+        {
+            VPTTrace::Line("DEVICE CHANGED: cached=%p/%p unity=%p/%p -> stop",
+                           (void*)cached.device, (void*)cached.physicalDevice,
+                           (void*)cur.device, (void*)cur.physicalDevice);
+            fprintf(stderr, "[VPT] FATAL: Unity 重建了 VkDevice（TDR 恢复），插件缓存已失效。\n");
+            VPT_MarkDeviceLost("Unity VkDevice recreated after TDR", 0);
+            return;
+        }
+    }
+
+    // ── 重建帧之后的 GPU 同步探针 ──
+    // 重建帧里录了 728 个 BLAS + TLAS + 纹理上传，由 Unity 提交，插件看不到 VkResult。
+    // 这里等一次 GPU 空闲：如果那一帧把 GPU 搞挂了，2s 后会以 VK_ERROR_DEVICE_LOST
+    // 形式返回，我们立刻停机并让 C# 关掉 PT —— 编辑器不会静默卡死几十秒。
+    if (VPTScene::TakeGpuSyncProbe() && !VPT_EnvFlag("VPT_NO_PROBE"))
+    {
+        VPTTrace::Stage("event:gpu-sync-probe");
+        const VkDevice probeDevice = VPT_GetInstance().device;
+        VPTTrace::Line("gpu-sync probe: vkDeviceWaitIdle after rebuild begin ...");
+        const VkResult pr = vkDeviceWaitIdle(probeDevice);
+        VPTTrace::Line("gpu-sync probe: returned %d", (int)pr);
+        if (!VPT_CheckVk(pr, "vkDeviceWaitIdle(post-rebuild probe)"))
+        {
+            fprintf(stderr, "[VPT] FATAL: 重建帧之后 GPU 同步失败（%d），设备已丢失。\n", (int)pr);
+            return;
+        }
+    }
+
     // ── Get Unity's current VkCommandBuffer ──
     // DontCare mode: we record into Unity's current command buffer, no direct queue submit.
     // (Allow mode would disable access to Unity's command buffer, returning null)
+    VPTTrace::Stage("event:CommandRecordingState");
     UnityVulkanRecordingState recState{};
-    if (!vulkan->CommandRecordingState(&recState, kUnityVulkanGraphicsQueueAccess_DontCare))
+    const bool haveState = vulkan->CommandRecordingState(&recState, kUnityVulkanGraphicsQueueAccess_DontCare);
+    if (!haveState)
     {
         fprintf(stderr, "[VPT] RenderCallback: CommandRecordingState failed\n");
+        VPTTrace::Line("PT event: CommandRecordingState FAILED");
         return;
     }
 
@@ -597,25 +738,68 @@ void VPTDispatch::RenderCallback(int eventID)
     if (cmd == VK_NULL_HANDLE)
     {
         fprintf(stderr, "[VPT] RenderCallback: Unity command buffer is null\n");
+        VPTTrace::Line("PT event: CommandRecordingState returned null cmd");
         return;
     }
 
-    VkDevice device = VPT_GetInstance().device;
+    // ── 0) 延迟场景重建（必须在任何 TLAS/dispatch 之前；会销毁旧 TLAS）──
+    VPTTrace::Stage("event:scene-update");
+    const bool sceneRebuilt = VPTScene::RecordSceneUpdateIfNeeded(cmd);
+
+    // ── 0.1) 延迟 HDR 环境贴图上传 + 占位资源初始化 ──
+    VPTTrace::Stage("event:env-upload");
+    const bool envReplaced = VPTEnv::RecordPendingUploads(cmd);
+
+    // ── 0.2) 延迟 DLSS Feature 创建（NGX 往 Unity 的命令缓冲里录初始化命令）──
+    VPTTrace::Stage("event:dlss-create");
+    VPT_DLSS_RecordPendingCreate(cmd);
+
+    // ── 0.3) 延迟蒙皮 mesh 注册（依赖刚构建好的统一顶点缓冲）──
+    VPTTrace::Stage("event:skin-register");
+    VPTScene::RecordSkinRegistrationIfNeeded(cmd);
+
+    // 本帧刚重建过场景 / 环境贴图：descriptor set 里的 TLAS、buffer、env 句柄
+    // 都已过期，本帧不再 dispatch（下一帧 C# 会重新 PrepareDispatch）。
+    if (sceneRebuilt || envReplaced)
+    {
+        fprintf(stderr, "[VPT] %s this frame; path trace dispatch skipped.\n",
+                sceneRebuilt ? "Scene rebuilt" : "Env map replaced");
+        VPTTrace::Line("PT event: %s -> dispatch skipped", sceneRebuilt ? "scene rebuilt" : "env replaced");
+        // Unity 侧重建后会换一批 Texture2DArray：丢掉旧 ImageView，避免句柄复用导致
+        // 缓存命中一个指向已销毁图像的 view。
+        if (sceneRebuilt)
+            VPTDispatch::InvalidateTextureViews();
+        return;
+    }
+
+    if (!dispatchPending || !s_PathReady)
+        return;
 
     // ── GPU 计时：T0（本帧开始），随后每个阶段结束各打一个点 ──
     VPTGpuTimer::BeginFrame(cmd);
 
     // ── 骨骼动画：GPU 蒙皮 dispatch（若有更新，须先于 refit/TLAS，蒙皮 compute 就地写统一顶点缓冲）──
+    VPTTrace::Stage("dispatch:gpu-skinning");
     VPTScene::RecordGPUSkinningIfNeeded(cmd);
     VPTGpuTimer::Mark(cmd);   // T1: 蒙皮结束
 
     // ── 骨骼动画：变形顶点上传 + BLAS refit（若有更新，需先于 TLAS 重建）──
+    VPTTrace::Stage("dispatch:blas-refit");
     VPTScene::RecordBLASRefitIfNeeded(cmd);
     VPTGpuTimer::Mark(cmd);   // T2: BLAS refit 结束
 
     // ── 动态场景：每帧 TLAS 重建（若本帧有实例更新，优先于 dispatch 录制）──
-    VPTScene::RecordTLASUpdateIfNeeded(cmd);
+    VPTTrace::Stage("dispatch:tlas-update");
+    const bool tlasResized = VPTScene::RecordTLASUpdateIfNeeded(cmd);
     VPTGpuTimer::Mark(cmd);   // T3: TLAS 重建结束
+
+    // 实例容量扩容会重建 TLAS 环形 buffer：descriptor set 里的旧句柄已失效，
+    // 本帧不能 dispatch（下一帧 PrepareDispatch 会重新绑定）。
+    if (tlasResized)
+    {
+        fprintf(stderr, "[VPT] TLAS ring resized; path trace dispatch skipped this frame.\n");
+        return;
+    }
 
     // ── Barrier 1: UBO host write → compute read + 5 images → GENERAL ──
     // oldLayout 用插件自己跟踪的布局：每次 dispatch 结束都恢复成
@@ -663,6 +847,7 @@ void VPTDispatch::RenderCallback(int eventID)
         0, 0, nullptr, 1, &uboBarrier, 5, imgBarriers);
 
     // ── Dispatch ──
+    VPTTrace::Stage("dispatch:record");
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_PathPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
         s_PathPipeLayout, 0, 1, &s_PathDescSet, 0, nullptr);
@@ -701,7 +886,9 @@ bool VPTDispatch::IsDispatchPending() { return s_DispatchPending; }
 void VPTDispatch::DestroyPathTracePipeline(VkDevice device)
 {
     if (!s_PathReady) return;
-    vkDeviceWaitIdle(device);
+    // 设备已丢失时 vkDeviceWaitIdle 可能长时间不返回，直接跳过等待
+    if (!VPT_IsDeviceLost())
+        VPT_CheckVk(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(DestroyPathTracePipeline)");
 
     for (int i = 0; i < 5; i++)
     {

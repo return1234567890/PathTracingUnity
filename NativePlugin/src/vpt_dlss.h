@@ -11,14 +11,25 @@ extern "C" {
     // ── DLSS NGX 接口（由 vpt_dlss.cpp 实现，vpt_api.cpp 导出） ──
     //  仅保留 DLSS Ray Reconstruction（RR）：降噪 + 超分一体化。
 
-    /// 初始化 NGX DLSS Ray Reconstruction feature
+    /// 初始化 NGX DLSS Ray Reconstruction feature（CPU 侧准备 + 排队创建）
     /// renderW/H: 低分辨率渲染尺寸; outputW/H: 全分辨率输出尺寸
     /// qualityMode: 0=Quality 1=Balanced 2=Performance 3=UltraPerf
-    /// 返回: 0=成功, -1=NGX不可用/初始化失败, -2=RR 不支持
+    /// 返回: 0=已接受（创建已排队，用 VPT_DLSS_GetStatus 查询结果）,
+    ///       -1=NGX不可用/初始化失败, -2=RR 不支持
     int32_t VPT_DLSS_Init_Internal(
         int32_t renderW, int32_t renderH,
         int32_t outputW, int32_t outputH,
         int32_t qualityMode);
+
+    /// 查询延迟创建的结果: 1=已就绪, 0=排队中/未创建, -1=创建失败
+    int32_t VPT_DLSS_GetStatus();
+
+    /// 是否有待创建的 feature（供事件回调决定是否取命令缓冲）
+    bool VPT_DLSS_HasPendingCreate();
+
+    /// 在 Unity 的命令缓冲里录制 NGX CreateFeature（渲染线程、事件内调用）
+    /// 返回 0=成功或无需创建, -1=失败
+    int32_t VPT_DLSS_RecordPendingCreate(VkCommandBuffer cmd);
 
     /// 销毁 NGX DLSS feature 并释放资源
     void VPT_DLSS_Destroy_Internal();

@@ -10,13 +10,19 @@
 
 #define PI 3.14159265359
 #define MISS_INDEX 0xFFFFFFFFu
+// 普通表面偏移 5mm：远离表面避免自交（对实体/不透明表面足够）
 #define EPS_OFFSET 5e-3
+// 体积（Volume）边界偏移 0.1mm：12mm 玻璃用 5mm 会吃掉近一半内部路径，
+// 薄玻璃（<5mm）甚至会直接跳过出射面。0.1mm 远大于 float 精度，不会自交。
+#define EPS_VOLUME 1e-4
 
 #define MAT_HAS_BASE       1u
 #define MAT_HAS_MR         2u
 #define MAT_HAS_NORMAL     4u
 #define MAT_HAS_EMISS      8u
 #define MAT_IS_TRANSPARENT 16u
+#define MAT_IS_VOLUME      32u   // bit5: 有厚度玻璃，走 Beer-Lambert 体积分支
+#define MAT_IS_THIN_WALLED 64u   // bit6: 零厚度薄壁（单面玻璃），保留原 double-tint 语义
 #define TEX_NONE       0xFFFFFFFFu
 
 // ── Descriptor Set 0 ──────────────────────────────────────────
@@ -67,6 +73,12 @@ struct VPT_Material {
     float ior;
     float diffuseTransmission;
     uint  thinWalled;
+    // ── 96B ~ 128B：体积透射（与 C# PathMaterial / C++ VPT_Material 严格一致）──
+    vec4  attenuationColor;     // 体积吸收色（线性 RGB，与 baseColor 相乘）
+    float attenuationDistance;  // 世界空间衰减距离（米）；<=0 无吸收
+    uint  volumeFlags;          // 预留（bit0 = 显式覆盖 tint 等）
+    float thickness;            // 世界空间厚度（米）；0 = 非体积
+    float padVolume;            // 对齐填充
 };
 
 struct VPT_Light {
@@ -344,10 +356,34 @@ vec3 refractDir(vec3 I, vec3 N, float eta, float cosI, out bool tir)
     return eta * I + (eta * cosI - sqrt(k)) * N;
 }
 
+// ── Volume（有厚度玻璃）──────────────────────────────────────────
+// thickness > 0 且置了 MAT_IS_VOLUME：颜色由体积吸收承担，表面只乘透射量/Fresnel。
+// 与薄壁材质（MAT_IS_THIN_WALLED）互斥，薄壁保留原 double-tint 语义。
+bool materialIsVolume(VPT_Material mat)
+{
+    return ((mat.flags & MAT_IS_VOLUME) != 0u) && (mat.thickness > 0.0);
+}
+
+// 表面附近的偏移量：体积玻璃用更小的 offset，保证 12mm 内部路径不被吃掉。
+float surfaceOffset(VPT_Material mat)
+{
+    return materialIsVolume(mat) ? EPS_VOLUME : EPS_OFFSET;
+}
+
+// 体积吸收系数 σt = -ln(透射色) / 衰减距离（Beer-Lambert）
+// tint = 逐像素 baseColor；再乘材质 attenuationColor。attenuationDistance <= 0 表示无吸收。
+vec3 volumeSigmaT(VPT_Material mat, vec3 tint)
+{
+    if (mat.attenuationDistance <= 0.0)
+        return vec3(0.0);
+    vec3 a = clamp(tint * mat.attenuationColor.rgb, vec3(1e-4), vec3(1.0));
+    return -log(a) / mat.attenuationDistance;
+}
+
 // ── BTDF sampling (specular transmission) ──
 // Outputs raw BSDF and pdf for the transmitted lobe.
 void btdfSample(VPT_Material mat, vec3 N, vec3 T, vec3 B,
-               vec3 k1, inout uint seed,
+               vec3 k1, inout uint seed, bool insideVolume,
                out vec3 k2, out float pdf, out vec3 bsdf)
 {
     bsdf = vec3(0.0);
@@ -355,8 +391,11 @@ void btdfSample(VPT_Material mat, vec3 N, vec3 T, vec3 B,
     k2 = vec3(0.0);
 
     bool thinWalled = (mat.thinWalled != 0u);
+    bool isVolume = materialIsVolume(mat);
     float ior1 = 1.0;
     float ior2 = mat.ior;
+    // 体积边界：从介质内部射出时 IOR 反向（玻璃→空气），否则出射折射方向会失真
+    if (isVolume && insideVolume) { ior1 = mat.ior; ior2 = 1.0; }
     float VdotN = dot(k1, N);
     bool entering = (VdotN > 0.0);
     float eta = entering ? (ior1 / ior2) : (ior2 / ior1);
@@ -394,6 +433,16 @@ void btdfSample(VPT_Material mat, vec3 N, vec3 T, vec3 B,
     float nk2 = abs(dot(k2, N));
     if (nk2 <= 1e-6 || isnan(k2.x)) return;
 
+    // ── gnk2 侧向校验（参考工程 bsdf_functions.h.slang L730-752）──
+    // 折射必须真正穿过表面到几何法线另一侧；TIR 反射必须留在入射侧。
+    // 粗糙度使 H 偏离 N 时，少量采样会落到错误一侧 → 直接丢弃（absorb），
+    // 避免光线带着错误的「内外状态」继续传播。
+    if (!thinWalled)
+    {
+        float side = dot(k2, N);
+        if (tir ? (side <= 0.0) : (side >= 0.0)) return;
+    }
+
     float fresnel = schlickFresnelScalar(mat.ior, k1h);
     float transProb = 1.0 - fresnel;
 
@@ -414,18 +463,25 @@ void btdfSample(VPT_Material mat, vec3 N, vec3 T, vec3 B,
 
     if (pdf <= 1e-6) return;
 
+    // 体积材质的表面透射 tint 用中性白：颜色只由内部 Beer-Lambert 吸收承担，
+    // 否则前后两个表面各乘一次 baseColor → T_total = T_layer²（本次修复的根因）。
+    vec3 transTint = isVolume ? vec3(1.0) : mat.albedo.rgb;
+
     if (thinWalled || tir)
-        bsdf = mat.albedo.rgb * G * pdf;
+        bsdf = transTint * G * pdf;
     else
-        bsdf = mat.albedo.rgb * G * transProb * pdf;
+        bsdf = transTint * G * transProb * pdf;
 }
 
 // ── BTDF evaluation (for NEE) ──
 vec3 btdfEval(VPT_Material mat, vec3 N, vec3 T, vec3 B,
-             vec3 k1, vec3 k2, float NdotV, float NdotL)
+             vec3 k1, vec3 k2, float NdotV, float NdotL, bool insideVolume)
 {
     bool thinWalled = (mat.thinWalled != 0u);
+    bool isVolume = materialIsVolume(mat);
     float ior1 = 1.0, ior2 = mat.ior;
+    // 与 btdfSample 一致：体积边界按介质内外方向确定 IOR
+    if (isVolume && insideVolume) { ior1 = mat.ior; ior2 = 1.0; }
 
     bool backside = (dot(k2, N) < 0.0);
     if (!backside) return vec3(0.0);
@@ -444,17 +500,20 @@ vec3 btdfEval(VPT_Material mat, vec3 N, vec3 T, vec3 B,
     float G = G_SmithGGX(NdotV, NdotL, a2);
     float fresnel = schlickFresnelScalar(mat.ior, k1h);
 
+    // 体积材质表面中性透射（颜色由内部吸收承担）
+    vec3 transTint = isVolume ? vec3(1.0) : mat.albedo.rgb;
+
     if (!thinWalled)
     {
         float tmp = k1h * ior1 - k2h * ior2;
         if (abs(tmp) < 1e-6) return vec3(0.0);
         float b = (1.0 - fresnel) * G * D * k1h * k2h / (NdotV * NdotH * tmp * tmp);
-        return mat.albedo.rgb * b;
+        return transTint * b;
     }
     else
     {
         float b = (1.0 - fresnel) * G * D * 0.25 / (NdotV * NdotH);
-        return mat.albedo.rgb * b;
+        return transTint * b;
     }
 }
 
@@ -472,10 +531,12 @@ vec4 sampleBaseColor(VPT_Material mat, vec2 uvT)
 
 // ── Transparent shadow traversal: accumulate transmission through all layers ──
 // Returns rgb transmission: (1,1,1)=fully transparent, (0,0,0)=fully occluded
-vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT)
+// startInsideVolume / startSigmaT：阴影射线起点所在的介质状态（主路径位于玻璃内部时为 true），
+// 让「表面 → 光源」整段用与主路径相同的 σt 做 Beer-Lambert 吸收。
+vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT,
+                             bool isInsideVolume, vec3 sigmaT)
 {
     vec3 totalTransmission = vec3(1.0);
-    bool isInside = false;
 
     for (int iter = 0; iter < MAX_SHADOW_LAYERS; iter++)
     {
@@ -489,7 +550,9 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT)
         bool committed = rayQueryGetIntersectionTypeEXT(rq, true)
                        != gl_RayQueryCommittedIntersectionNoneEXT;
 
-        // ── 2. Miss: ray reached light, return accumulated transmission ──
+        // ── 2. Miss: ray reached light ──
+        // 仍处于介质内说明射线漏出了闭合玻璃（数值漏光）。此处不再补最后一段吸收：
+        // 补吸收会把漏光变成黑点，直接返回更接近「已离开介质」。
         if (!committed)
             return totalTransmission;
 
@@ -497,6 +560,11 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT)
         uint instanceIndex = rayQueryGetIntersectionInstanceIdEXT(rq, true);
         uint primitiveIndex = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
         float hitT = rayQueryGetIntersectionTEXT(rq, true);
+
+        // ── 4. 介质段吸收：上一表面 → 当前命中（Beer-Lambert）──
+        // 体积颜色只在这里乘一次；表面层不再乘 baseColor（见 Factor C）。
+        if (isInsideVolume)
+            totalTransmission *= exp(-hitT * sigmaT);
 
         InstanceInfo inst = instances[instanceIndex];
         VPT_Material mat = materials[inst.materialID];
@@ -512,13 +580,12 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT)
 
         vec3 P = origin + dir * hitT;
 
-        // ── 4. Opaque material: fully occluded, terminate ──
+        // ── 5. Opaque material: fully occluded, terminate ──
         if ((mat.flags & MAT_IS_TRANSPARENT) == 0u)
             return vec3(0.0);
 
         // 与主路径一致：用命中点的重心坐标插值 UV，采样 _BaseMap 的 RGBA。
-        // alpha 决定该层透射率，RGB 用作玻璃染色；否则阴影不会带彩色玻璃的颜色，
-        // 且只读 SSBO 的 mat.transmission（C# 侧为 0）会永远判成全遮挡。
+        // alpha 决定该层透射率；RGB 对薄壁材质做玻璃染色，对体积材质用作体积色（Beer）。
         vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
         vec2 hitUV = v0.uv * (1.0 - bary.x - bary.y) + v1.uv * bary.x + v2.uv * bary.y;
         vec2 uvT = hitUV * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
@@ -528,7 +595,9 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT)
         if (trans <= MIN_TRANSMISSION)
             return vec3(0.0);
 
-        // ── 5. Compute per-layer transmission (5 factors) ──
+        bool isVolume = materialIsVolume(mat);
+
+        // ── 6. Surface-only transmission（体积材质不再乘颜色）──
 
         // Factor A: base transmission
         vec3 layerT = vec3(trans);
@@ -538,20 +607,24 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT)
         float fresnel = schlickFresnelScalar(mat.ior, cosTheta);
         layerT *= (1.0 - fresnel);
 
-        // Factor C: color tint
-        layerT *= base.rgb;
+        // Factor C: color tint —— 仅薄壁材质逐层乘；体积材质由 Factor D 的 Beer 承担，
+        // 否则前后两个表面各乘一次 baseColor（double tint，本次修复的根因）。
+        if (!isVolume)
+            layerT *= base.rgb;
 
-        // Factor D: volume absorption (Beer's law) — only when propagating inside
-        if (mat.thinWalled == 0u && isInside)
+        // Factor D: 体积边界状态切换（进入时捕获 σt，离开时清空）
+        if (isVolume)
         {
-            vec3 absorbColor = max(base.rgb, vec3(0.001));
-            vec3 absCoeff = -log(absorbColor) / max(mat.ior * 2.0, 0.1);
-            layerT *= exp(-hitT * absCoeff);
-            isInside = !isInside;
-        }
-        else if (mat.thinWalled == 0u)
-        {
-            isInside = !isInside;
+            if (!isInsideVolume)
+            {
+                sigmaT = volumeSigmaT(mat, base.rgb);
+                isInsideVolume = true;
+            }
+            else
+            {
+                isInsideVolume = false;
+                sigmaT = vec3(0.0);
+            }
         }
 
         // Factor E: roughness/metallic attenuation
@@ -559,19 +632,20 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT)
         float roughnessEffect = 1.0 - (mat.roughness * mat.roughness);
         layerT *= mix(0.65, 1.0, roughnessEffect);
 
-        // ── 6. Accumulate transmission ──
+        // ── 7. Accumulate transmission ──
         totalTransmission *= layerT;
 
-        // ── 7. Early termination if too low ──
+        // ── 8. Early termination if too low ──
         float maxComp = max(max(totalTransmission.r, totalTransmission.g), totalTransmission.b);
         if (maxComp <= MIN_TRANSMISSION)
             return vec3(0.0);
 
-        // ── 8. Continue from hit point ──
+        // ── 9. Continue from hit point ──
+        float eps = surfaceOffset(mat);
         float facing = dot(dir, Ngeo);
-        origin = P + Ngeo * sign(facing) * EPS_OFFSET;
+        origin = P + Ngeo * sign(facing) * eps;
         maxT -= hitT;
-        if (maxT <= EPS_OFFSET) break;
+        if (maxT <= eps) break;
     }
 
     return totalTransmission;
@@ -827,13 +901,21 @@ void main()
         vec3 radiance = vec3(0.0);
         vec3 throughput = vec3(1.0);
 
+        // ── Volume 介质状态（每个 sample 独立）──
+        // 单介质假设：只支持一层玻璃（教堂窗）；嵌套玻璃/玻璃内水不支持（见方案 §3.4）。
+        bool isInsideVolume = false;
+        vec3 volumeSigma    = vec3(0.0);
+
         for (int depth = 0; depth < maxDepth; depth++)
         {
             // ── Trace primary ray ──
+            // tmin：只有相机首段用近裁剪面；后续 bounce 必须从 0 起，
+            // 否则 < nearPlane(0.3m) 的几何会被跳过——12mm 玻璃的后表面永远命中不到。
+            float tmin = (depth == 0) ? nearPlane : 0.0;
             rayQueryEXT rq;
             rayQueryInitializeEXT(rq, tlas,
                 gl_RayFlagsOpaqueEXT, 0xFF,
-                rayOrigin, nearPlane,
+                rayOrigin, tmin,
                 rayDir, farPlane);
             while (rayQueryProceedEXT(rq)) {}
 
@@ -886,7 +968,8 @@ void main()
             // ★ URP Lit 语义：_BaseColor * _BaseMap，RGBA 全乘。
             // alpha 必须一起乘进来，否则 mat.albedo.a 恒为 _BaseColor.a(=1)，
             // 后面的 transmission = 1 - albedo.a 会恒为 0（不透明）。
-            mat.albedo = sampleBaseColor(mat, finalUV);
+            vec4 baseCol = sampleBaseColor(mat, finalUV);
+            mat.albedo = baseCol;
 
             if ((mat.flags & MAT_HAS_MR) != 0u && mat.metalRoughTexID != TEX_NONE)
             {
@@ -916,6 +999,12 @@ void main()
             bool isTransparent = ((mat.flags & MAT_IS_TRANSPARENT) != 0u);
             if (isTransparent)
                 mat.transmission = 1.0 - mat.albedo.a;
+
+            // ── Volume：上一表面 → 当前命中的 segment 介质吸收（Beer-Lambert）──
+            // 必须在任何着色贡献之前乘到 throughput；体积颜色只在这里乘一次，
+            // 表面 tint 已中性化（见 btdfSample / btdfEval）。
+            if (isInsideVolume)
+                throughput *= exp(-hit.hitT * volumeSigma);
 
             // G-buffer output (first hit, first sample)
             if (depth == 0 && s == 0u)
@@ -971,7 +1060,7 @@ void main()
                 if (isTransparent && NdotL <= 0.0)
                 {
                     float absNdotL = abs(NdotL);
-                    bsdf_nee = btdfEval(mat, N, T_world, B_world, V, toL, NdotV, absNdotL);
+                    bsdf_nee = btdfEval(mat, N, T_world, B_world, V, toL, NdotV, absNdotL, isInsideVolume);
                     lightValid = (dot(N_flat, toL) < 0.0 || NdotL > 0.0);
                     NdotL = absNdotL;
                 }
@@ -983,9 +1072,10 @@ void main()
 
                 if (lightValid)
                 {
-                    vec3 shadowOrigin = P + Ngeo * EPS_OFFSET;
+                    vec3 shadowOrigin = P + Ngeo * surfaceOffset(mat);
                     // ★ Use traceShadowTransmission for transparent-aware shadows
-                    vec3 shadowTrans = traceShadowTransmission(shadowOrigin, toL, dist);
+                    vec3 shadowTrans = traceShadowTransmission(shadowOrigin, toL, dist,
+                                                              isInsideVolume, volumeSigma);
                     // ×lightCount 补偿单灯选取；×2.0 = MIS 权重（1/0.5）
                     radiance += throughput * bsdf_nee * NdotL * Lcolor * shadowTrans
                              * float(lightCount) * 2.0;
@@ -1012,7 +1102,7 @@ void main()
                 if (isTransparent && NdotL <= 0.0)
                 {
                     float absNdotL = abs(NdotL);
-                    bsdf_nee = btdfEval(mat, N, T_world, B_world, V, toL, NdotV, absNdotL);
+                    bsdf_nee = btdfEval(mat, N, T_world, B_world, V, toL, NdotV, absNdotL, isInsideVolume);
                     lightValid = (dot(N_flat, toL) < 0.0 || NdotL > 0.0);
                     NdotL = absNdotL;
                 }
@@ -1024,9 +1114,10 @@ void main()
 
                 if (lightValid)
                 {
-                    vec3 shadowOrigin = P + Ngeo * EPS_OFFSET;
+                    vec3 shadowOrigin = P + Ngeo * surfaceOffset(mat);
                     // 环境在无穷远；遮挡=环境遮蔽（AO）/半影
-                    vec3 shadowTrans = traceShadowTransmission(shadowOrigin, toL, 1e34);
+                    vec3 shadowTrans = traceShadowTransmission(shadowOrigin, toL, 1e34,
+                                                              isInsideVolume, volumeSigma);
                     // ×2.0 = MIS coin weight（1/0.5）；radiance/pdf 为 importance 采样估计
                     radiance += throughput * bsdf_nee * NdotL * (envRadiance / envPdf)
                              * shadowTrans * 2.0;
@@ -1044,7 +1135,7 @@ void main()
                 if (lobe == LOBE_SPECULAR_TRANSMISSION || lobe == LOBE_DIFFUSE_TRANSMISSION)
                 {
                     if (lobe == LOBE_SPECULAR_TRANSMISSION)
-                        btdfSample(mat, N, T_world, B_world, V, seed, newDir, pdf, bsdf);
+                        btdfSample(mat, N, T_world, B_world, V, seed, isInsideVolume, newDir, pdf, bsdf);
                     else
                     {
                         // Diffuse transmission: cosine hemisphere on back side
@@ -1071,10 +1162,29 @@ void main()
 
             // ── Ray offset: transmission vs reflection ──
             bool isTransmission = (dot(newDir, Ngeo) < 0.0);
+
+            // ── Volume 边界状态机：进入时捕获 σt，离开时清空 ──
+            // 单介质假设：只要还是「体积材质 + 透射」，就按进入/离开翻转。反射不改状态。
+            // 体积色取命中点逐像素 baseColor（彩色玻璃马赛克逐格着色）。
+            if (isTransmission && materialIsVolume(mat))
+            {
+                if (!isInsideVolume)
+                {
+                    volumeSigma = volumeSigmaT(mat, baseCol.rgb);
+                    isInsideVolume = true;
+                }
+                else
+                {
+                    isInsideVolume = false;
+                    volumeSigma = vec3(0.0);
+                }
+            }
+
+            float eps = surfaceOffset(mat);
             if (isTransmission)
-                rayOrigin = P - Ngeo * EPS_OFFSET;
+                rayOrigin = P - Ngeo * eps;
             else
-                rayOrigin = P + Ngeo * EPS_OFFSET;
+                rayOrigin = P + Ngeo * eps;
             rayDir = newDir;
 
             // ── Russian roulette (depth > 3) ──

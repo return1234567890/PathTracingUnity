@@ -6,6 +6,7 @@
 #include "vpt_scene.h"
 #include "vpt_internal.h"
 #include "vpt_types.h"
+#include "vpt_trace.h"
 #include "skinning_spv.h"
 
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <vector>
 #include <algorithm>
 #include <functional>
+#include <mutex>
 
 // ═══════════════════════════════════════════════════════════
 //  扩展函数指针（pfn_ 前缀避免与 SDK 函数原型冲突）
@@ -107,6 +109,11 @@ static uint32_t s_InstanceCapacity = 0;  // 每槽位最大实例数
 static uint32_t s_CurrentRing      = 0;  // 当前写入/构建/读取的槽位
 static uint32_t s_PendingCount     = 0;  // 待构建的实例数
 static bool     s_TLASPending      = false; // UpdateInstances 已写主机数据，待 build
+
+// 实例数超过容量时的延迟扩容（主线程只拷贝，渲染线程里等待 idle 再重建）
+static bool                          s_ResizePending = false;
+static uint32_t                      s_ResizeCount   = 0;
+static std::vector<VPT_InstanceData> s_ResizeInstances;
 
 // ═══════════════════════════════════════════════════════════
 //  工具函数
@@ -253,9 +260,56 @@ void VPTScene::LoadExtensionFunctions(PFN_vkGetInstanceProcAddr gipa, VkInstance
 
 static std::vector<BufferResource> s_StagingBuffers;
 
+// ═══════════════════════════════════════════════════════════
+//  延迟场景推送（Plan B）
+//
+//  C# 侧 VPT_UpdateScene 可能来自主线程（Start / OnValidate→Invoke），
+//  而 Unity 的 VkQueue 归渲染线程所有：主线程直接 vkQueueSubmit /
+//  vkDeviceWaitIdle 与渲染线程并发使用同一条队列，会产生 GPU 挂死
+//  （实测触发 nvlddmkm TDR + VK_ERROR_DEVICE_LOST）。
+//
+//  因此 PushScene 只做 CPU 深拷贝，真正的资源创建/上传/AS 构建放在
+//  RecordSceneUpdateIfNeeded 里，用 Plan B 的 Unity command buffer 录制，
+//  由 Unity 自己提交 —— 全程不出现插件自己的 vkQueueSubmit。
+// ═══════════════════════════════════════════════════════════
+
+struct PendingMeshData
+{
+    std::vector<VPT_Vertex> vertices;
+    std::vector<uint32_t>   indices;
+    uint32_t                materialID = 0;
+    uint32_t                flags      = 0;
+};
+
+// 主线程（PushScene / UpdateInstances / 注册蒙皮）与渲染线程（*Record*IfNeeded）
+// 会同时访问这些待处理数据：一把锁把它们串行化（recursive 便于内部 helper 复用）。
+static std::recursive_mutex s_PendingMutex;
+
+static std::vector<PendingMeshData>  s_PendingMeshes;
+static std::vector<VPT_Material>     s_PendingMaterials;
+static std::vector<VPT_Light>        s_PendingLights;
+static std::vector<VPT_InstanceData> s_PendingSceneInstances;
+static bool                          s_ScenePending = false;
+
+// 重建帧之后做一次 GPU 同步探针（见 vpt_scene.h 说明）
+static bool                          s_NeedGpuSyncProbe = false;
+
+bool VPTScene::TakeGpuSyncProbe()
+{
+    std::lock_guard<std::recursive_mutex> guard(s_PendingMutex);
+    const bool v = s_NeedGpuSyncProbe;
+    s_NeedGpuSyncProbe = false;
+    return v;
+}
+
 // 创建 device-local buffer 并通过 staging buffer 上传数据。
-// staging buffer 被记录到 s_StagingBuffers，调用方需在 vkQueueWaitIdle 后销毁。
-static void CreateDeviceLocalBufferWithData(
+// staging buffer 被记录到 s_StagingBuffers，等下一次场景重建（或 VPT_Destroy）
+// 时统一销毁 —— 这些拷贝是本帧录进 Unity 命令缓冲的，不能立即释放。
+//
+// 返回值必须检查：分配失败时 outDevice.buffer/address 会是 0，若继续把它录进
+// 命令缓冲（vkCmdCopyBuffer 目标为 null、AS build 读地址 0），GPU 会直接挂死
+// 并触发 TDR —— 这正是"第二次 Play 卡死"最可能的形态。
+static bool CreateDeviceLocalBufferWithData(
     VkDevice device, VkPhysicalDevice gpu,
     VkCommandBuffer cmd,
     const void* srcData, VkDeviceSize size,
@@ -263,21 +317,44 @@ static void CreateDeviceLocalBufferWithData(
     BufferResource& outDevice)
 {
     // 1. device-local 目标 buffer（GPU VRAM）
-    CreateBufferResource(device, gpu, size,
+    VkResult r = CreateBufferResource(device, gpu, size,
         usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         outDevice);
+    if (r != VK_SUCCESS)
+    {
+        VPTTrace::Line("alloc FAILED: device buffer size=%llu usage=0x%x -> %d",
+                       (unsigned long long)size, (unsigned)usage, (int)r);
+        VPT_CheckVk(r, "CreateDeviceLocalBufferWithData(device)");
+        return false;
+    }
 
     // 2. host-visible staging buffer（仅用于一次性上传）
     BufferResource staging{};
-    CreateBufferResource(device, gpu, size,
+    r = CreateBufferResource(device, gpu, size,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
         staging);
+    if (r != VK_SUCCESS)
+    {
+        VPTTrace::Line("alloc FAILED: staging buffer size=%llu -> %d",
+                       (unsigned long long)size, (int)r);
+        VPT_CheckVk(r, "CreateDeviceLocalBufferWithData(staging)");
+        DestroyBufferResource(device, outDevice);
+        return false;
+    }
 
     // 3. CPU 写入 staging
     void* m = nullptr;
-    vkMapMemory(device, staging.memory, 0, size, 0, &m);
+    r = vkMapMemory(device, staging.memory, 0, size, 0, &m);
+    if (r != VK_SUCCESS || m == nullptr)
+    {
+        VPTTrace::Line("vkMapMemory(staging) FAILED -> %d", (int)r);
+        VPT_CheckVk(r, "vkMapMemory(staging)");
+        DestroyBufferResource(device, staging);
+        DestroyBufferResource(device, outDevice);
+        return false;
+    }
     memcpy(m, srcData, size);
     vkUnmapMemory(device, staging.memory);
 
@@ -287,13 +364,14 @@ static void CreateDeviceLocalBufferWithData(
 
     // 5. staging 延迟销毁
     s_StagingBuffers.push_back(staging);
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════
 //  统一缓冲区创建 + 数据上传（device-local + staging）
 // ═══════════════════════════════════════════════════════════
 
-static void CreateUnifiedBuffers(
+static bool CreateUnifiedBuffers(
     VkDevice device, VkPhysicalDevice gpu,
     VkCommandBuffer cmd,
     const VPT_MeshData* meshes, int32_t meshCount)
@@ -313,8 +391,8 @@ static void CreateUnifiedBuffers(
         s_MeshVertexOffsets.push_back((uint32_t)(totalVertSize / sizeof(VPT_Vertex)));
         s_MeshIndexOffsets.push_back((uint32_t)(totalIdxSize / sizeof(uint32_t)));
         s_MeshVertexCounts.push_back(meshes[i].vertexCount);
-        totalVertSize += meshes[i].vertexCount * sizeof(VPT_Vertex);
-        totalIdxSize  += meshes[i].indexCount * sizeof(uint32_t);
+        totalVertSize += meshCount > 0 ? (VkDeviceSize)meshes[i].vertexCount * sizeof(VPT_Vertex) : 0;
+        totalIdxSize  += meshCount > 0 ? (VkDeviceSize)meshes[i].indexCount * sizeof(uint32_t) : 0;
     }
 
     if (totalVertSize == 0) totalVertSize = 4;
@@ -326,28 +404,58 @@ static void CreateUnifiedBuffers(
     std::vector<uint8_t> idxData(totalIdxSize);
     for (int32_t i = 0; i < meshCount; i++)
     {
-        VkDeviceSize vSize = meshes[i].vertexCount * sizeof(VPT_Vertex);
-        VkDeviceSize iSize = meshes[i].indexCount * sizeof(uint32_t);
-        memcpy(vertData.data() + s_MeshVertexOffsets[i] * sizeof(VPT_Vertex),
-               meshes[i].vertices, vSize);
-        memcpy(idxData.data() + s_MeshIndexOffsets[i] * sizeof(uint32_t),
-               meshes[i].indices, iSize);
+        VkDeviceSize vSize = (VkDeviceSize)meshes[i].vertexCount * sizeof(VPT_Vertex);
+        VkDeviceSize iSize = (VkDeviceSize)meshes[i].indexCount * sizeof(uint32_t);
+        if (vSize > 0 && meshes[i].vertices)
+            memcpy(vertData.data() + (size_t)s_MeshVertexOffsets[i] * sizeof(VPT_Vertex),
+                   meshes[i].vertices, (size_t)vSize);
+        if (iSize > 0 && meshes[i].indices)
+            memcpy(idxData.data() + (size_t)s_MeshIndexOffsets[i] * sizeof(uint32_t),
+                   meshes[i].indices, (size_t)iSize);
     }
 
-    CreateDeviceLocalBufferWithData(device, gpu, cmd,
+    if (!CreateDeviceLocalBufferWithData(device, gpu, cmd,
         vertData.data(), totalVertSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
         | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
         | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
         | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, // 蒙皮 base 副本需从统一缓冲读出（RegisterSkinnedMesh）
-        s_UnifiedVertexBuffer);
+        s_UnifiedVertexBuffer))
+    {
+        VPTTrace::Line("scene: unified VERTEX buffer upload failed (%llu bytes) -> abort rebuild",
+                       (unsigned long long)totalVertSize);
+        return false;
+    }
 
-    CreateDeviceLocalBufferWithData(device, gpu, cmd,
+    if (!CreateDeviceLocalBufferWithData(device, gpu, cmd,
         idxData.data(), totalIdxSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
         | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
         | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-        s_UnifiedIndexBuffer);
+        s_UnifiedIndexBuffer))
+    {
+        VPTTrace::Line("scene: unified INDEX buffer upload failed (%llu bytes) -> abort rebuild",
+                       (unsigned long long)totalIdxSize);
+        DestroyBufferResource(device, s_UnifiedVertexBuffer);
+        return false;
+    }
+
+    // 顶点/索引缓冲的 device address 必须非 0：AS build 直接拿它当输入指针
+    if (s_UnifiedVertexBuffer.address == 0 || s_UnifiedIndexBuffer.address == 0)
+    {
+        VPTTrace::Line("scene: unified buffer device address is ZERO (v=%llu i=%llu) -> abort rebuild",
+                       (unsigned long long)s_UnifiedVertexBuffer.address,
+                       (unsigned long long)s_UnifiedIndexBuffer.address);
+        DestroyBufferResource(device, s_UnifiedVertexBuffer);
+        DestroyBufferResource(device, s_UnifiedIndexBuffer);
+        return false;
+    }
+
+    VPTTrace::Line("scene: unified buffers ok (verts=%llu idx=%llu, addr=0x%llx/0x%llx)",
+                   (unsigned long long)totalVertSize, (unsigned long long)totalIdxSize,
+                   (unsigned long long)s_UnifiedVertexBuffer.address,
+                   (unsigned long long)s_UnifiedIndexBuffer.address);
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -898,42 +1006,6 @@ static bool EnsureSkinPipeline(VkDevice device)
     return true;
 }
 
-// 一次性命令提交辅助（注册为低频路径）：创建临时 pool/cmd，录制后提交并等待完成
-static bool OneShotSubmit(VkDevice device, uint32_t queueFamily,
-                          const std::function<void(VkCommandBuffer)>& record)
-{
-    VkCommandPoolCreateInfo poolCI{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    poolCI.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolCI.queueFamilyIndex = queueFamily;
-    VkCommandPool pool;
-    if (vkCreateCommandPool(device, &poolCI, nullptr, &pool) != VK_SUCCESS)
-        return false;
-
-    VkCommandBufferAllocateInfo allocCI{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    allocCI.commandPool = pool;
-    allocCI.commandBufferCount = 1;
-    allocCI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device, &allocCI, &cmd);
-
-    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
-    record(cmd);
-    vkEndCommandBuffer(cmd);
-
-    const UnityVulkanInstance& inst = VPT_GetInstance();
-    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(inst.graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(inst.graphicsQueue);
-
-    vkFreeCommandBuffers(device, pool, 1, &cmd);
-    vkDestroyCommandPool(device, pool, nullptr);
-    return true;
-}
-
 // 释放单个 SkinMeshResource（防御重复注册/失败路径共用）
 static void DestroySkinMeshResource(VkDevice device, SkinMeshResource& m)
 {
@@ -945,136 +1017,205 @@ static void DestroySkinMeshResource(VkDevice device, SkinMeshResource& m)
     m = {};
 }
 
+// ── 延迟蒙皮注册（Plan B）──
+// C# 在 VPT_UpdateScene 之后紧接着调用 VPT_RegisterSkinnedMesh，而场景构建已经
+// 挪到渲染事件里，此刻 BLAS 还没建好。所以这里只做 CPU 拷贝排队，
+// buffer 创建 + 拷贝由 RecordSkinRegistrationIfNeeded 录进 Unity 的命令缓冲。
+struct PendingSkinReg
+{
+    uint32_t             blasID      = 0;
+    uint32_t             vertexCount = 0;
+    uint32_t             jointCount  = 0;
+    std::vector<float>   weights;
+    std::vector<int32_t> joints;
+};
+static std::vector<PendingSkinReg> s_PendingSkinRegs;
+
 void VPTScene::RegisterSkinnedMesh(uint32_t blasID,
                                     const float* weights, const int32_t* joints,
                                     uint32_t vertexCount, uint32_t jointCount)
 {
-    if (!s_ExtensionsReady || !s_Ready || !weights || !joints
-        || vertexCount == 0 || jointCount == 0)
+    std::lock_guard<std::recursive_mutex> guard(s_PendingMutex);
+
+    if (!weights || !joints || vertexCount == 0 || jointCount == 0)
         return;
-    if (blasID >= s_BLASes.size())
+
+    PendingSkinReg reg;
+    reg.blasID      = blasID;
+    reg.vertexCount = vertexCount;
+    reg.jointCount  = jointCount;
+    reg.weights.assign(weights, weights + (size_t)vertexCount * 4);
+    reg.joints.assign(joints, joints + (size_t)vertexCount * 4);
+
+    // 同 BLAS 重复注册（场景重建后 C# 会重新注册）→ 覆盖旧队列条目
+    for (auto& r : s_PendingSkinRegs)
     {
-        fprintf(stderr, "[VPT] RegisterSkinnedMesh: blasID %u out of range (%zu BLASes)\n",
-                blasID, s_BLASes.size());
-        return;
+        if (r.blasID == blasID) { r = std::move(reg); return; }
     }
-    if (!s_BLASes[blasID].allowUpdate)
-    {
-        fprintf(stderr, "[VPT] RegisterSkinnedMesh: BLAS[%u] built without ALLOW_UPDATE. Skipped.\n", blasID);
+    s_PendingSkinRegs.push_back(std::move(reg));
+
+    fprintf(stderr, "[VPT] RegisterSkinnedMesh queued: BLAS[%u], %u verts, %u joints\n",
+            blasID, vertexCount, jointCount);
+}
+
+void VPTScene::RecordSkinRegistrationIfNeeded(VkCommandBuffer cmd)
+{
+    std::lock_guard<std::recursive_mutex> guard(s_PendingMutex);
+
+    if (s_PendingSkinRegs.empty() || cmd == VK_NULL_HANDLE)
         return;
-    }
-    if (blasID >= s_MeshVertexCounts.size() || vertexCount != s_MeshVertexCounts[blasID])
+    if (!s_Ready)
+        return;                       // 场景还没建好：下一帧再说
+    if (VPT_IsDeviceLost())
     {
-        fprintf(stderr, "[VPT] RegisterSkinnedMesh: BLAS[%u] vertex count mismatch "
-                        "(%u given, %u uploaded). Skipped.\n",
-                blasID, vertexCount,
-                blasID < s_MeshVertexCounts.size() ? s_MeshVertexCounts[blasID] : 0);
+        s_PendingSkinRegs.clear();
         return;
     }
 
     const UnityVulkanInstance& inst = VPT_GetInstance();
     VkDevice device = inst.device;
     VkPhysicalDevice gpu = inst.physicalDevice;
-
-    if (!EnsureSkinPipeline(device))
+    if (device == VK_NULL_HANDLE)
         return;
 
-    // 防御：同 BLAS 重复注册 → 先释放并移除旧条目（正常流程在场景重建时已整体销毁）
-    for (auto it = s_SkinMeshes.begin(); it != s_SkinMeshes.end(); ++it)
+    for (auto it = s_PendingSkinRegs.begin(); it != s_PendingSkinRegs.end(); )
     {
-        if (it->blasID == blasID)
+        PendingSkinReg reg = std::move(*it);
+        it = s_PendingSkinRegs.erase(it);
+
+        // ── 校验（场景重建后 BLAS 数量/顶点数可能已变化）──
+        if (reg.blasID >= s_BLASes.size())
         {
-            fprintf(stderr, "[VPT] RegisterSkinnedMesh: BLAS[%u] already registered, re-registering.\n", blasID);
-            DestroySkinMeshResource(device, *it);
-            s_SkinMeshes.erase(it);
-            break;
+            fprintf(stderr, "[VPT] RegisterSkinnedMesh: blasID %u out of range (%zu BLASes), dropped.\n",
+                    reg.blasID, s_BLASes.size());
+            continue;
         }
-    }
-
-    SkinMeshResource sm{};
-    sm.blasID      = blasID;
-    sm.vertexCount = vertexCount;
-    sm.jointCount  = jointCount;
-
-    VkDeviceSize baseBytes = (VkDeviceSize)vertexCount * sizeof(VPT_Vertex);
-    VkDeviceSize attrBytes  = (VkDeviceSize)vertexCount * 16; // vec4 / ivec4 每顶点
-    VkDeviceSize matBytes   = (VkDeviceSize)kTLASRingSize * jointCount * 64;
-
-    constexpr VkBufferUsageFlags ssboUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                                           | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-
-    bool ok = CreateBufferResource(device, gpu, baseBytes,
-        ssboUsage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sm.baseVertices) == VK_SUCCESS
-        && CreateBufferResource(device, gpu, attrBytes,
-            ssboUsage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sm.weights) == VK_SUCCESS
-        && CreateBufferResource(device, gpu, attrBytes,
-            ssboUsage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sm.joints) == VK_SUCCESS
-        && CreateBufferResource(device, gpu, matBytes,
-            ssboUsage,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            sm.jointMatrices) == VK_SUCCESS
-        && vkMapMemory(device, sm.jointMatrices.memory, 0, matBytes, 0, &sm.jointMapped) == VK_SUCCESS;
-
-    if (ok)
-    {
-        // weights/joints 一次性 staging（注册低频，独立提交等待完成）
-        BufferResource wStaging{}, jStaging{};
-        void* wm = nullptr, * jm = nullptr;
-        ok = CreateBufferResource(device, gpu, attrBytes,
-                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                  wStaging) == VK_SUCCESS
-              && CreateBufferResource(device, gpu, attrBytes,
-                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                  jStaging) == VK_SUCCESS;
-        if (ok)
+        if (!s_BLASes[reg.blasID].allowUpdate)
         {
-            vkMapMemory(device, wStaging.memory, 0, attrBytes, 0, &wm);
-            memcpy(wm, weights, (size_t)attrBytes);
-            vkUnmapMemory(device, wStaging.memory);
-            vkMapMemory(device, jStaging.memory, 0, attrBytes, 0, &jm);
-            memcpy(jm, joints, (size_t)attrBytes);
-            vkUnmapMemory(device, jStaging.memory);
+            fprintf(stderr, "[VPT] RegisterSkinnedMesh: BLAS[%u] built without ALLOW_UPDATE. Skipped.\n", reg.blasID);
+            continue;
+        }
+        if (reg.blasID >= s_MeshVertexCounts.size() || reg.vertexCount != s_MeshVertexCounts[reg.blasID])
+        {
+            fprintf(stderr, "[VPT] RegisterSkinnedMesh: BLAS[%u] vertex count mismatch "
+                            "(%u given, %u uploaded). Skipped.\n",
+                    reg.blasID, reg.vertexCount,
+                    reg.blasID < s_MeshVertexCounts.size() ? s_MeshVertexCounts[reg.blasID] : 0);
+            continue;
         }
 
-        if (ok)
+        if (!EnsureSkinPipeline(device))
+            continue;
+
+        // 防御：同 BLAS 重复注册 → 先释放并移除旧条目（正常流程在场景重建时已整体销毁）
+        for (auto sit = s_SkinMeshes.begin(); sit != s_SkinMeshes.end(); ++sit)
         {
-            OneShotSubmit(device, inst.queueFamilyIndex, [&](VkCommandBuffer cmd)
+            if (sit->blasID == reg.blasID)
             {
-                // base 副本：直接自统一顶点缓冲复制对应区段（此时内容即 bind-pose）
-                // 注意 srcOffset 必须指向该 mesh 自己的区段（偏移 0 是第一个 mesh 的顶点）
-                VkBufferCopy baseRegion{};
-                baseRegion.srcOffset = (VkDeviceSize)s_MeshVertexOffsets[blasID] * sizeof(VPT_Vertex);
-                baseRegion.dstOffset = 0;
-                baseRegion.size      = baseBytes;
-                vkCmdCopyBuffer(cmd, s_UnifiedVertexBuffer.buffer, sm.baseVertices.buffer, 1, &baseRegion);
-
-                VkBufferCopy attrRegion{};
-                attrRegion.size = attrBytes;
-                vkCmdCopyBuffer(cmd, wStaging.buffer, sm.weights.buffer, 1, &attrRegion);
-                vkCmdCopyBuffer(cmd, jStaging.buffer,  sm.joints.buffer,  1, &attrRegion);
-            });
+                fprintf(stderr, "[VPT] RegisterSkinnedMesh: BLAS[%u] already registered, re-registering.\n", reg.blasID);
+                DestroySkinMeshResource(device, *sit);
+                s_SkinMeshes.erase(sit);
+                break;
+            }
         }
 
-        DestroyBufferResource(device, wStaging);
-        DestroyBufferResource(device, jStaging);
+        SkinMeshResource sm{};
+        sm.blasID      = reg.blasID;
+        sm.vertexCount = reg.vertexCount;
+        sm.jointCount  = reg.jointCount;
+
+        VkDeviceSize baseBytes = (VkDeviceSize)reg.vertexCount * sizeof(VPT_Vertex);
+        VkDeviceSize attrBytes  = (VkDeviceSize)reg.vertexCount * 16; // vec4 / ivec4 每顶点
+        VkDeviceSize matBytes   = (VkDeviceSize)kTLASRingSize * reg.jointCount * 64;
+
+        constexpr VkBufferUsageFlags ssboUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                               | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+        bool ok = CreateBufferResource(device, gpu, baseBytes,
+            ssboUsage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sm.baseVertices) == VK_SUCCESS
+            && CreateBufferResource(device, gpu, attrBytes,
+                ssboUsage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sm.weights) == VK_SUCCESS
+            && CreateBufferResource(device, gpu, attrBytes,
+                ssboUsage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sm.joints) == VK_SUCCESS
+            && CreateBufferResource(device, gpu, matBytes,
+                ssboUsage,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                sm.jointMatrices) == VK_SUCCESS
+            && vkMapMemory(device, sm.jointMatrices.memory, 0, matBytes, 0, &sm.jointMapped) == VK_SUCCESS;
+
+        if (!ok)
+        {
+            fprintf(stderr, "[VPT] RegisterSkinnedMesh: BLAS[%u] resource creation FAILED\n", reg.blasID);
+            DestroySkinMeshResource(device, sm);
+            continue;
+        }
+
+        // weights/joints staging：host-visible，常驻到下次场景重建（拷贝是本帧录制的）
+        BufferResource wStaging{}, jStaging{};
+        ok = CreateBufferResource(device, gpu, attrBytes,
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 wStaging) == VK_SUCCESS
+          && CreateBufferResource(device, gpu, attrBytes,
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 jStaging) == VK_SUCCESS;
+        if (!ok)
+        {
+            DestroyBufferResource(device, wStaging);
+            DestroyBufferResource(device, jStaging);
+            DestroySkinMeshResource(device, sm);
+            continue;
+        }
+
+        void* wm = nullptr;
+        void* jm = nullptr;
+        vkMapMemory(device, wStaging.memory, 0, attrBytes, 0, &wm);
+        memcpy(wm, reg.weights.data(), (size_t)attrBytes);
+        vkUnmapMemory(device, wStaging.memory);
+        vkMapMemory(device, jStaging.memory, 0, attrBytes, 0, &jm);
+        memcpy(jm, reg.joints.data(), (size_t)attrBytes);
+        vkUnmapMemory(device, jStaging.memory);
+
+        // Barrier: 之前对统一顶点缓冲/新 buffer 的写 → transfer 读
+        VkMemoryBarrier toTransfer{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        toTransfer.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 1, &toTransfer, 0, nullptr, 0, nullptr);
+
+        // base 副本：直接自统一顶点缓冲复制对应区段（此时内容即 bind-pose）
+        VkBufferCopy baseRegion{};
+        baseRegion.srcOffset = (VkDeviceSize)s_MeshVertexOffsets[reg.blasID] * sizeof(VPT_Vertex);
+        baseRegion.dstOffset = 0;
+        baseRegion.size      = baseBytes;
+        vkCmdCopyBuffer(cmd, s_UnifiedVertexBuffer.buffer, sm.baseVertices.buffer, 1, &baseRegion);
+
+        VkBufferCopy attrRegion{};
+        attrRegion.size = attrBytes;
+        vkCmdCopyBuffer(cmd, wStaging.buffer, sm.weights.buffer, 1, &attrRegion);
+        vkCmdCopyBuffer(cmd, jStaging.buffer, sm.joints.buffer,  1, &attrRegion);
+
+        // Barrier: transfer 写 → 蒙皮 compute 读
+        VkMemoryBarrier toCompute{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        toCompute.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toCompute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &toCompute, 0, nullptr, 0, nullptr);
+
+        s_StagingBuffers.push_back(wStaging);
+        s_StagingBuffers.push_back(jStaging);
+
+        s_SkinMeshes.push_back(std::move(sm));
+
+        fprintf(stderr, "[VPT] Skinned mesh registered: BLAS[%u], %u verts, %u joints\n",
+                reg.blasID, reg.vertexCount, reg.jointCount);
     }
-
-    if (!ok)
-    {
-        fprintf(stderr, "[VPT] RegisterSkinnedMesh: BLAS[%u] resource creation FAILED\n", blasID);
-        DestroySkinMeshResource(device, sm);
-        return;
-    }
-
-    s_SkinMeshes.push_back(std::move(sm));
-
-    fprintf(stderr, "[VPT] Skinned mesh registered: BLAS[%u], %u verts, %u joints\n",
-            blasID, vertexCount, jointCount);
 }
 
 void VPTScene::UpdateSkinning(uint32_t blasID, const float* jointMatrices, uint32_t jointCount)
@@ -1173,138 +1314,74 @@ void VPTScene::RecordGPUSkinningIfNeeded(VkCommandBuffer cmd)
 //  场景更新主入口
 // ═══════════════════════════════════════════════════════════
 
-void VPTScene::UpdateScene(const VPT_SceneUpdate& su)
+// ═══════════════════════════════════════════════════════════
+//  场景更新（Plan B：主线程只拷贝，渲染线程录制）
+// ═══════════════════════════════════════════════════════════
+
+void VPTScene::PushScene(const VPT_SceneUpdate& su)
 {
-    s_Ready = false;
-    DestroyResources();
+    std::lock_guard<std::recursive_mutex> guard(s_PendingMutex);
 
-    const UnityVulkanInstance& inst = VPT_GetInstance();
-    VkDevice device = inst.device;
-    VkPhysicalDevice gpu = inst.physicalDevice;
-    s_Device = device;
-
-    // 清空上一轮 staging buffers（此时 GPU 已 idle，DestroyResources 中 vkDeviceWaitIdle 已保证）
-    for (auto& sb : s_StagingBuffers)
-        DestroyBufferResource(device, sb);
-    s_StagingBuffers.clear();
-
-    // ── 创建 command buffer（提前到此处，因为 staging copy 需要录入）──
-    VkCommandPoolCreateInfo poolCI{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    poolCI.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolCI.queueFamilyIndex = inst.queueFamilyIndex;
-    VkCommandPool pool;
-    vkCreateCommandPool(device, &poolCI, nullptr, &pool);
-
-    VkCommandBufferAllocateInfo allocCI{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    allocCI.commandPool = pool;
-    allocCI.commandBufferCount = 1;
-    allocCI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device, &allocCI, &cmd);
-
-    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
-
-    // ── device-local buffer 创建 + staging 上传（材质 / 光源 / 顶点 / 索引）──
-    VkDeviceSize matSize = su.materialCount * sizeof(VPT_Material);
-    if (matSize > 0)
+    if (su.meshCount <= 0 || !su.meshes)
     {
-        CreateDeviceLocalBufferWithData(device, gpu, cmd,
-            su.materials, matSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            s_MaterialBuffer);
+        fprintf(stderr, "[VPT] PushScene: empty scene ignored.\n");
+        return;
     }
 
-    VkDeviceSize lightSize = su.lightCount * sizeof(VPT_Light);
-    if (lightSize > 0)
-    {
-        CreateDeviceLocalBufferWithData(device, gpu, cmd,
-            su.lights, lightSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            s_LightBuffer);
-    }
+    // 深拷贝（调用方的指针/托管内存返回后即可释放）。先释放上一轮待处理数据，
+    // 避免反复拖 Inspector 时内存翻倍。
+    s_PendingMeshes.clear();
+    s_PendingMaterials.clear();
+    s_PendingLights.clear();
+    s_PendingSceneInstances.clear();
 
-    // 统一顶点/索引缓冲（device-local + staging）
-    CreateUnifiedBuffers(device, gpu, cmd, su.meshes, su.meshCount);
-
-    // ── Barrier: staging copy (TRANSFER_WRITE) → BLAS build + shader read ──
-    VkMemoryBarrier copyBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    copyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    copyBarrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
-                               | VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
-        | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &copyBarrier, 0, nullptr, 0, nullptr);
-
-    s_BLASes.reserve(su.meshCount);
+    s_PendingMeshes.resize((size_t)su.meshCount);
     for (int32_t i = 0; i < su.meshCount; i++)
-        BuildBLAS(cmd, device, gpu, su.meshes[i], i);
-
-    // CRITICAL: Memory barrier between BLAS builds and TLAS build.
-    VkMemoryBarrier blasBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    blasBarrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-    blasBarrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        0, 1, &blasBarrier, 0, nullptr, 0, nullptr);
-
-    // ── TLAS 环形资源分配（静态拓扑变化时一次性）+ 首次构建（槽位 0）──
-    if (EnsureTLASResources(device, gpu, (uint32_t)(su.instanceCount > 0 ? su.instanceCount : 1)))
     {
-        s_CurrentRing = 0;
-        WriteInstanceData(su.instances, su.instanceCount, 0);
-        RecordTLASBuild(cmd, device, 0, (uint32_t)su.instanceCount);
-    }
-    else
-    {
-        fprintf(stderr, "[VPT] TLAS ring allocation FAILED\n");
-    }
-
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    VkResult qRes = vkQueueSubmit(inst.graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(inst.graphicsQueue);
-    if (qRes != VK_SUCCESS) {
-        fprintf(stderr, "[VPT] vkQueueSubmit FAILED: %d\n", qRes);
+        const VPT_MeshData& src = su.meshes[i];
+        PendingMeshData& dst = s_PendingMeshes[(size_t)i];
+        dst.materialID = src.materialID;
+        dst.flags      = src.flags;
+        if (src.vertices && src.vertexCount)
+        {
+            dst.vertices.assign(src.vertices, src.vertices + src.vertexCount);
+        }
+        if (src.indices && src.indexCount)
+        {
+            dst.indices.assign(src.indices, src.indices + src.indexCount);
+        }
     }
 
-    // ── GPU 完成，销毁 staging buffers ──
-    for (auto& sb : s_StagingBuffers)
-        DestroyBufferResource(device, sb);
-    s_StagingBuffers.clear();
+    if (su.materials && su.materialCount > 0)
+        s_PendingMaterials.assign(su.materials, su.materials + su.materialCount);
+    if (su.lights && su.lightCount > 0)
+        s_PendingLights.assign(su.lights, su.lights + su.lightCount);
+    if (su.instances && su.instanceCount > 0)
+        s_PendingSceneInstances.assign(su.instances, su.instances + su.instanceCount);
 
-    vkFreeCommandBuffers(device, pool, 1, &cmd);
-    vkDestroyCommandPool(device, pool, nullptr);
-
-    s_Ready = true;
-    fprintf(stderr, "[VPT] Scene: %d meshes, %d mats, %d lights, %d instances\n",
+    s_ScenePending = true;
+    fprintf(stderr, "[VPT] PushScene queued: %d meshes, %d mats, %d lights, %d instances "
+                    "(deferred to Unity command buffer)\n",
             su.meshCount, su.materialCount, su.lightCount, su.instanceCount);
+    VPTTrace::Line("PushScene: queued %d meshes, %d mats, %d lights, %d instances",
+                   su.meshCount, su.materialCount, su.lightCount, su.instanceCount);
 }
 
-// ═══════════════════════════════════════════════════════════
-//  资源销毁
-// ═══════════════════════════════════════════════════════════
+bool VPTScene::IsSceneUpdatePending() { return s_ScenePending; }
 
-void VPTScene::DestroyResources()
+// 拆场景资源（不做 wait；调用方负责先保证 GPU 空闲）
+static void DestroySceneResourcesNoWait(VkDevice device)
 {
-    if (s_Device == VK_NULL_HANDLE) return;
-    vkDeviceWaitIdle(s_Device);
+    if (device == VK_NULL_HANDLE) return;
 
-    for (auto& blas : s_BLASes) DestroyBLASResource(s_Device, blas);
+    for (auto& blas : s_BLASes) DestroyBLASResource(device, blas);
     s_BLASes.clear();
-    DestroyBufferResource(s_Device, s_UnifiedVertexBuffer);
-    DestroyBufferResource(s_Device, s_UnifiedIndexBuffer);
-    DestroyBufferResource(s_Device, s_MaterialBuffer);
-    DestroyBufferResource(s_Device, s_LightBuffer);
-    DestroyTLASRingResources(s_Device);
-    DestroySkinResources(s_Device);
+    DestroyBufferResource(device, s_UnifiedVertexBuffer);
+    DestroyBufferResource(device, s_UnifiedIndexBuffer);
+    DestroyBufferResource(device, s_MaterialBuffer);
+    DestroyBufferResource(device, s_LightBuffer);
+    DestroyTLASRingResources(device);
+    DestroySkinResources(device);
     s_SkinNotRegisteredWarned = false;
     s_MeshVertexOffsets.clear();
     s_MeshIndexOffsets.clear();
@@ -1313,24 +1390,285 @@ void VPTScene::DestroyResources()
     s_Ready = false;
 }
 
+bool VPTScene::RecordSceneUpdateIfNeeded(VkCommandBuffer cmd)
+{
+    std::lock_guard<std::recursive_mutex> guard(s_PendingMutex);
+
+    if (!s_ScenePending)
+        return false;
+
+    const UnityVulkanInstance& inst = VPT_GetInstance();
+    VkDevice device = inst.device;
+    VkPhysicalDevice gpu = inst.physicalDevice;
+
+    if (device == VK_NULL_HANDLE || cmd == VK_NULL_HANDLE)
+        return false;   // 设备/命令缓冲还没就绪，下一帧再试
+
+    if (VPT_IsDeviceLost())
+    {
+        // 设备已丢失：丢弃这次推送，绝不再向死设备要资源
+        s_ScenePending = false;
+        s_PendingMeshes.clear();
+        s_PendingMaterials.clear();
+        s_PendingLights.clear();
+        s_PendingSceneInstances.clear();
+        fprintf(stderr, "[VPT] PushScene dropped: device lost.\n");
+        VPTTrace::Line("scene: dropped (device lost)");
+        return false;
+    }
+
+    VPTTrace::Stage("scene:begin");
+    VPTTrace::Line("scene: begin rebuild (%zu meshes, %zu mats, %zu lights, %zu instances)",
+                   s_PendingMeshes.size(), s_PendingMaterials.size(),
+                   s_PendingLights.size(), s_PendingSceneInstances.size());
+
+    // ── 旧资源/上一轮 staging 仍可能被在飞行帧读取：先等 GPU 空闲。
+    //    这一步现在跑在渲染线程 + 事件内（Unity 保证上一帧已提交），
+    //    不会和 Unity 的 submit 抢同一条队列。 ──
+    if (s_Device != VK_NULL_HANDLE)
+    {
+        VPTTrace::Stage("scene:vkDeviceWaitIdle");
+        VPTTrace::Line("scene: vkDeviceWaitIdle(before destroy) begin ...");
+        const VkResult wr = vkDeviceWaitIdle(device);
+        VPTTrace::Line("scene: vkDeviceWaitIdle returned %d", (int)wr);
+        if (!VPT_CheckVk(wr, "vkDeviceWaitIdle(scene rebuild)"))
+        {
+            s_ScenePending = false;
+            return false;
+        }
+    }
+
+    for (auto& sb : s_StagingBuffers)
+        DestroyBufferResource(device, sb);
+    s_StagingBuffers.clear();
+
+    VPTTrace::Stage("scene:destroy-old");
+    s_Device = device;
+    DestroySceneResourcesNoWait(device);
+
+    // Unity 命令缓冲：本次上传/构建全部录进去，由 Unity 在帧末提交。
+    VkCommandBuffer cmdBuf = cmd;
+
+    // ── 由待处理数据组装 VPT_MeshData（仅 BuildBLAS/CreateUnifiedBuffers 读描述信息）──
+    std::vector<VPT_MeshData> meshes(s_PendingMeshes.size());
+    for (size_t i = 0; i < s_PendingMeshes.size(); i++)
+    {
+        const PendingMeshData& m = s_PendingMeshes[i];
+        meshes[i].vertices    = m.vertices.empty() ? nullptr : m.vertices.data();
+        meshes[i].vertexCount = (uint32_t)m.vertices.size();
+        meshes[i].indices     = m.indices.empty() ? nullptr : m.indices.data();
+        meshes[i].indexCount  = (uint32_t)m.indices.size();
+        meshes[i].materialID  = m.materialID;
+        meshes[i].flags       = m.flags;
+    }
+
+    // ── device-local buffer 创建 + staging 上传（材质 / 光源 / 顶点 / 索引）──
+    // 任何一步分配失败都必须放弃整个重建：把 null buffer / 0 地址录进命令缓冲
+    // 会让 GPU 直接挂死（TDR），而 CPU 侧没有任何报错。
+    VPTTrace::Stage("scene:buffers");
+    VkDeviceSize matSize = (VkDeviceSize)s_PendingMaterials.size() * sizeof(VPT_Material);
+    if (matSize > 0)
+    {
+        if (!CreateDeviceLocalBufferWithData(device, gpu, cmdBuf,
+            s_PendingMaterials.data(), matSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            s_MaterialBuffer))
+        {
+            VPTTrace::Line("scene: material buffer upload failed -> abort rebuild");
+            DestroySceneResourcesNoWait(device);
+            s_ScenePending = false;
+            s_PendingMeshes.clear(); s_PendingMaterials.clear();
+            s_PendingLights.clear(); s_PendingSceneInstances.clear();
+            return false;
+        }
+    }
+
+    VkDeviceSize lightSize = (VkDeviceSize)s_PendingLights.size() * sizeof(VPT_Light);
+    if (lightSize > 0)
+    {
+        if (!CreateDeviceLocalBufferWithData(device, gpu, cmdBuf,
+            s_PendingLights.data(), lightSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            s_LightBuffer))
+        {
+            VPTTrace::Line("scene: light buffer upload failed -> abort rebuild");
+            DestroySceneResourcesNoWait(device);
+            s_ScenePending = false;
+            s_PendingMeshes.clear(); s_PendingMaterials.clear();
+            s_PendingLights.clear(); s_PendingSceneInstances.clear();
+            return false;
+        }
+    }
+
+    // 统一顶点/索引缓冲（device-local + staging）
+    if (!CreateUnifiedBuffers(device, gpu, cmdBuf, meshes.data(), (int32_t)meshes.size()))
+    {
+        VPTTrace::Line("scene: unified buffer creation failed -> abort rebuild");
+        DestroySceneResourcesNoWait(device);
+        s_ScenePending = false;
+        s_PendingMeshes.clear(); s_PendingMaterials.clear();
+        s_PendingLights.clear(); s_PendingSceneInstances.clear();
+        return false;
+    }
+
+    // ── Barrier: staging copy (TRANSFER_WRITE) → BLAS build + shader read ──
+    VkMemoryBarrier copyBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    copyBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    copyBarrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                               | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmdBuf,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+        | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &copyBarrier, 0, nullptr, 0, nullptr);
+
+    s_BLASes.reserve(meshes.size());
+    VPTTrace::Stage("scene:build-blas");
+    VPTTrace::Line("scene: building %zu BLAS ...", meshes.size());
+
+    int32_t skippedMeshes = 0;
+    for (int32_t i = 0; i < (int32_t)meshes.size(); i++)
+    {
+        // 退化几何直接跳过：vertexCount==0 会让 maxVertex 变成 0xFFFFFFFF，
+        // indexCount<3 时 primitiveCount=0，这两种 AS build 都可能把驱动拖死。
+        if (meshes[i].vertexCount == 0 || meshes[i].indexCount < 3)
+        {
+            if (skippedMeshes < 8)
+                VPTTrace::Line("scene: SKIP degenerate mesh[%d] verts=%u idx=%u",
+                               i, meshes[i].vertexCount, meshes[i].indexCount);
+            skippedMeshes++;
+            s_MeshVertexCounts[i] = 0;
+            continue;
+        }
+        BuildBLAS(cmdBuf, device, gpu, meshes[i], (uint32_t)i);
+    }
+    if (skippedMeshes > 0)
+        VPTTrace::Line("scene: %d degenerate mesh(es) skipped", skippedMeshes);
+    VPTTrace::Line("scene: BLAS built (%zu / %zu)", s_BLASes.size(), meshes.size());
+
+    if (s_BLASes.empty())
+    {
+        VPTTrace::Line("scene: NO valid BLAS at all -> abort rebuild");
+        DestroySceneResourcesNoWait(device);
+        s_ScenePending = false;
+        s_PendingMeshes.clear();
+        s_PendingMaterials.clear();
+        s_PendingLights.clear();
+        s_PendingSceneInstances.clear();
+        return false;
+    }
+
+    // CRITICAL: Memory barrier between BLAS builds and TLAS build.
+    VkMemoryBarrier blasBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    blasBarrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    blasBarrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(cmdBuf,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        0, 1, &blasBarrier, 0, nullptr, 0, nullptr);
+
+    // ── TLAS 环形资源分配（静态拓扑变化时一次性）+ 首次构建（槽位 0）──
+    VPTTrace::Stage("scene:build-tlas");
+    const int32_t instanceCount = (int32_t)s_PendingSceneInstances.size();
+    if (EnsureTLASResources(device, gpu, (uint32_t)(instanceCount > 0 ? instanceCount : 1)))
+    {
+        s_CurrentRing = 0;
+        WriteInstanceData(s_PendingSceneInstances.data(), instanceCount, 0);
+        RecordTLASBuild(cmdBuf, device, 0, (uint32_t)instanceCount);
+    }
+    else
+    {
+        fprintf(stderr, "[VPT] TLAS ring allocation FAILED\n");
+    }
+
+    s_Ready = true;
+    fprintf(stderr, "[VPT] Scene recorded: %zu meshes, %zu mats, %zu lights, %d instances\n",
+            s_PendingMeshes.size(), s_PendingMaterials.size(),
+            s_PendingLights.size(), instanceCount);
+    VPTTrace::Line("scene: recorded OK (%zu meshes, %d instances, ready=%d)",
+                   s_PendingMeshes.size(), instanceCount, (int)s_Ready);
+    VPTTrace::Stage("scene:done");
+
+    // 构建完成后可以释放待处理 CPU 数据（顶点/索引已在 GPU 缓冲里）
+    s_PendingMeshes.clear();
+    s_PendingMaterials.clear();
+    s_PendingLights.clear();
+    s_PendingSceneInstances.clear();
+    s_ScenePending = false;
+
+    // 新场景已经按推送的实例建好 TLAS，之前排队的"扩容"请求作废
+    s_ResizePending = false;
+    s_ResizeInstances.clear();
+
+    // 这一帧录进 Unity 命令缓冲的 BLAS/TLAS/上传量很大：下一帧做一次同步探针，
+    // 万一 GPU 在重建帧上挂了，能立刻拿到 VK_ERROR_DEVICE_LOST 而不是静默继续。
+    s_NeedGpuSyncProbe = true;
+
+    // staging buffer 不在这里销毁：它们刚被录进本帧命令缓冲，等下一次重建
+    // （或 VPT_Destroy，那里会先等 GPU 空闲）再统一释放。
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  资源销毁
+// ═══════════════════════════════════════════════════════════
+
+void VPTScene::DestroyResources()
+{
+    std::lock_guard<std::recursive_mutex> guard(s_PendingMutex);
+
+    if (s_Device == VK_NULL_HANDLE) return;
+
+    VPTTrace::Stage("scene:destroy-all");
+    VPTTrace::Line("DestroyResources: enter (deviceLost=%d)", (int)VPT_IsDeviceLost());
+
+    // 设备已丢失时 vkDeviceWaitIdle 可能长时间不返回，直接跳过等待
+    if (!VPT_IsDeviceLost())
+    {
+        VPTTrace::Line("DestroyResources: vkDeviceWaitIdle begin ...");
+        VPT_CheckVk(vkDeviceWaitIdle(s_Device), "vkDeviceWaitIdle(VPTScene::DestroyResources)");
+        VPTTrace::Line("DestroyResources: vkDeviceWaitIdle done");
+    }
+
+    DestroySceneResourcesNoWait(s_Device);
+
+    for (auto& sb : s_StagingBuffers)
+        DestroyBufferResource(s_Device, sb);
+    s_StagingBuffers.clear();
+
+    s_PendingMeshes.clear();
+    s_PendingMaterials.clear();
+    s_PendingLights.clear();
+    s_PendingSceneInstances.clear();
+    s_ScenePending = false;
+    s_PendingSkinRegs.clear();
+}
+
 // ═══════════════════════════════════════════════════════════
 //  动态场景：每帧实例更新（仅刚体 Transform，BLAS 不动）
 // ═══════════════════════════════════════════════════════════
 
 void VPTScene::UpdateInstances(const VPT_InstanceData* instances, int32_t instanceCount)
 {
-    if (!s_ExtensionsReady || !instances || instanceCount <= 0 || s_BLASes.empty())
+    std::lock_guard<std::recursive_mutex> guard(s_PendingMutex);
+
+    if (!s_ExtensionsReady || !instances || instanceCount <= 0)
         return;
 
-    // 扩容（实例数超过预分配容量，低频路径）：需 GPU idle 后重建环形资源
+    // 扩容（实例数超过预分配容量）：需要拆/建环形资源 → 必须在渲染线程上做，
+    // 主线程只把数据拷下来排队（主线程 vkDeviceWaitIdle 会与渲染线程抢队列）。
     if ((uint32_t)instanceCount > s_InstanceCapacity)
     {
-        const UnityVulkanInstance& inst = VPT_GetInstance();
-        vkDeviceWaitIdle(inst.device);
-        if (!EnsureTLASResources(inst.device, inst.physicalDevice, (uint32_t)instanceCount))
-            return;
-        // 扩容后所有槽位均未构建，当前帧必须重建（s_TLASPending 由下方统一置位）
+        VPTTrace::Line("UpdateInstances: capacity %u < %d, deferring resize",
+                       s_InstanceCapacity, instanceCount);
+        s_ResizeInstances.assign(instances, instances + instanceCount);
+        s_ResizeCount   = (uint32_t)instanceCount;
+        s_ResizePending = true;
+        return;
     }
+
+    if (s_BLASes.empty())
+        return;
 
     // 轮转槽位：历史在飞行帧仍在读旧槽位，写入新槽位避免覆盖
     s_CurrentRing = (s_CurrentRing + 1) % kTLASRingSize;
@@ -1340,13 +1678,54 @@ void VPTScene::UpdateInstances(const VPT_InstanceData* instances, int32_t instan
     s_TLASPending  = true;
 }
 
-void VPTScene::RecordTLASUpdateIfNeeded(VkCommandBuffer cmd)
+bool VPTScene::RecordTLASUpdateIfNeeded(VkCommandBuffer cmd)
 {
-    if (!s_TLASPending || cmd == VK_NULL_HANDLE)
-        return;
+    std::lock_guard<std::recursive_mutex> guard(s_PendingMutex);
+
+    if (cmd == VK_NULL_HANDLE)
+        return false;
+
+    // 低频：实例数超容量 → 此时（渲染线程、事件内）才等待 GPU idle 并重建环形资源
+    if (s_ResizePending)
+    {
+        if (VPT_IsDeviceLost())
+        {
+            s_ResizePending = false;
+            s_ResizeInstances.clear();
+            return false;
+        }
+        s_ResizePending = false;
+
+        VPTTrace::Stage("tlas:resize-wait-idle");
+        VPTTrace::Line("tlas: resize to %u instances, vkDeviceWaitIdle begin ...", s_ResizeCount);
+        const UnityVulkanInstance& inst = VPT_GetInstance();
+        if (!VPT_CheckVk(vkDeviceWaitIdle(inst.device), "vkDeviceWaitIdle(TLAS resize)"))
+        {
+            s_ResizeInstances.clear();
+            return true;   // 资源可能已被拆，本帧不得 dispatch
+        }
+        if (!EnsureTLASResources(inst.device, inst.physicalDevice, s_ResizeCount))
+        {
+            s_ResizeInstances.clear();
+            return true;
+        }
+
+        s_CurrentRing = 0;
+        WriteInstanceData(s_ResizeInstances.data(), (int32_t)s_ResizeCount, 0);
+        RecordTLASBuild(cmd, inst.device, 0, s_ResizeCount);
+        s_ResizeInstances.clear();
+
+        s_PendingCount = s_ResizeCount;
+        s_TLASPending  = false;
+        return true;       // 环形 buffer 句柄已变，descriptor 失效
+    }
+
+    if (!s_TLASPending)
+        return false;
 
     RecordTLASBuild(cmd, s_Device, s_CurrentRing, s_PendingCount);
     s_TLASPending = false;
+    return false;
 }
 
 VkAccelerationStructureKHR VPTScene::GetTLAS() { return s_TLASRing[s_CurrentRing].handle; }

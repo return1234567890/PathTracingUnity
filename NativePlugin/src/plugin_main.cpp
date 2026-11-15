@@ -9,6 +9,7 @@
 #include "IUnityGraphics.h"          // UnityRenderingEventAndData
 #include "IUnityGraphicsVulkan.h"
 #include "vpt_intercept.h"
+#include "vpt_trace.h"
 
 #include <cstdio>
 #include <cstring>
@@ -27,23 +28,32 @@ static bool                    s_RayQuerySupported = false;
 static bool                    s_AccelStructSupported = false;
 static bool                    s_Initialized   = false;
 static bool                    s_DeviceChecked = false;
+static bool                    s_DeviceLost    = false;
 
 // ── Unity 插件入口 ────────────────────────────────────────
 extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 UnityPluginLoad(IUnityInterfaces* unityInterfaces)
 {
+    // 最早的入口：先把诊断日志打开，之后所有步骤都有落盘记录
+    VPTTrace::Init();
+    VPTTrace::Stage("plugin-load");
+    VPTTrace::Line("UnityPluginLoad: enter");
+
     s_UnityInterfaces = unityInterfaces;
 
     // 获取 Unity Vulkan 接口
+    VPTTrace::Stage("plugin-load:get-IUnityGraphicsVulkan");
     s_UnityVulkan = unityInterfaces->Get<IUnityGraphicsVulkan>();
     if (s_UnityVulkan == nullptr)
     {
         fprintf(stderr, "[VPT] ERROR: IUnityGraphicsVulkan not available. "
                         "Is Vulkan graphics API enabled?\n");
+        VPTTrace::Line("ERROR: IUnityGraphicsVulkan not available");
         return;
     }
 
     // 注册 vkCreateDevice 拦截（必须在设备创建前调用，需 isPreloaded=1）
+    VPTTrace::Stage("plugin-load:register-intercept");
     VPT_RegisterIntercept(s_UnityVulkan);
 
     // 注意：预加载模式下此时 Vulkan 实例可能尚未创建。
@@ -52,12 +62,16 @@ UnityPluginLoad(IUnityInterfaces* unityInterfaces)
 
     fflush(stderr);
     fprintf(stderr, "[VPT] UnityPluginLoad succeeded.\n");
+    VPTTrace::Line("UnityPluginLoad: done (trace=%s)", VPTTrace::Path());
 }
 
 extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 UnityPluginUnload()
 {
     fprintf(stderr, "[VPT] UnityPluginUnload.\n");
+    VPTTrace::Line("UnityPluginUnload");
+    // 注意：必须在 DLL 卸载前停掉看门狗线程，否则线程代码会被从内存里抽走
+    VPTTrace::Shutdown();
     s_UnityVulkan     = nullptr;
     s_UnityInterfaces = nullptr;
     s_Initialized     = false;
@@ -132,15 +146,81 @@ bool VPT_IsAccelStructSupported() { return s_AccelStructSupported; }
 bool VPT_IsInitialized() { return s_Initialized; }
 void VPT_SetInitialized(bool v) { s_Initialized = v; }
 
+// ── 设备丢失状态 ──────────────────────────────────────────
+bool VPT_IsDeviceLost() { return s_DeviceLost; }
+
+void VPT_ResetDeviceLost()
+{
+    if (s_DeviceLost)
+        fprintf(stderr, "[VPT] Device lost 标志已复位（重新初始化）。\n");
+    s_DeviceLost = false;
+}
+
+void VPT_MarkDeviceLost(const char* where, int vkResult)
+{
+    if (!s_DeviceLost)
+    {
+        fprintf(stderr,
+                "[VPT] FATAL: Vulkan 设备丢失（VkResult=%d，位置=%s）。"
+                "GPU 已复位（TDR），Unity 的 VkDevice 无法恢复；"
+                "已停止该设备的全部路径追踪请求。\n",
+                vkResult, where ? where : "?");
+        fflush(stderr);
+        VPTTrace::Line("FATAL: device lost (VkResult=%d at %s)", vkResult, where ? where : "?");
+    }
+    s_DeviceLost = true;
+}
+
+bool VPT_CheckVk(VkResult r, const char* where)
+{
+    if (r == VK_SUCCESS)
+        return true;
+    if (r == VK_ERROR_DEVICE_LOST)
+        VPT_MarkDeviceLost(where, (int)r);
+    else
+        fprintf(stderr, "[VPT] %s failed: %d\n", where ? where : "vk call", (int)r);
+    return false;
+}
+
+// 环境变量开关（二分排查用），值为空 / "0" / "n..." / "f..." 视为关闭。
+//
+// 注意：本函数**没有**做结果缓存，每次调用都会真的读一次环境变量。
+// 调用频率：VPT_NO_DLSS 只在 DLSS Init 时一次；VPT_NO_PROBE 只在重建后的探针帧一次；
+//   VPT_NO_ENV 在 RecordPendingUploads 里，PT 运行期间是每帧一次（getenv_s 是微秒级，
+//   可忽略，但确实不是零）。环境变量在进程内不会变，理论上可以缓存，需要时再加 static 缓存
+//   （改这里要重建 DLL）。
+bool VPT_EnvFlag(const char* name)
+{
+    if (!name || !name[0])
+        return false;
+
+    char value[64] = { 0 };
+    size_t len = 0;
+    if (getenv_s(&len, value, sizeof(value), name) != 0 || len == 0)
+        return false;
+
+    return !(value[0] == '0' || value[0] == 'n' || value[0] == 'N' || value[0] == 'f' || value[0] == 'F');
+}
+
 /// 刷新 Vulkan 实例信息（预加载模式下设备在 UnityPluginLoad 时可能未就绪）
 void VPT_RefreshInstance()
 {
     if (!s_UnityVulkan) return;
+
+    // Instance() 会驱动 Unity 的 Vulkan 初始化（可能等待设备创建），是初始化阶段
+    // 最容易卡住的一步之一：前后各记一条。
+    VPTTrace::Stage("refresh-instance:Unity Instance()");
+    VPTTrace::Line("VPT_RefreshInstance: calling IUnityGraphicsVulkan::Instance() ...");
     s_Instance = s_UnityVulkan->Instance();
+    VPTTrace::Line("VPT_RefreshInstance: Instance() returned (device=%p, physical=%p)",
+                   (void*)s_Instance.device, (void*)s_Instance.physicalDevice);
+
     if (!s_DeviceChecked && s_Instance.device != VK_NULL_HANDLE && s_Instance.physicalDevice != VK_NULL_HANDLE)
     {
+        VPTTrace::Stage("refresh-instance:check-extensions");
         CheckDeviceExtensionsAndFeatures();
         s_DeviceChecked = true;
         fflush(stderr);
     }
+    VPTTrace::Stage("refresh-instance:done");
 }
