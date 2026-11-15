@@ -57,7 +57,7 @@ URPPT/
 
 - `doc/DLSS_RR集成踩坑记录.md` — DLSS RR 集成记录
 - `doc/DLSS_RR亮区抖动分析.md`、`doc/DLSS_抖动修复踩坑记录.md` — DLSS 抖动问题排查
-- `半透明BSDF实现方案.md` — 透射/半透明 BSDF 设计参考（现实现位于 `NativePlugin/shaders/pathtrace.glsl`）
+- `doc/PT半透明材质渲染流程.md` — 半透明材质（薄片 / 体积）在当前 PT 中的完整渲染流程、公式与坑
 
 ## 声明
 

@@ -79,6 +79,9 @@ static std::vector<BLASResource>    s_BLASes;
 static std::vector<uint32_t> s_MeshVertexOffsets; // per-mesh vertex offset
 static std::vector<uint32_t> s_MeshIndexOffsets;  // per-mesh index offset
 static std::vector<uint32_t> s_MeshVertexCounts;  // per-mesh vertex count（GPU 蒙皮注册时校验）
+// 每材质 flags 快照：TLAS 实例的 opaque 标记要按材质判断，而 WriteInstanceData 在动态场景
+// 的每帧路径上也会被调用（那时 s_PendingMaterials 已被清空），所以单独留一份。
+static std::vector<uint32_t> s_MaterialFlagsSnapshot;
 static bool            s_Ready = false;
 
 // ═════════════════════════════════════════════════════════
@@ -480,7 +483,11 @@ static void BuildBLAS(VkCommandBuffer cmd, VkDevice device, VkPhysicalDevice gpu
     VkAccelerationStructureGeometryKHR geom{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
     geom.geometryType     = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
     geom.geometry.triangles = triData;
-    geom.flags            = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    // 几何级不再一律标 OPAQUE：半透明实例必须 non-opaque，硬件才会为它产生 candidate 交点
+    //（阴影 any-hit 遍历依赖 candidate）。不透明实例改由 TLAS 实例级的 FORCE_OPAQUE 兜住，
+    // 依然走硬件快路径，见 WriteInstanceData。
+    // 主路径 rayQuery 仍传 gl_RayFlagsOpaqueEXT，所以本次改动对主光线零影响。
+    geom.flags            = 0;
 
     uint32_t primCount = mesh.indexCount / 3;
 
@@ -711,8 +718,19 @@ static void WriteInstanceData(const VPT_InstanceData* instances, int32_t instanc
         dst.instanceCustomIndex = src.materialID;
         dst.mask = 0xFF;
         dst.instanceShaderBindingTableRecordOffset = 0;
-        dst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR
-                  | VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+
+        // ── 实例 opaque 标记：只给真不透明材质 FORCE_OPAQUE ──
+        // 半透明实例必须 non-opaque，否则硬件不会给出 candidate 交点，
+        // shader 的 any-hit 阴影遍历就看不到玻璃（玻璃会退化成纯遮挡）。
+        // 不透明实例保留 FORCE_OPAQUE：硬件 opaque 快路径 + TerminateOnFirstHit 立即结束遍历。
+        // materialID 越界（正常不会）时按不透明处理，保证不会把实心物体误判成玻璃。
+        const bool transparentMat =
+            src.materialID < s_MaterialFlagsSnapshot.size() &&
+            (s_MaterialFlagsSnapshot[src.materialID] & VPT_MAT_FLAG_TRANSPARENT) != 0u;
+
+        dst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        if (!transparentMat)
+            dst.flags |= VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
 
         // 填充 InstanceInfo（供 shader 读取顶点属性用；下标必须与 TLAS 实例数组一致）
         memcpy(infoData[i].transformRow0, &src.transform[0], sizeof(float) * 4);
@@ -1386,6 +1404,7 @@ static void DestroySceneResourcesNoWait(VkDevice device)
     s_MeshVertexOffsets.clear();
     s_MeshIndexOffsets.clear();
     s_MeshVertexCounts.clear();
+    s_MaterialFlagsSnapshot.clear();
 
     s_Ready = false;
 }
@@ -1481,6 +1500,14 @@ bool VPTScene::RecordSceneUpdateIfNeeded(VkCommandBuffer cmd)
             s_PendingLights.clear(); s_PendingSceneInstances.clear();
             return false;
         }
+
+        // 材质 flags 快照：WriteInstanceData 要用它决定实例的 FORCE_OPAQUE。
+        // 必须在这里做（s_PendingMaterials 在本次重建末尾就会被清空，而动态场景每帧
+        // 更新实例时仍需要这份数据）。
+        s_MaterialFlagsSnapshot.clear();
+        s_MaterialFlagsSnapshot.reserve(s_PendingMaterials.size());
+        for (const VPT_Material& m : s_PendingMaterials)
+            s_MaterialFlagsSnapshot.push_back(m.flags);
     }
 
     VkDeviceSize lightSize = (VkDeviceSize)s_PendingLights.size() * sizeof(VPT_Light);

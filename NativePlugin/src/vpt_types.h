@@ -91,6 +91,9 @@ static_assert(sizeof(VPT_Light) == 32, "VPT_Light must be 32 bytes");
 /// VPT_MeshData.flags 位掩码
 constexpr uint32_t VPT_MESH_FLAG_DEFORMABLE = 1u; // bit0: 支持变形（BLAS 加 ALLOW_UPDATE，可 refit）
 
+/// VPT_Material.flags 位掩码（与 C# MaterialFlags / GLSL 宏一一对应）
+constexpr uint32_t VPT_MAT_FLAG_TRANSPARENT = 16u; // bit4: 半透明（TLAS 实例不能标 FORCE_OPAQUE）
+
 /// 网格数据描述（C# 侧 GCHandle.Pinned 后传入指针）
 struct VPT_MeshData
 {

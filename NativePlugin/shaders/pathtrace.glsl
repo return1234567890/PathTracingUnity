@@ -529,8 +529,16 @@ vec4 sampleBaseColor(VPT_Material mat, vec2 uvT)
     return c;
 }
 
-// ── Transparent shadow traversal: accumulate transmission through all layers ──
+// ── Transparent shadow traversal：硬件 any-hit（ray query candidate 模式）──
 // Returns rgb transmission: (1,1,1)=fully transparent, (0,0,0)=fully occluded
+//
+// 与旧「迭代式 closest-hit」的区别：整条阴影射线只下潜一次 BVH。
+//   · TLAS 侧：不透明实例带 FORCE_OPAQUE，半透明实例不带（vpt_scene.cpp 的 WriteInstanceData）；
+//   · 本查询：只加 TerminateOnFirstHit，不加 Opaque。
+//     → 不透明实例由硬件直接 commit，TerminateOnFirstHit 立刻结束遍历（= any-hit 的"任一遮挡即停"）；
+//     → 半透明实例以 candidate 形式回到这里，不 confirm 就被丢弃，遍历继续往下走。
+//   语义等价于硬件 any-hit，但不需要 ray tracing pipeline / SBT。
+//
 // startInsideVolume / startSigmaT：阴影射线起点所在的介质状态（主路径位于玻璃内部时为 true），
 // 让「表面 → 光源」整段用与主路径相同的 σt 做 Beer-Lambert 吸收。
 vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT,
@@ -538,33 +546,41 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT,
 {
     vec3 totalTransmission = vec3(1.0);
 
-    for (int iter = 0; iter < MAX_SHADOW_LAYERS; iter++)
+    // candidate 的 hitT 是相对射线起点（着色点）的绝对距离，段长要自己记上一个命中点。
+    // 注意：candidate 不保证按 t 排序（Vulkan/DXR 都不保证），abs() 对"单层凸体"精确，
+    // 多层玻璃是近似（与参考工程 raytracer_interface.h.slang:174-176 的做法一致）。
+    float prevT = 0.0;
+
+    // 不加 gl_RayFlagsOpaqueEXT：否则根本不产生 candidate，玻璃会退化成纯遮挡。
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas,
+        gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
+        origin, 0.0, dir, maxT);
+
+    int layers = 0;
+    while (rayQueryProceedEXT(rq))
     {
-        // ── 1. Cast closest-hit ray via rayQuery ──
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, tlas,
-            gl_RayFlagsOpaqueEXT, 0xFF,
-            origin, 0.0, dir, maxT);
-        while (rayQueryProceedEXT(rq)) {}
+        // 只处理三角形 candidate（本项目 TLAS 里没有 AABB / procedural）
+        if (rayQueryGetIntersectionTypeEXT(rq, false)
+            != gl_RayQueryCandidateIntersectionTriangleEXT)
+            continue;
 
-        bool committed = rayQueryGetIntersectionTypeEXT(rq, true)
-                       != gl_RayQueryCommittedIntersectionNoneEXT;
+        // 层数上限：防止病态场景（上百层玻璃）把候选循环拖成无底洞。
+        // 触发时按旧行为返回已累积值（偏亮），而不是直接判全黑。
+        if (++layers > MAX_SHADOW_LAYERS)
+            break;
 
-        // ── 2. Miss: ray reached light ──
-        // 仍处于介质内说明射线漏出了闭合玻璃（数值漏光）。此处不再补最后一段吸收：
-        // 补吸收会把漏光变成黑点，直接返回更接近「已离开介质」。
-        if (!committed)
-            return totalTransmission;
+        // ── 1. 命中信息（candidate 访问子：第二个参数 = false）──
+        uint instanceIndex = rayQueryGetIntersectionInstanceIdEXT(rq, false);
+        uint primitiveIndex = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+        float hitT = rayQueryGetIntersectionTEXT(rq, false);
 
-        // ── 3. Get hit material and geometry ──
-        uint instanceIndex = rayQueryGetIntersectionInstanceIdEXT(rq, true);
-        uint primitiveIndex = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-        float hitT = rayQueryGetIntersectionTEXT(rq, true);
-
-        // ── 4. 介质段吸收：上一表面 → 当前命中（Beer-Lambert）──
+        // ── 2. 介质段吸收：上一表面 → 当前命中（Beer-Lambert）──
         // 体积颜色只在这里乘一次；表面层不再乘 baseColor（见 Factor C）。
+        // abs()：candidate 可能乱序到达，不能让乱序把段长算成负数/0。
         if (isInsideVolume)
-            totalTransmission *= exp(-hitT * sigmaT);
+            totalTransmission *= exp(-abs(hitT - prevT) * sigmaT);
+        prevT = hitT;
 
         InstanceInfo inst = instances[instanceIndex];
         VPT_Material mat = materials[inst.materialID];
@@ -578,15 +594,15 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT,
         vec3 Ngeo = normalize(transformDir(inst,
             normalize(cross(v1.pos - v0.pos, v2.pos - v0.pos))));
 
-        vec3 P = origin + dir * hitT;
-
-        // ── 5. Opaque material: fully occluded, terminate ──
+        // ── 3. 不透明材质：完全遮挡 ──
+        // 正常情况下到不了这里（不透明实例被硬件 commit + TerminateOnFirstHit 直接结束遍历），
+        // 留着是防御：万一某实例的 opaque 标记与材质 flags 不一致，至少不会把实心物体当玻璃。
         if ((mat.flags & MAT_IS_TRANSPARENT) == 0u)
             return vec3(0.0);
 
         // 与主路径一致：用命中点的重心坐标插值 UV，采样 _BaseMap 的 RGBA。
         // alpha 决定该层透射率；RGB 对薄壁材质做玻璃染色，对体积材质用作体积色（Beer）。
-        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
         vec2 hitUV = v0.uv * (1.0 - bary.x - bary.y) + v1.uv * bary.x + v2.uv * bary.y;
         vec2 uvT = hitUV * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
         vec4 base = sampleBaseColor(mat, uvT);
@@ -597,7 +613,7 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT,
 
         bool isVolume = materialIsVolume(mat);
 
-        // ── 6. Surface-only transmission（体积材质不再乘颜色）──
+        // ── 4. Surface-only transmission（体积材质不再乘颜色）──
 
         // Factor A: base transmission
         vec3 layerT = vec3(trans);
@@ -632,21 +648,24 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT,
         float roughnessEffect = 1.0 - (mat.roughness * mat.roughness);
         layerT *= mix(0.65, 1.0, roughnessEffect);
 
-        // ── 7. Accumulate transmission ──
+        // ── 5. Accumulate transmission ──
         totalTransmission *= layerT;
 
-        // ── 8. Early termination if too low ──
+        // ── 6. Early termination if too low ──
         float maxComp = max(max(totalTransmission.r, totalTransmission.g), totalTransmission.b);
         if (maxComp <= MIN_TRANSMISSION)
             return vec3(0.0);
 
-        // ── 9. Continue from hit point ──
-        float eps = surfaceOffset(mat);
-        float facing = dot(dir, Ngeo);
-        origin = P + Ngeo * sign(facing) * eps;
-        maxT -= hitT;
-        if (maxT <= eps) break;
+        // ── 7. 不 confirm candidate → 该层被丢弃，遍历自动继续到下一层 ──
+        // 旧实现要在这里步进 origin/maxT 并重开一次 traversal，现在完全不需要。
     }
+
+    // ── 8. 遍历结束：只要出现 committed 命中，就是被不透明实例挡住了 ──
+    // 半透明实例从不 commit，所以 committed 只可能来自 TerminateOnFirstHit 下的不透明实例。
+    // 若射线漏出介质（数值漏光），与旧实现一致：不补最后一段吸收，直接返回累积值。
+    if (rayQueryGetIntersectionTypeEXT(rq, true)
+        != gl_RayQueryCommittedIntersectionNoneEXT)
+        return vec3(0.0);
 
     return totalTransmission;
 }
@@ -678,20 +697,6 @@ void sampleLightContribution(VPT_Light L, vec3 P,
         }
         Lcolor = L.color * atten / max(dist2, 1e-6);
     }
-}
-
-// ══════════════════════════════════════════════════════════════
-//  Shadow ray via rayQuery (opaque, terminate-on-first-hit)
-// ══════════════════════════════════════════════════════════════
-
-bool testShadow(vec3 origin, vec3 dir, float maxT)
-{
-    rayQueryEXT rq;
-    rayQueryInitializeEXT(rq, tlas,
-        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-        0xFF, origin, 0.0, dir, maxT);
-    while (rayQueryProceedEXT(rq)) {}
-    return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
 // ══════════════════════════════════════════════════════════════
