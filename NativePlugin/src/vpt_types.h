@@ -45,7 +45,7 @@ struct VPT_Material
     float    roughness;         // 4B
     float    bumpScale;         // 4B - normal map strength
     uint32_t flags;             // 4B - bit0:hasBaseMap, bit1:hasMetalRough, bit2:hasNormal, bit3:hasEmissive,
-                                //       bit4:transparent, bit5:volume, bit6:thinWalled
+                                //       bit4:transparent, bit5:volume, bit6:thinWalled, bit7:alphaTest
     // -- 32B --
     float    emissionColor[4];  // 16B - emissive tint (rgba)
     uint32_t baseTexID;        // 4B - BaseColorArray slice (0xFFFFFFFF=none)
@@ -65,7 +65,7 @@ struct VPT_Material
     float    attenuationDistance; // 4B - 世界空间衰减距离（米）；<=0 无吸收
     uint32_t volumeFlags;         // 4B - 预留
     float    thickness;           // 4B - 世界空间厚度（米）；0 = 非体积
-    float    padVolume;           // 4B - 16B 对齐填充
+    float    alphaCutoff;         // 4B - alpha test 阈值（URP _Cutoff，默认 0.5；复用原对齐填充）
     // -- 32B --
     // 合计 128B
 };
@@ -92,7 +92,8 @@ static_assert(sizeof(VPT_Light) == 32, "VPT_Light must be 32 bytes");
 constexpr uint32_t VPT_MESH_FLAG_DEFORMABLE = 1u; // bit0: 支持变形（BLAS 加 ALLOW_UPDATE，可 refit）
 
 /// VPT_Material.flags 位掩码（与 C# MaterialFlags / GLSL 宏一一对应）
-constexpr uint32_t VPT_MAT_FLAG_TRANSPARENT = 16u; // bit4: 半透明（TLAS 实例不能标 FORCE_OPAQUE）
+constexpr uint32_t VPT_MAT_FLAG_TRANSPARENT = 16u;  // bit4: 半透明（TLAS 实例不能标 FORCE_OPAQUE）
+constexpr uint32_t VPT_MAT_FLAG_ALPHA_TEST  = 128u; // bit7: alpha cutout（TLAS 实例不能标 FORCE_OPAQUE）
 
 /// 网格数据描述（C# 侧 GCHandle.Pinned 后传入指针）
 struct VPT_MeshData

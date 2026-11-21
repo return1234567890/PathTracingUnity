@@ -483,10 +483,10 @@ static void BuildBLAS(VkCommandBuffer cmd, VkDevice device, VkPhysicalDevice gpu
     VkAccelerationStructureGeometryKHR geom{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
     geom.geometryType     = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
     geom.geometry.triangles = triData;
-    // 几何级不再一律标 OPAQUE：半透明实例必须 non-opaque，硬件才会为它产生 candidate 交点
-    //（阴影 any-hit 遍历依赖 candidate）。不透明实例改由 TLAS 实例级的 FORCE_OPAQUE 兜住，
+    // 几何级不再一律标 OPAQUE：半透明 / 镂空实例必须 non-opaque，硬件才会为它产生 candidate 交点
+    //（阴影遍历与主光线 alpha-test 都依赖 candidate）。不透明实例改由 TLAS 实例级的 FORCE_OPAQUE 兜住，
     // 依然走硬件快路径，见 WriteInstanceData。
-    // 主路径 rayQuery 仍传 gl_RayFlagsOpaqueEXT，所以本次改动对主光线零影响。
+    // 主路径 rayQuery 不再强制 Opaque（镂空材质需要 candidate）；不透明实例仍靠 FORCE_OPAQUE 直接 commit。
     geom.flags            = 0;
 
     uint32_t primCount = mesh.indexCount / 3;
@@ -720,16 +720,19 @@ static void WriteInstanceData(const VPT_InstanceData* instances, int32_t instanc
         dst.instanceShaderBindingTableRecordOffset = 0;
 
         // ── 实例 opaque 标记：只给真不透明材质 FORCE_OPAQUE ──
-        // 半透明实例必须 non-opaque，否则硬件不会给出 candidate 交点，
-        // shader 的 any-hit 阴影遍历就看不到玻璃（玻璃会退化成纯遮挡）。
+        // 半透明 / 镂空实例必须 non-opaque，否则硬件不会给出 candidate 交点：
+        //   · 半透明：阴影 any-hit 遍历看不到玻璃；
+        //   · 镂空：主光线无法在 candidate 循环里按 alpha 丢弃微面。
         // 不透明实例保留 FORCE_OPAQUE：硬件 opaque 快路径 + TerminateOnFirstHit 立即结束遍历。
-        // materialID 越界（正常不会）时按不透明处理，保证不会把实心物体误判成玻璃。
-        const bool transparentMat =
-            src.materialID < s_MaterialFlagsSnapshot.size() &&
-            (s_MaterialFlagsSnapshot[src.materialID] & VPT_MAT_FLAG_TRANSPARENT) != 0u;
+        // materialID 越界（正常不会）时按不透明处理，保证不会把实心物体误判成玻璃/镂空。
+        uint32_t matFlags = 0;
+        if (src.materialID < s_MaterialFlagsSnapshot.size())
+            matFlags = s_MaterialFlagsSnapshot[src.materialID];
+        const bool nonOpaqueMat =
+            (matFlags & (VPT_MAT_FLAG_TRANSPARENT | VPT_MAT_FLAG_ALPHA_TEST)) != 0u;
 
         dst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-        if (!transparentMat)
+        if (!nonOpaqueMat)
             dst.flags |= VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
 
         // 填充 InstanceInfo（供 shader 读取顶点属性用；下标必须与 TLAS 实例数组一致）

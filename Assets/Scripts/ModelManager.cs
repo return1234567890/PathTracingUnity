@@ -49,7 +49,7 @@ public struct VertexGpuData
 /// 金属度工作流：metallic 线性插值 F0；roughness = 1 - URP _Smoothness，钳制 [0.02,1]。
 /// 扩展字段：emissionColor / 4个纹理slice索引 / flags / uvScaleOffset。
 /// 纹理索引 0xFFFFFFFF = 无纹理（使用 uniform 值）。
-/// 96B~128B 为体积（Volume）透射参数，与 native VPT_Material / GLSL 严格一致。
+/// 96B~128B 为体积（Volume）透射参数 + alpha cutoff，与 native VPT_Material / GLSL 严格一致。
 /// </remarks>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct PathMaterial
@@ -58,7 +58,8 @@ public struct PathMaterial
     public float   metallic;        // 4B
     public float   roughness;       // 4B
     public float   bumpScale;       // 4B - normal map strength (_BumpScale)
-    public uint    flags;           // 4B - bit0:hasBaseMap, bit1:hasMetalRough, bit2:hasNormal, bit3:hasEmissive
+    public uint    flags;           // 4B - bit0:hasBaseMap, bit1:hasMetalRough, bit2:hasNormal, bit3:hasEmissive,
+                                    //       bit4:transparent, bit5:volume, bit6:thinWalled, bit7:alphaTest
     // -- 32B --
     public Vector4 emissionColor;   // 16B - emissive tint (_EmissionColor rgb + intensity)
     public uint    baseTexID;       // 4B - BaseColorArray slice (0xFFFFFFFF=none)
@@ -79,7 +80,7 @@ public struct PathMaterial
     public float   attenuationDistance; // 4B - 世界空间衰减距离（米）；<=0 无吸收
     public uint    volumeFlags;         // 4B - 预留
     public float   thickness;           // 4B - 世界空间厚度（米）；0 = 非体积
-    public float   padVolume;           // 4B - 16B 对齐填充
+    public float   alphaCutoff;         // 4B - alpha test 阈值（URP _Cutoff，默认 0.5；复用原对齐填充）
     // -- 32B --
     // 合计 128B
 }
@@ -123,6 +124,7 @@ public static class MaterialFlags
     public const uint MAT_IS_TRANSPARENT = 16u;  // bit4: 材质启用透射
     public const uint MAT_IS_VOLUME      = 32u;  // bit5: 有厚度玻璃 → Beer-Lambert 体积分支
     public const uint MAT_IS_THIN_WALLED = 64u;  // bit6: 零厚度薄壁 → 保留原 double-tint 语义
+    public const uint MAT_ALPHA_TEST     = 128u; // bit7: alpha clipping / 镂空（TLAS 实例不能 FORCE_OPAQUE）
     public const uint TEX_NONE          = 0xFFFFFFFFu;
 }
 
@@ -656,7 +658,7 @@ public class ModelManager : MonoBehaviour
         pm.attenuationDistance = 0f;
         pm.volumeFlags = 0u;
         pm.thickness = 0f;
-        pm.padVolume = 0f;
+        pm.alphaCutoff = 0.5f;
 
         if (mat == null) return pm;
 
@@ -821,6 +823,21 @@ public class ModelManager : MonoBehaviour
                 pm.thinWalled = 1u; // 薄壁模式（无体积吸收）
             }
         }
+
+        // ── Alpha Clipping（镂空）──
+        // URP Lit 的 Alpha Clipping 材质 Surface Type 仍然是 Opaque，靠 _Surface 判断不到；
+        // 这里用 _ALPHATEST_ON 关键字 / _AlphaClip 属性识别。alpha < cutoff 的微面在 PT 里
+        // 由主光线 candidate 循环丢弃，阴影遍历同样跳过（见 NativePlugin/shaders/pathtrace.glsl）。
+        bool alphaClip = mat.IsKeywordEnabled("_ALPHATEST_ON")
+                      || (mat.HasProperty("_AlphaClip") && mat.GetFloat("_AlphaClip") > 0.5f);
+        if (alphaClip)
+        {
+            flags |= MaterialFlags.MAT_ALPHA_TEST;
+            pm.alphaCutoff = mat.HasProperty("_Cutoff")
+                           ? Mathf.Clamp01(mat.GetFloat("_Cutoff"))
+                           : 0.5f;
+        }
+
         // transmission = 1 - albedo.a（HLSL 侧 applyMaterialTextures 后用最终 alpha 覆盖）
         pm.transmission = 1.0f - pm.albedo.w;
         pm.ior = 1.5f;    // 玻璃默认折射率

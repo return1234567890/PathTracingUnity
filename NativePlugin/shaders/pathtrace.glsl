@@ -23,6 +23,7 @@
 #define MAT_IS_TRANSPARENT 16u
 #define MAT_IS_VOLUME      32u   // bit5: 有厚度玻璃，走 Beer-Lambert 体积分支
 #define MAT_IS_THIN_WALLED 64u   // bit6: 零厚度薄壁（单面玻璃），保留原 double-tint 语义
+#define MAT_ALPHA_TEST     128u  // bit7: alpha clipping / 镂空
 #define TEX_NONE       0xFFFFFFFFu
 
 // ── Descriptor Set 0 ──────────────────────────────────────────
@@ -78,7 +79,7 @@ struct VPT_Material {
     float attenuationDistance;  // 世界空间衰减距离（米）；<=0 无吸收
     uint  volumeFlags;          // 预留（bit0 = 显式覆盖 tint 等）
     float thickness;            // 世界空间厚度（米）；0 = 非体积
-    float padVolume;            // 对齐填充
+    float alphaCutoff;          // alpha test 阈值（URP _Cutoff，默认 0.5；复用原对齐填充）
 };
 
 struct VPT_Light {
@@ -529,14 +530,37 @@ vec4 sampleBaseColor(VPT_Material mat, vec2 uvT)
     return c;
 }
 
+// ── Alpha cutout（镂空）辅助 ──────────────────────────────
+// 取三角形 candidate 的重心坐标并插值 UV（object space，未做材质 uvScaleOffset）。
+vec2 candidateHitUV(rayQueryEXT rq, InstanceInfo inst, uint primitiveIndex)
+{
+    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+    uint i0 = indices[inst.indexOffset + primitiveIndex * 3 + 0];
+    uint i1 = indices[inst.indexOffset + primitiveIndex * 3 + 1];
+    uint i2 = indices[inst.indexOffset + primitiveIndex * 3 + 2];
+    VPT_Vertex v0 = vertices[inst.vertexOffset + i0];
+    VPT_Vertex v1 = vertices[inst.vertexOffset + i1];
+    VPT_Vertex v2 = vertices[inst.vertexOffset + i2];
+    return v0.uv * (1.0 - bary.x - bary.y) + v1.uv * bary.x + v2.uv * bary.y;
+}
+
+// 采样 candidate 的 baseColor alpha（已应用材质的 uvScaleOffset）。
+float sampleCandidateAlpha(rayQueryEXT rq, InstanceInfo inst, VPT_Material mat, uint primitiveIndex)
+{
+    vec2 uv  = candidateHitUV(rq, inst, primitiveIndex);
+    vec2 uvT = uv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
+    return sampleBaseColor(mat, uvT).a;
+}
+
 // ── Transparent shadow traversal：硬件 any-hit（ray query candidate 模式）──
 // Returns rgb transmission: (1,1,1)=fully transparent, (0,0,0)=fully occluded
 //
 // 与旧「迭代式 closest-hit」的区别：整条阴影射线只下潜一次 BVH。
-//   · TLAS 侧：不透明实例带 FORCE_OPAQUE，半透明实例不带（vpt_scene.cpp 的 WriteInstanceData）；
+//   · TLAS 侧：不透明实例带 FORCE_OPAQUE，半透明/镂空实例不带（vpt_scene.cpp 的 WriteInstanceData）；
 //   · 本查询：只加 TerminateOnFirstHit，不加 Opaque。
 //     → 不透明实例由硬件直接 commit，TerminateOnFirstHit 立刻结束遍历（= any-hit 的"任一遮挡即停"）；
-//     → 半透明实例以 candidate 形式回到这里，不 confirm 就被丢弃，遍历继续往下走。
+//     → 半透明/镂空实例以 candidate 形式回到这里：玻璃按透射率累积，
+//       镂空 alpha < cutoff 的微面直接跳过（洞），实心部分完全遮挡。
 //   语义等价于硬件 any-hit，但不需要 ray tracing pipeline / SBT。
 //
 // startInsideVolume / startSigmaT：阴影射线起点所在的介质状态（主路径位于玻璃内部时为 true），
@@ -575,15 +599,17 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT,
         uint primitiveIndex = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
         float hitT = rayQueryGetIntersectionTEXT(rq, false);
 
-        // ── 2. 介质段吸收：上一表面 → 当前命中（Beer-Lambert）──
-        // 体积颜色只在这里乘一次；表面层不再乘 baseColor（见 Factor C）。
-        // abs()：candidate 可能乱序到达，不能让乱序把段长算成负数/0。
-        if (isInsideVolume)
-            totalTransmission *= exp(-abs(hitT - prevT) * sigmaT);
-        prevT = hitT;
-
         InstanceInfo inst = instances[instanceIndex];
         VPT_Material mat = materials[inst.materialID];
+
+        const bool isAlphaTest   = (mat.flags & MAT_ALPHA_TEST) != 0u;
+        const bool isTransparent = (mat.flags & MAT_IS_TRANSPARENT) != 0u;
+
+        // ── 2. 非透射且非镂空：完全遮挡 ──
+        // 正常情况下到不了这里（不透明实例被硬件 commit + TerminateOnFirstHit 直接结束遍历），
+        // 留着是防御：万一某实例的 opaque 标记与材质 flags 不一致，至少不会把实心物体当玻璃。
+        if (!isAlphaTest && !isTransparent)
+            return vec3(0.0);
 
         uint i0 = indices[inst.indexOffset + primitiveIndex * 3 + 0];
         uint i1 = indices[inst.indexOffset + primitiveIndex * 3 + 1];
@@ -594,18 +620,26 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT,
         vec3 Ngeo = normalize(transformDir(inst,
             normalize(cross(v1.pos - v0.pos, v2.pos - v0.pos))));
 
-        // ── 3. 不透明材质：完全遮挡 ──
-        // 正常情况下到不了这里（不透明实例被硬件 commit + TerminateOnFirstHit 直接结束遍历），
-        // 留着是防御：万一某实例的 opaque 标记与材质 flags 不一致，至少不会把实心物体当玻璃。
-        if ((mat.flags & MAT_IS_TRANSPARENT) == 0u)
-            return vec3(0.0);
-
+        // ── 3. 采样 baseColor：alpha 同时用于镂空判定与透射率 ──
         // 与主路径一致：用命中点的重心坐标插值 UV，采样 _BaseMap 的 RGBA。
-        // alpha 决定该层透射率；RGB 对薄壁材质做玻璃染色，对体积材质用作体积色（Beer）。
         vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
         vec2 hitUV = v0.uv * (1.0 - bary.x - bary.y) + v1.uv * bary.x + v2.uv * bary.y;
         vec2 uvT = hitUV * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
         vec4 base = sampleBaseColor(mat, uvT);
+
+        // ── 4. Alpha cutout：洞 → 丢弃该层；实心 → 遮挡 ──
+        // 洞不是介质边界，不能更新 prevT / 做段吸收，否则玻璃内阴影会被切成错误的段。
+        if (isAlphaTest && base.a < mat.alphaCutoff)
+            continue;
+        if (!isTransparent)
+            return vec3(0.0);
+
+        // ── 5. 介质段吸收：上一表面 → 当前命中（Beer-Lambert）──
+        // 体积颜色只在这里乘一次；表面层不再乘 baseColor（见 Factor C）。
+        // abs()：candidate 可能乱序到达，不能让乱序把段长算成负数/0。
+        if (isInsideVolume)
+            totalTransmission *= exp(-abs(hitT - prevT) * sigmaT);
+        prevT = hitT;
 
         float trans = 1.0 - base.a;
         if (trans <= MIN_TRANSMISSION)
@@ -661,7 +695,8 @@ vec3 traceShadowTransmission(vec3 origin, vec3 dir, float maxT,
     }
 
     // ── 8. 遍历结束：只要出现 committed 命中，就是被不透明实例挡住了 ──
-    // 半透明实例从不 commit，所以 committed 只可能来自 TerminateOnFirstHit 下的不透明实例。
+    // 半透明实例从不 confirm；镂空实心部分直接 return 0；洞直接跳过。
+    // 所以 committed 只可能来自 TerminateOnFirstHit 下的不透明实例。
     // 若射线漏出介质（数值漏光），与旧实现一致：不补最后一段吸收，直接返回累积值。
     if (rayQueryGetIntersectionTypeEXT(rq, true)
         != gl_RayQueryCommittedIntersectionNoneEXT)
@@ -918,11 +953,34 @@ void main()
             // 否则 < nearPlane(0.3m) 的几何会被跳过——12mm 玻璃的后表面永远命中不到。
             float tmin = (depth == 0) ? nearPlane : 0.0;
             rayQueryEXT rq;
+            // 不再强制 Opaque：镂空材质需要以 candidate 形式回到 shader，按 alpha 丢弃微面。
+            // 不透明实例仍由 TLAS 的 FORCE_OPAQUE 直接 commit，不产生 candidate。
             rayQueryInitializeEXT(rq, tlas,
-                gl_RayFlagsOpaqueEXT, 0xFF,
+                0u, 0xFF,
                 rayOrigin, tmin,
                 rayDir, farPlane);
-            while (rayQueryProceedEXT(rq)) {}
+
+            while (rayQueryProceedEXT(rq))
+            {
+                // 本项目 TLAS 只有三角形；非三角形 candidate 防御性跳过
+                if (rayQueryGetIntersectionTypeEXT(rq, false)
+                    != gl_RayQueryCandidateIntersectionTriangleEXT)
+                    continue;
+
+                uint cInstanceIndex = rayQueryGetIntersectionInstanceIdEXT(rq, false);
+                uint cPrimitiveIndex = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                InstanceInfo cInst = instances[cInstanceIndex];
+                VPT_Material cMat = materials[cInst.materialID];
+
+                if ((cMat.flags & MAT_ALPHA_TEST) != 0u)
+                {
+                    float alpha = sampleCandidateAlpha(rq, cInst, cMat, cPrimitiveIndex);
+                    if (alpha < cMat.alphaCutoff)
+                        continue;   // 镂空：丢弃该 candidate，遍历继续找下一层表面
+                }
+                // 透射表面 / 镂空实心部分：确认命中；后续遍历仍可能找到更近的 opaque 命中
+                rayQueryConfirmIntersectionEXT(rq);
+            }
 
             bool committed = rayQueryGetIntersectionTypeEXT(rq, true)
                            != gl_RayQueryCommittedIntersectionNoneEXT;
