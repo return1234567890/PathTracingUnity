@@ -9,7 +9,10 @@ extern "C" {
 #endif
 
     /// 初始化 Native 路径追踪插件（由 C# 在 Awake 中调用）
-    /// 返回: 0=成功, 1=Vulkan 设备获取失败, 2=RT Core 扩展不支持
+    /// 返回: 0=成功, 1=Vulkan 设备获取失败,
+    ///       2=RT 能力不支持（缺 VK_KHR_ray_tracing_pipeline / rayTracingPipeline feature /
+    ///         VK_KHR_acceleration_structure）,
+    ///       3=RT pipeline 创建失败（SPIR-V 被拒 / 链接失败 / SBT 创建失败）
     UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_Initialize();
 
     /// 销毁插件资源（由 C# 在 OnDestroy 中调用）
@@ -52,9 +55,9 @@ extern "C" {
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_SetDeformableRebuildInterval(
         uint32_t interval);
 
-    /// 查询设备 RT Core 支持状态
-    /// 返回: 1=支持 VK_KHR_ray_query, 0=不支持
-    UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_QueryRayQuerySupport();
+    /// 查询设备 RT 能力（VK_KHR_ray_tracing_pipeline）
+    /// 返回: 1=支持, 0=不支持
+    UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API VPT_QueryRayTracingPipelineSupport();
 
     /// 设置 HDR 环境光贴图
     /// pixels: RGBA32F 数据（每像素 4 float，width*height 个像素）

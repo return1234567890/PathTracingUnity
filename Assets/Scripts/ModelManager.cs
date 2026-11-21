@@ -827,7 +827,7 @@ public class ModelManager : MonoBehaviour
         // ── Alpha Clipping（镂空）──
         // URP Lit 的 Alpha Clipping 材质 Surface Type 仍然是 Opaque，靠 _Surface 判断不到；
         // 这里用 _ALPHATEST_ON 关键字 / _AlphaClip 属性识别。alpha < cutoff 的微面在 PT 里
-        // 由主光线 candidate 循环丢弃，阴影遍历同样跳过（见 NativePlugin/shaders/pathtrace.glsl）。
+        // 由主光线 any-hit 丢弃，阴影 any-hit 同样跳过（见 NativePlugin/shaders/pt.slang）。
         bool alphaClip = mat.IsKeywordEnabled("_ALPHATEST_ON")
                       || (mat.HasProperty("_AlphaClip") && mat.GetFloat("_AlphaClip") > 0.5f);
         if (alphaClip)

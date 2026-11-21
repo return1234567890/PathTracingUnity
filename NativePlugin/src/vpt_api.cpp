@@ -56,11 +56,20 @@ VPT_Initialize()
         return 1;
     }
 
-    if (!VPT_IsRayQuerySupported() || !VPT_IsAccelStructSupported())
+    if (!VPT_IsRayTracingPipelineSupported())
     {
-        fprintf(stderr, "[VPT] WARNING: RT Core extensions not supported.\n");
-        VPTTrace::Line("VPT_Initialize: FAILED, RT extensions unsupported "
-                       "(rayQuery=%d accel=%d)", (int)VPT_IsRayQuerySupported(), (int)VPT_IsAccelStructSupported());
+        // D5 = A：初始化失败 + 明确报错，PT 关闭（不回退光栅、不回退 ray query）
+        fprintf(stderr,
+                "[VPT] ERROR: RT pipeline path tracing unsupported on this GPU.\n"
+                "  Required: VK_KHR_acceleration_structure + VK_KHR_ray_tracing_pipeline\n"
+                "  and the rayTracingPipeline feature. Needs an RTX-class GPU + recent driver.\n");
+        VPTTrace::Line("VPT_Initialize: FAILED, VK_KHR_ray_tracing_pipeline unsupported");
+        return 2;
+    }
+    if (!VPT_IsAccelStructSupported())
+    {
+        fprintf(stderr, "[VPT] ERROR: accelerationStructure feature missing.\n");
+        VPTTrace::Line("VPT_Initialize: FAILED, accelerationStructure unsupported");
         return 2;
     }
 
@@ -88,10 +97,19 @@ VPT_Initialize()
     VPTEnv::InitFallback(inst.device, inst.physicalDevice);
     VPTTrace::Line("VPT_Initialize: env fallback created (ready=%d)", (int)VPTEnv::HasPendingUploads());
 
+    // RT pipeline + SBT（同步创建；失败是确定性失败，不再每帧重试）
     VPTTrace::Stage("VPT_Initialize:pathtrace-pipeline");
     VPTDispatch::InitPathTracePipeline(inst.device, inst.physicalDevice);
-    VPTTrace::Line("VPT_Initialize: path trace pipeline created (ready=%d)",
-                   (int)VPTDispatch::IsPathTraceReady());
+    VPTTrace::Line("VPT_Initialize: RT pipeline created (ready=%d)", (int)VPTDispatch::IsPathTraceReady());
+    if (!VPTDispatch::IsPathTraceReady())
+    {
+        fprintf(stderr, "[VPT] ERROR: RT pipeline creation failed: %s\n", VPTDispatch::PathTraceError());
+        VPTTrace::Line("VPT_Initialize: FAILED, RT pipeline creation: %s", VPTDispatch::PathTraceError());
+        // 释放半成品（layout/pool/UBO/SBT），避免重进 Play 时泄漏
+        VPTDispatch::DestroyPathTracePipeline(inst.device);
+        VPT_SetInitialized(false);
+        return 3;
+    }
 
     // ── Configure rendering event for Plan B (CommandRecordingState) ──
     // Event must be outside render pass (compute dispatch) and allow queue access
@@ -118,7 +136,7 @@ VPT_Initialize()
     VPTTrace::Stage("VPT_Initialize:gpu-timer");
     VPTGpuTimer::Init(inst.device, inst.physicalDevice, inst.queueFamilyIndex);
 
-    fprintf(stderr, "[VPT] VPT_Initialize succeeded. Device ready for RayQuery.\n");
+    fprintf(stderr, "[VPT] VPT_Initialize succeeded. Device ready for RayTracingPipeline.\n");
     fflush(stderr);
     VPTTrace::Stage("VPT_Initialize:done");
     VPTTrace::Line("VPT_Initialize: OK");
@@ -264,11 +282,11 @@ VPT_SetDeformableRebuildInterval(uint32_t interval)
     VPTScene::SetDeformableRebuildInterval(interval);
 }
 
-// ── VPT_QueryRayQuerySupport ──────────────────────────────
+// ── VPT_QueryRayTracingPipelineSupport ───────────────────
 extern "C" UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API
-VPT_QueryRayQuerySupport()
+VPT_QueryRayTracingPipelineSupport()
 {
-    return VPT_IsRayQuerySupported() ? 1 : 0;
+    return VPT_IsRayTracingPipelineSupported() ? 1 : 0;
 }
 
 // ── VPT_SetEnvironmentMap ────────────────────────────────
@@ -308,11 +326,11 @@ VPT_PrepareDispatch(
         return;
     }
     if (!VPTDispatch::IsPathTraceReady())
-        VPTDispatch::InitPathTracePipeline(VPT_GetInstance().device, VPT_GetInstance().physicalDevice);
-    if (!VPTDispatch::IsPathTraceReady())
     {
-        fprintf(stderr, "[VPT] VPT_PrepareDispatch: pipeline not ready\n");
-        VPTTrace::Line("VPT_PrepareDispatch: pipeline NOT ready");
+        // 失败已判定（确定性失败），不再重试；直接返回，避免每帧重新编译刷屏
+        fprintf(stderr, "[VPT] VPT_PrepareDispatch: RT pipeline not ready (%s)\n",
+                VPTDispatch::PathTraceError());
+        VPTTrace::Line("VPT_PrepareDispatch: RT pipeline NOT ready (%s)", VPTDispatch::PathTraceError());
         return;
     }
     VPTTrace::Line("prepare %dx%d", width, height);

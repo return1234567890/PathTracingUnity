@@ -7,21 +7,28 @@ namespace VPTDispatch {
 
     // ── PathTrace dispatch ─────────────────────────────────
     // Multi-bounce PBR path tracing with NEE, GGX BSDF, Russian roulette.
-    // Uses VK_KHR_ray_query for hardware-accelerated ray traversal.
+    // 后端：VK_KHR_ray_tracing_pipeline（Slang 单模块 7 入口 + SBT）。
+    // 着色全部在 raygen，closest-hit 只回写命中记录；阴影走 any-hit 累积透射率。
     // Writes to 5 Unity RenderTextures (output + G-buffers + 2 albedo) via imageStore.
     //
     // 只有一条路径：Plan B 两阶段（PrepareDispatch + RenderCallback）。
     // 早期的直连路径 DispatchPathTrace（自建 cb + vkQueueSubmit + vkQueueWaitIdle）
     // 已整体删除，导出符号 VPT_DispatchPathTrace 一并移除（§7.6 / §10⑦）。
 
-    /// Initialize PathTrace pipeline (18 bindings)
+    /// Initialize PathTrace RT pipeline (18 bindings / 7 stages / 5 groups) + SBT
     void InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu);
 
-    /// Cleanup PathTrace pipeline resources
+    /// Cleanup PathTrace pipeline resources (含 SBT，与 pipeline 同生共死)
     void DestroyPathTracePipeline(VkDevice device);
 
     /// Whether PathTrace pipeline is initialized
     bool IsPathTraceReady();
+
+    /// 初始化是否已失败（确定性失败，不再每帧重试）
+    bool IsPathTraceFailed();
+
+    /// 失败原因（给日志/错误提示用；未失败时是空串）
+    const char* PathTraceError();
 
     // ── Plan B: Two-phase dispatch (eliminates vkQueueWaitIdle) ─────────
     // Phase 1 (PrepareDispatch): Called from C# before cmd.IssuePluginEvent.

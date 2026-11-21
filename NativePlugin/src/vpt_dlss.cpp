@@ -41,6 +41,20 @@
 // against snippet metadata; must match exactly or RR creation is rejected.
 static const unsigned long long VPT_DLSS_APP_ID = 241534723ULL;
 
+// ── NGX 日志回调 ─────────────────────────────────────────────
+// 为什么需要它：唯一能真正关掉 NGX「文件 sink」的开关是
+// `NVSDK_NGX_LoggingInfo::DisableOtherLoggingSinks`，而 SDK 要求此时 LoggingCallback 非空。
+// 默认把日志丢掉；设 VPT_NGX_LOG=1 时转发到 stderr（进 Editor.log / Player.log）。
+// 背景见 NVSDK_NGX_VULKAN_Init 调用处的长注释：NGX 把日志写进 Assets/ 会触发
+// AssetDatabase 刷新 → renderer/RT 重建 → DLSS 重初始化的自激循环。
+static void NVSDK_CONV NgxLogCallback(const char* message, NVSDK_NGX_Logging_Level /*level*/,
+                                      NVSDK_NGX_Feature /*sourceComponent*/)
+{
+    static const bool s_Forward = VPT_EnvFlag("VPT_NGX_LOG");
+    if (!s_Forward || !message) return;
+    fprintf(stderr, "[VPT-NGX-LOG] %s\n", message);
+}
+
 // ════════════════════════════════════════════════════════════
 //  NGX 全局状态
 // ═══════════════════════════════════════════════════════════
@@ -286,7 +300,25 @@ int32_t VPT_DLSS_Init_Internal(
         NVSDK_NGX_FeatureCommonInfo featureInfo{};
         featureInfo.PathListInfo.Path = pathList;
         featureInfo.PathListInfo.Length = 1;
-        featureInfo.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
+
+        // ⚠ NGX 的日志文件会写进 dataPath —— 也就是 `Assets/Plugins/x86_64/`
+        //   （`nvngx.log` / `nvngx_dlssd_310_7_0.log` / `nvsdk_ngx.log` …）。
+        //   Unity 监视 Assets/：**每次 NGX 写日志都会触发一次 AssetDatabase 刷新**，
+        //   刷新会重新反序列化 URP renderer 资产 → `PathTraceRendererFeature.Create()` →
+        //   全部 RT 重建 + DLSS 重新初始化 → NGX 再写日志 → 自激循环。
+        //   循环起来后：RT 每帧新建（插件侧每帧重建 ImageView），并持续消耗 Unity 的
+        //   resource ID；耗尽后 Unity 每帧刷
+        //   `Resource ID out of range in GetResource: … (max is 1048575)`，
+        //   画面变黑、Editor.log 涨到几百 MB、编辑器最终卡死（2026-11-22 实测）。
+        //
+        //   所以默认**关闭 NGX 自带的日志输出**（DisableOtherLoggingSinks 是唯一能真正
+        //   关掉文件 sink 的开关，SDK 要求此时 LoggingCallback 非空）。
+        //   排障需要看 NGX 细节时：设环境变量 VPT_NGX_LOG=1 打开（日志会回流到 stderr）。
+        static const bool s_NgxLogToStderr = VPT_EnvFlag("VPT_NGX_LOG");
+        featureInfo.LoggingInfo.LoggingCallback = NgxLogCallback;
+        featureInfo.LoggingInfo.DisableOtherLoggingSinks = s_NgxLogToStderr ? false : true;
+        featureInfo.LoggingInfo.MinimumLoggingLevel =
+            s_NgxLogToStderr ? NVSDK_NGX_LOGGING_LEVEL_VERBOSE : NVSDK_NGX_LOGGING_LEVEL_OFF;
 
         NVSDK_NGX_Result result = NVSDK_NGX_VULKAN_Init(
             VPT_DLSS_APP_ID, dataPath,
@@ -319,6 +351,10 @@ int32_t VPT_DLSS_Init_Internal(
             NVSDK_NGX_FeatureCommonInfo featureInfoDiag{};
             featureInfoDiag.PathListInfo.Path = pathListDiag;
             featureInfoDiag.PathListInfo.Length = 1;
+            // 诊断路径同样关掉文件 sink（否则每次能力查询都会往 Assets/ 里写日志）
+            featureInfoDiag.LoggingInfo.LoggingCallback = NgxLogCallback;
+            featureInfoDiag.LoggingInfo.DisableOtherLoggingSinks = true;
+            featureInfoDiag.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
 
             struct FeatDiag { NVSDK_NGX_Feature id; const char* name; };
             const FeatDiag featDiags[] = {
@@ -825,7 +861,7 @@ void VPT_DLSS_RenderCallback()
     rrEval.pInDiffuseAlbedo  = &diffuseAlbedoRes;
     rrEval.pInSpecularAlbedo = &specularAlbedoRes;
     // Jitter 取负（边缘抖动修复 2026-09-07）：
-    // 渲染侧 pathtrace.glsl 的 jitter 应用方向为 uv = (pixel + 0.5 + jitter)/res，
+    // 渲染侧 pt.slang 的 jitter 应用方向为 uv = (pixel + 0.5 + jitter)/res，
     // 与 NVIDIA nvpro 官方参考（gltf_pathtrace.slang L786 subpixelJitter = jitter + 0.5）
     // 完全一致；而官方参考传 NGX 时取负（dlss_wrapper.cpp L390
     // InJitterOffsetX = -info.jitter.x）。此前按 +jitter 传，

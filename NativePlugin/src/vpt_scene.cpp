@@ -182,7 +182,12 @@ static VkResult CreateBufferResource(
     if (res != VK_SUCCESS) return res;
 
     out.size    = size;
-    out.address = GetBufferAddress(device, out.buffer);
+    // 只有带 SHADER_DEVICE_ADDRESS_BIT 的 buffer 才能查设备地址。
+    // 少了这个判断会在验证层报 VUID-VkBufferDeviceAddressInfo-buffer-02601
+    // （staging / TRANSFER_SRC 之类的 buffer 本来就不需要地址）。
+    out.address = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+                ? GetBufferAddress(device, out.buffer)
+                : 0;
     return VK_SUCCESS;
 }
 
@@ -225,6 +230,15 @@ void VPTScene::LoadExtensionFunctions(PFN_vkGetInstanceProcAddr gipa, VkInstance
         else { fprintf(stderr, "[VPT]   " #name " : NOT FOUND (extension not enabled on device)\n"); }
 
     LOAD(vkGetBufferDeviceAddressKHR);
+    // BDA 的三个别名：KHR / EXT / core(1.2)。
+    // Unity 有时启用的不是 VK_KHR_buffer_device_address（而是 EXT 版，规范不允许两者同时启用），
+    // 这时 KHR 名字可能取不到，需要退回 EXT / core 名字。
+    if (!pfn_vkGetBufferDeviceAddressKHR)
+        pfn_vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)gdpa(device, "vkGetBufferDeviceAddressEXT");
+    if (!pfn_vkGetBufferDeviceAddressKHR)
+        pfn_vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)gdpa(device, "vkGetBufferDeviceAddress");
+    if (pfn_vkGetBufferDeviceAddressKHR)
+        fprintf(stderr, "[VPT]   vkGetBufferDeviceAddress (KHR/EXT/core alias) : OK\n");
     LOAD(vkGetAccelerationStructureBuildSizesKHR);
     LOAD(vkCreateAccelerationStructureKHR);
     LOAD(vkDestroyAccelerationStructureKHR);
@@ -483,10 +497,10 @@ static void BuildBLAS(VkCommandBuffer cmd, VkDevice device, VkPhysicalDevice gpu
     VkAccelerationStructureGeometryKHR geom{ VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
     geom.geometryType     = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
     geom.geometry.triangles = triData;
-    // 几何级不再一律标 OPAQUE：半透明 / 镂空实例必须 non-opaque，硬件才会为它产生 candidate 交点
-    //（阴影遍历与主光线 alpha-test 都依赖 candidate）。不透明实例改由 TLAS 实例级的 FORCE_OPAQUE 兜住，
+    // 几何级不再一律标 OPAQUE：半透明 / 镂空实例必须 non-opaque，硬件才会为它产生候补命中
+    //（阴影 any-hit 与主光线 alpha-test 都依赖它）。不透明实例改由 TLAS 实例级的 FORCE_OPAQUE 兜住，
     // 依然走硬件快路径，见 WriteInstanceData。
-    // 主路径 rayQuery 不再强制 Opaque（镂空材质需要 candidate）；不透明实例仍靠 FORCE_OPAQUE 直接 commit。
+    // 主路径不加 RAY_FLAG_FORCE_OPAQUE（镂空材质需要 any-hit）；不透明实例仍靠 FORCE_OPAQUE 直接 commit。
     geom.flags            = 0;
 
     uint32_t primCount = mesh.indexCount / 3;
@@ -720,9 +734,9 @@ static void WriteInstanceData(const VPT_InstanceData* instances, int32_t instanc
         dst.instanceShaderBindingTableRecordOffset = 0;
 
         // ── 实例 opaque 标记：只给真不透明材质 FORCE_OPAQUE ──
-        // 半透明 / 镂空实例必须 non-opaque，否则硬件不会给出 candidate 交点：
+        // 半透明 / 镂空实例必须 non-opaque，否则硬件不会为它触发 any-hit：
         //   · 半透明：阴影 any-hit 遍历看不到玻璃；
-        //   · 镂空：主光线无法在 candidate 循环里按 alpha 丢弃微面。
+        //   · 镂空：主光线 any-hit 无法按 alpha 丢弃微面。
         // 不透明实例保留 FORCE_OPAQUE：硬件 opaque 快路径 + TerminateOnFirstHit 立即结束遍历。
         // materialID 越界（正常不会）时按不透明处理，保证不会把实心物体误判成玻璃/镂空。
         uint32_t matFlags = 0;
@@ -775,7 +789,13 @@ static void RecordTLASBuild(VkCommandBuffer cmd, VkDevice device, uint32_t ringI
     preBuild.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+        // 着色器侧消费者只剩 ray tracing（RT pipeline 后端；compute 不再读 AS）。
+        // ⚠ 不能把 COMPUTE_SHADER 留在这里：rayQuery feature 关闭时，dstAccessMask
+        //   含 ACCELERATION_STRUCTURE_READ 的 barrier 若把任意 *_SHADER 阶段
+        //   （除 RAY_TRACING）放进 dstStageMask 属规范违背
+        //   （VUID-vkCmdPipelineBarrier-dstAccessMask-06257）。
+        | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         0, 1, &preBuild, 0, nullptr, 0, nullptr);
 
     // ── TLAS 重建（每帧全量 rebuild；instance 数少成本极低，且无 refit 退化问题）──
@@ -805,7 +825,13 @@ static void RecordTLASBuild(VkCommandBuffer cmd, VkDevice device, uint32_t ringI
     postBuild.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+        // 着色器侧消费者只剩 ray tracing（RT pipeline 后端；compute 不再读 AS）。
+        // ⚠ 不能把 COMPUTE_SHADER 留在这里：rayQuery feature 关闭时，dstAccessMask
+        //   含 ACCELERATION_STRUCTURE_READ 的 barrier 若把任意 *_SHADER 阶段
+        //   （除 RAY_TRACING）放进 dstStageMask 属规范违背
+        //   （VUID-vkCmdPipelineBarrier-dstAccessMask-06257）。
+        | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         0, 1, &postBuild, 0, nullptr, 0, nullptr);
 }
 
@@ -814,7 +840,7 @@ static void RecordTLASBuild(VkCommandBuffer cmd, VkDevice device, uint32_t ringI
 //
 //  GPU 蒙皮 compute 就地写统一顶点缓冲后，dispatch 前录制 mode=UPDATE refit。
 //  hit shader 从统一顶点缓冲直接读 VPT_Vertex 插值法线/切线，
-//  顶点就地更新后着色属性自动跟随，无需改 pathtrace.glsl。
+//  顶点就地更新后着色属性自动跟随，无需改 pt.slang。
 // ═══════════════════════════════════════════════════════════
 
 static bool                    s_BlasRefitPending     = false;
@@ -914,7 +940,13 @@ void VPTScene::RecordBLASRefitIfNeeded(VkCommandBuffer cmd)
     postRefit.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+        // 着色器侧消费者只剩 ray tracing（RT pipeline 后端；compute 不再读 AS）。
+        // ⚠ 不能把 COMPUTE_SHADER 留在这里：rayQuery feature 关闭时，dstAccessMask
+        //   含 ACCELERATION_STRUCTURE_READ 的 barrier 若把任意 *_SHADER 阶段
+        //   （除 RAY_TRACING）放进 dstStageMask 属规范违背
+        //   （VUID-vkCmdPipelineBarrier-dstAccessMask-06257）。
+        | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         0, 1, &postRefit, 0, nullptr, 0, nullptr);
 
     // 消费完毕
@@ -1322,7 +1354,13 @@ void VPTScene::RecordGPUSkinningIfNeeded(VkCommandBuffer cmd)
                               | VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+        // 着色器侧消费者只剩 ray tracing（RT pipeline 后端；compute 不再读 AS）。
+        // ⚠ 不能把 COMPUTE_SHADER 留在这里：rayQuery feature 关闭时，dstAccessMask
+        //   含 ACCELERATION_STRUCTURE_READ 的 barrier 若把任意 *_SHADER 阶段
+        //   （除 RAY_TRACING）放进 dstStageMask 属规范违背
+        //   （VUID-vkCmdPipelineBarrier-dstAccessMask-06257）。
+        | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         0, 1, &skinBarrier, 0, nullptr, 0, nullptr);
 
     // 消费：轮转关节矩阵槽位（在飞历史帧仍在读旧槽）；
@@ -1549,7 +1587,10 @@ bool VPTScene::RecordSceneUpdateIfNeeded(VkCommandBuffer cmd)
     vkCmdPipelineBarrier(cmdBuf,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
-        | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        // InstanceInfo / 统一顶点缓冲的 shader 读只发生在 ray tracing 阶段；
+        // 保留 COMPUTE_SHADER 会触发 VUID-vkCmdPipelineBarrier-dstAccessMask-06257
+        // （rayQuery 关闭时，AS_READ + 非 RT 的 shader 阶段不被允许）。
+        | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         0, 1, &copyBarrier, 0, nullptr, 0, nullptr);
 
     s_BLASes.reserve(meshes.size());
