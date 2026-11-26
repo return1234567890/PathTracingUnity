@@ -70,6 +70,15 @@
 [[vk::image_format("rgba16f")]] [[vk::binding(14, 0)]] RWTexture2D<float4> diffuseAlbedoImg;
 [[vk::image_format("rgba16f")]] [[vk::binding(15, 0)]] RWTexture2D<float4> specularAlbedoImg;
 
+// DLSS RR specular guide（binding 18 → VPT_DLSS 的 pInSpecularRayDirectionHitDistance）
+//   xyz = 镜面射线方向（世界空间，单位向量）
+//   w   = 该射线自主表面出发命中的世界空间距离（米）；miss / 无镜面弹射 = 0
+// 语义：RR 用它反推「虚拟命中点」 P_spec = P + dir * dist，从而对镜面分量做正确的
+// 时域重投影（否则只能拿主表面 MV 硬套，运动时反射拖影）。
+// 约定：只有 s==0 且 depth==0 选中【镜面反射】lobe 的像素写值，其余像素写 0。
+//       写 0 等于「本帧没有镜面几何信息」→ RR 退回主表面重投影，不会算错虚拟点。
+[[vk::image_format("rgba16f")]] [[vk::binding(18, 0)]] RWTexture2D<float4> specGuideImg;
+
 // C++ 侧 PathTraceCameraUBO：208B / std140。
 // row_major：C++ 传的是 Unity 的 Matrix4x4（行主序 16 float），
 // 必须显式声明 row_major，否则会被当成列主序 → 相机全错。
@@ -86,6 +95,7 @@ struct CameraUBO
     float              envIntensity;   // 200  HDR env intensity multiplier
     float              envRotation;    // 204  HDR env 绕 Y 轴旋转，单位弧度
 };
+
 [[vk::binding(4, 0)]] ConstantBuffer<CameraUBO> cam;
 
 // ── SSBO 结构体（与 vpt_types.h 严格一致）──────────────────────
@@ -289,8 +299,10 @@ float3 evaluateBSDF(VPT_Material mat, float3 N, float3 L, float3 V, float NdotL,
 }
 
 // Sample BSDF for indirect bounce (returns BSDF value and pdf)
+// lobeOut：本次选中的 lobe（LOBE_DIFFUSE_REFLECTION / LOBE_SPECULAR_REFLECTION）。
+//   raygen 用它判断「这一跳是不是镜面反射」，从而写 DLSS RR 的 specular guide。
 float3 sampleBSDF(VPT_Material mat, float3 N, float3 V,
-                  inout uint seed, out float3 wi, out float pdf)
+                  inout uint seed, out float3 wi, out float pdf, out uint lobeOut)
 {
     float3 albedo    = mat.albedo.rgb;
     float  metallic  = mat.metallic;
@@ -299,7 +311,8 @@ float3 sampleBSDF(VPT_Material mat, float3 N, float3 V,
     float  a         = roughness * roughness;
     float  a2        = a * a;
 
-    float pd = 1.0f - metallic;
+    // ⚠ 随机数的消费顺序必须保持稳定（r 先取，再算 pd），否则整条路径的
+    //   RNG 流会平移，画面全变、与历史版本无法逐像素对比。
     float r  = rand(seed);
 
     float3 T, B;
@@ -307,9 +320,21 @@ float3 sampleBSDF(VPT_Material mat, float3 N, float3 V,
 
     float NdotV = max(dot(N, V), 0.0f);
 
+    // ── 漫反射 / 镜面 lobe 的选择概率 pd ──
+    // 金属恒走镜面；介质按 Fresnel 加权（F0 = lerp(0.04, albedo, metallic)）。
+    // 不用 pd = 1-metallic：那样介质表面永远走余弦，镜面 lobe 一次都不采 ——
+    // 镜面反射只能靠余弦方向碰巧落进 GGX 瓣（噪声大），而且 RR 的 specular guide
+    // 永远没有镜面弹射可写（该通路会变成死代码）。
+    // 改 pd 只改方差、不改均值：下方 pdf 就是与选样策略一致的混合分布。
+    float f0    = dot(F0, float3(1.0f / 3.0f));
+    float fr    = f0 + (1.0f - f0) * pow(1.0f - NdotV, 5.0f);
+    float pSpec = max(metallic, (1.0f - metallic) * clamp(fr, 0.0f, 1.0f));
+    float pd    = 1.0f - clamp(pSpec, 0.0f, 1.0f);
+
     if (r < pd)
     {
-        wi = cosineSampleHemisphere(float2(rand(seed), rand(seed)), T, B, N);
+        wi      = cosineSampleHemisphere(float2(rand(seed), rand(seed)), T, B, N);
+        lobeOut = LOBE_DIFFUSE_REFLECTION;
     }
     else
     {
@@ -320,7 +345,8 @@ float3 sampleBSDF(VPT_Material mat, float3 N, float3 V,
         float3 H = normalize(sinTheta * cos(phi) * T
                            + sinTheta * sin(phi) * B
                            + cosTheta * N);
-        wi = reflect(-V, H);
+        wi      = reflect(-V, H);
+        lobeOut = LOBE_SPECULAR_REFLECTION;
     }
 
     float NdotL = max(dot(N, wi), 0.0f);

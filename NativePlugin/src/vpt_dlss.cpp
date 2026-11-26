@@ -115,6 +115,9 @@ static DLSSImageViewCache s_OutputView; // 全分辨率输出
 static DLSSImageViewCache s_NormalRoughView; // RR: normal.xyz + roughness.w（GBuffer1）
 static DLSSImageViewCache s_DiffuseAlbedoView;  // RR: diffuse albedo = albedo*(1-metallic)
 static DLSSImageViewCache s_SpecularAlbedoView; // RR: specular albedo = EnvBRDFApprox(F0, roughness², NoV)
+// RR: specular guide —— xyz = 镜面射线方向（世界空间，单位向量）, w = 命中距离（米）
+// 对应 NGX 的 pInSpecularRayDirectionHitDistance（一张图同时给方向和距离）
+static DLSSImageViewCache s_SpecGuideView;
 
 // RR 待评估参数（Phase 1 填充，Phase 2 消费）
 static float s_RRViewMatrix[16] = {0};
@@ -678,6 +681,7 @@ void VPT_DLSS_Destroy_Internal()
     cleanupView(s_NormalRoughView);
     cleanupView(s_DiffuseAlbedoView);
     cleanupView(s_SpecularAlbedoView);
+    cleanupView(s_SpecGuideView);
 
     s_DLSSReady = false;
     s_DLSSParams = nullptr;
@@ -705,7 +709,7 @@ void VPT_DLSS_Destroy_Internal()
 void VPT_DLSS_PrepareRRDispatch_Internal(
     void* colorLowPtr, void* motionLowPtr, void* linearDepthPtr, void* outputHighPtr,
     void* normalRoughPtr,
-    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+    void* diffuseAlbedoPtr, void* specularAlbedoPtr, void* specGuidePtr,
     int32_t renderW, int32_t renderH,
     int32_t outputW, int32_t outputH,
     float jitterX, float jitterY, int32_t reset,
@@ -713,7 +717,7 @@ void VPT_DLSS_PrepareRRDispatch_Internal(
 {
     std::lock_guard<std::recursive_mutex> guard(s_DlssMutex);
     if (!s_DLSSReady || !colorLowPtr || !motionLowPtr || !linearDepthPtr || !outputHighPtr || !normalRoughPtr
-        || !diffuseAlbedoPtr || !specularAlbedoPtr)
+        || !diffuseAlbedoPtr || !specularAlbedoPtr || !specGuidePtr)
         return;
 
     if (VPT_IsDeviceLost())
@@ -752,6 +756,11 @@ void VPT_DLSS_PrepareRRDispatch_Internal(
     if (!EnsureDLSSImageView(vulkan, device, specularAlbedoPtr, s_SpecularAlbedoView,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_ACCESS_SHADER_READ_BIT, "SpecularAlbedo")) return;
+
+    // SpecularGuide: read-only（RR specular ray direction + hit distance）
+    if (!EnsureDLSSImageView(vulkan, device, specGuidePtr, s_SpecGuideView,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_ACCESS_SHADER_READ_BIT, "SpecularGuide")) return;
 
     // Output: write-only, General layout
     if (!EnsureDLSSImageView(vulkan, device, outputHighPtr, s_OutputView,
@@ -849,6 +858,11 @@ void VPT_DLSS_RenderCallback()
         s_SpecularAlbedoView.view, s_SpecularAlbedoView.image, subRange,
         s_SpecularAlbedoView.format, s_SpecularAlbedoView.width, s_SpecularAlbedoView.height, false);
 
+    // RR specular guide：方向 + 命中距离打包在同一张 RGBA16F（xyz=方向, w=距离）
+    NVSDK_NGX_Resource_VK specGuideRes = NVSDK_NGX_Create_ImageView_Resource_VK(
+        s_SpecGuideView.view, s_SpecGuideView.image, subRange,
+        s_SpecGuideView.format, s_SpecGuideView.width, s_SpecGuideView.height, false);
+
     NVSDK_NGX_VK_DLSSD_Eval_Params rrEval{};
     rrEval.pInColor       = &colorRes;
     rrEval.pInOutput      = &outputRes;
@@ -860,6 +874,10 @@ void VPT_DLSS_RenderCallback()
     // Diffuse = albedo*(1-metallic)，Specular = EnvBRDFApprox(F0, roughness², NoV)
     rrEval.pInDiffuseAlbedo  = &diffuseAlbedoRes;
     rrEval.pInSpecularAlbedo = &specularAlbedoRes;
+    // specular guide：NGX 用「RayDirection + HitDistance」这一组参数接收同一张图。
+    // RR 靠它反推虚拟命中点 P + dir*dist，对镜面分量做正确的时域重投影；
+    // 不给的话镜面只能用主表面 MV，相机一动反射就拖影。0 = 本帧无镜面几何信息。
+    rrEval.pInSpecularRayDirectionHitDistance = &specGuideRes;
     // Jitter 取负（边缘抖动修复 2026-09-07）：
     // 渲染侧 pt.slang 的 jitter 应用方向为 uv = (pixel + 0.5 + jitter)/res，
     // 与 NVIDIA nvpro 官方参考（gltf_pathtrace.slang L786 subpixelJitter = jitter + 0.5）
@@ -910,7 +928,7 @@ int32_t VPT_DLSS_Init_Internal(int32_t, int32_t, int32_t, int32_t, int32_t)
 }
 
 void VPT_DLSS_Destroy_Internal() {}
-void VPT_DLSS_PrepareRRDispatch_Internal(void*, void*, void*, void*, void*, void*, void*, int32_t, int32_t, int32_t, int32_t, float, float, int32_t, const float*, const float*) {}
+void VPT_DLSS_PrepareRRDispatch_Internal(void*, void*, void*, void*, void*, void*, void*, void*, int32_t, int32_t, int32_t, int32_t, float, float, int32_t, const float*, const float*) {}
 void VPT_DLSS_RenderCallback() {}
 bool VPT_DLSS_IsReady() { return false; }
 int32_t VPT_DLSS_GetStatus() { return -1; }

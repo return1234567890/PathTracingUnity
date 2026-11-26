@@ -302,6 +302,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
     // ── DLSS RR albedo G-buffer（无条件创建：native binding 14/15 descriptor 必须始终有效）──
     private RenderTexture _diffuseAlbedoRT;   // 低分辨率 ARGBHalf，albedo*(1-metallic)
     private RenderTexture _specularAlbedoRT;  // 低分辨率 ARGBHalf，EnvBRDFApprox(F0, roughness², NoV)
+    private RenderTexture _specGuideRT;       // 低分辨率 ARGBHalf，RR specular guide（xyz=镜面方向, w=命中距离）
 
     // ── DLSS 专用 RT ──
     private RenderTexture _motionVectorRT;    // 低分辨率 RGFloat（运动矢量）
@@ -362,14 +363,11 @@ public class PathTraceRenderPass : ScriptableRenderPass
         if (mm == null || !mm.HasScene)
             return;
 
-        // 卡死诊断：每帧只更新"当前阶段" + 喂狗。
-        // 卡住时看门狗线程会把最后设置的 Stage 打出来，这就是死点，无需每帧写行
-        //（60fps 下 2 行/帧 ≈ 120 行/s，且 C# 日志没有轮转 → 文件会无限增长）。
+        // 卡死诊断：每帧只更新"当前阶段" + 喂狗（纯内存操作，不写文件）。
+        // 卡住时看门狗线程会把最后设置的 Stage 打出来，这就是死点 —— 不需要每帧写日志。
         VptTrace.Beat();
         VptTrace.NextFrame();
         VptTrace.Stage("Execute:enter");
-        if (VptTrace.Frame % 60 == 0)
-            VptTrace.Line("Execute alive, frame=" + VptTrace.Frame);
 
         // ── 1. 相机参数 ──
         Camera camera = renderingData.cameraData.camera;
@@ -537,7 +535,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
         TextureArrayManager texArr = mm.TextureArrays;
         VptTrace.Stage("Execute:PrepareDispatch");
         IntPtr callbackPtr = NativeBridge.PrepareDispatch(_outputRT, _gbuffer0, _gbuffer1,
-            _diffuseAlbedoRT, _specularAlbedoRT,
+            _diffuseAlbedoRT, _specularAlbedoRT, _specGuideRT,
             texArr != null ? texArr.BaseColorArray : null,
             texArr != null ? texArr.MetallicSmoothArray : null,
             texArr != null ? texArr.NormalArray : null,
@@ -584,7 +582,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
             float[] projMat = MatrixToFloat16(curProj);
             IntPtr dlssPtr = NativeBridge.PrepareDLSSRRDispatch(
                 _outputRT, _motionVectorRT, _linearDepthRT, _dlssOutputRT,
-                _gbuffer1, _diffuseAlbedoRT, _specularAlbedoRT,
+                _gbuffer1, _diffuseAlbedoRT, _specularAlbedoRT, _specGuideRT,
                 w, h, camera.pixelWidth, camera.pixelHeight,
                 jitter.x, jitter.y, _hasPrev ? 0 : 1,
                 viewMat, projMat);
@@ -753,6 +751,9 @@ public class PathTraceRenderPass : ScriptableRenderPass
         // descriptor 必须始终有效，即使 DLSS 关闭也不能为 null）
         _diffuseAlbedoRT  = NewRT(w, h, RenderTextureFormat.ARGBHalf);
         _specularAlbedoRT = NewRT(w, h, RenderTextureFormat.ARGBHalf);
+        // RR specular guide：同样无条件创建 —— PT shader 的 binding 18 描述符必须始终有效，
+        // 即使 DLSS 关闭也不能为 null（与上面两张 albedo 图同样的理由）。
+        _specGuideRT = NewRT(w, h, RenderTextureFormat.ARGBHalf);
 
         // ── DLSS 专用 RT ──
         if (_feature.dlssEnabled)
@@ -794,6 +795,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
         Release(ref _gbuffer1);
         Release(ref _diffuseAlbedoRT);
         Release(ref _specularAlbedoRT);
+        Release(ref _specGuideRT);
         // ── DLSS ──
         Release(ref _motionVectorRT);
         Release(ref _linearDepthRT);

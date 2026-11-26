@@ -126,7 +126,7 @@ public static class NativeBridge
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_PrepareDispatch(
         IntPtr outputPtr, IntPtr gbuf0Ptr, IntPtr gbuf1Ptr,
-        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr,
+        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr, IntPtr specGuidePtr,
         IntPtr baseColorPtr, IntPtr metallicRoughPtr, IntPtr normalPtr, IntPtr emissivePtr,
         int width, int height,
         IntPtr cameraData,
@@ -165,11 +165,11 @@ public static class NativeBridge
         public int age;
     }
 
-    private static readonly TexPtrSlot[] s_TexPtrSlots = new TexPtrSlot[16];
+    private static readonly TexPtrSlot[] s_TexPtrSlots = new TexPtrSlot[18];
     private static readonly bool s_PtrCacheEnabled =
         string.IsNullOrEmpty(Environment.GetEnvironmentVariable("VPT_NO_PTR_CACHE"));
 
-    /// <summary>取（带缓存的）原生纹理指针。slot 0..8 = PT，9..15 = DLSS。</summary>
+    /// <summary>取（带缓存的）原生纹理指针。slot 0..9 = PT，10..17 = DLSS。</summary>
     private static IntPtr CachedPtr(int slot, UnityEngine.Texture tex)
     {
         if (tex == null) return IntPtr.Zero;
@@ -201,6 +201,7 @@ public static class NativeBridge
     public static IntPtr PrepareDispatch(
         UnityEngine.RenderTexture outputRT, UnityEngine.RenderTexture gbuf0RT, UnityEngine.RenderTexture gbuf1RT,
         UnityEngine.RenderTexture diffuseAlbedoRT, UnityEngine.RenderTexture specularAlbedoRT,
+        UnityEngine.RenderTexture specGuideRT,
         UnityEngine.Texture2DArray baseColorArr, UnityEngine.Texture2DArray metallicRoughArr,
         UnityEngine.Texture2DArray normalArr, UnityEngine.Texture2DArray emissiveArr,
         int width, int height, ref VPT_CameraData cameraData,
@@ -212,11 +213,12 @@ public static class NativeBridge
         IntPtr gbuf1Ptr          = CachedPtr(2, gbuf1RT);
         IntPtr diffuseAlbedoPtr  = CachedPtr(3, diffuseAlbedoRT);
         IntPtr specularAlbedoPtr = CachedPtr(4, specularAlbedoRT);
+        IntPtr specGuidePtr      = CachedPtr(5, specGuideRT);
 
-        IntPtr baseColorPtr     = CachedPtr(5, baseColorArr);
-        IntPtr metallicRoughPtr = CachedPtr(6, metallicRoughArr);
-        IntPtr normalPtr        = CachedPtr(7, normalArr);
-        IntPtr emissivePtr      = CachedPtr(8, emissiveArr);
+        IntPtr baseColorPtr     = CachedPtr(6, baseColorArr);
+        IntPtr metallicRoughPtr = CachedPtr(7, metallicRoughArr);
+        IntPtr normalPtr        = CachedPtr(8, normalArr);
+        IntPtr emissivePtr      = CachedPtr(9, emissiveArr);
 
         int camSize = Marshal.SizeOf<VPT_CameraData>();
         IntPtr camPtr = Marshal.AllocHGlobal(camSize);
@@ -224,7 +226,7 @@ public static class NativeBridge
         {
             Marshal.StructureToPtr(cameraData, camPtr, false);
             VPT_PrepareDispatch(outputPtr, gbuf0Ptr, gbuf1Ptr,
-                diffuseAlbedoPtr, specularAlbedoPtr,
+                diffuseAlbedoPtr, specularAlbedoPtr, specGuidePtr,
                 baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
                 width, height, camPtr, lightCount, samplesPerPixel);
         }
@@ -318,7 +320,7 @@ public static class NativeBridge
     public static extern void VPT_DLSS_PrepareRRDispatch(
         IntPtr colorLowPtr, IntPtr motionLowPtr, IntPtr linearDepthPtr, IntPtr outputHighPtr,
         IntPtr normalRoughPtr,
-        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr,
+        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr, IntPtr specGuidePtr,
         int renderW, int renderH, int outputW, int outputH,
         float jitterX, float jitterY, int reset,
         IntPtr viewMatrix, IntPtr projMatrix);
@@ -338,19 +340,21 @@ public static class NativeBridge
         UnityEngine.RenderTexture linearDepthRT, UnityEngine.RenderTexture outputHighRT,
         UnityEngine.RenderTexture normalRoughRT,
         UnityEngine.RenderTexture diffuseAlbedoRT, UnityEngine.RenderTexture specularAlbedoRT,
+        UnityEngine.RenderTexture specGuideRT,
         int renderW, int renderH, int outputW, int outputH,
         float jitterX, float jitterY, int reset,
         float[] viewMatrix, float[] projMatrix)
     {
-        // 带缓存（见 CachedPtr）：DLSS 这条每帧也要 7 次 GetNativeTexturePtr，
+        // 带缓存（见 CachedPtr）：DLSS 这条每帧也要 8 次 GetNativeTexturePtr，
         // 同样会消耗 Unity resource ID
-        IntPtr colorPtr          = CachedPtr(9,  colorLowRT);
-        IntPtr motionPtr         = CachedPtr(10, motionLowRT);
-        IntPtr depthPtr          = CachedPtr(11, linearDepthRT);
-        IntPtr outputPtr         = CachedPtr(12, outputHighRT);
-        IntPtr normalPtr         = CachedPtr(13, normalRoughRT);
-        IntPtr diffuseAlbedoPtr  = CachedPtr(14, diffuseAlbedoRT);
-        IntPtr specularAlbedoPtr = CachedPtr(15, specularAlbedoRT);
+        IntPtr colorPtr          = CachedPtr(10, colorLowRT);
+        IntPtr motionPtr         = CachedPtr(11, motionLowRT);
+        IntPtr depthPtr          = CachedPtr(12, linearDepthRT);
+        IntPtr outputPtr         = CachedPtr(13, outputHighRT);
+        IntPtr normalPtr         = CachedPtr(14, normalRoughRT);
+        IntPtr diffuseAlbedoPtr  = CachedPtr(15, diffuseAlbedoRT);
+        IntPtr specularAlbedoPtr = CachedPtr(16, specularAlbedoRT);
+        IntPtr specGuidePtr      = CachedPtr(17, specGuideRT);
 
         // 将 float[16] 矩阵 pin 到非托管内存
         GCHandle viewPin = GCHandle.Alloc(viewMatrix, GCHandleType.Pinned);
@@ -358,7 +362,7 @@ public static class NativeBridge
         try
         {
             VPT_DLSS_PrepareRRDispatch(colorPtr, motionPtr, depthPtr, outputPtr,
-                normalPtr, diffuseAlbedoPtr, specularAlbedoPtr,
+                normalPtr, diffuseAlbedoPtr, specularAlbedoPtr, specGuidePtr,
                 renderW, renderH, outputW, outputH,
                 jitterX, jitterY, reset,
                 viewPin.AddrOfPinnedObject(), projPin.AddrOfPinnedObject());

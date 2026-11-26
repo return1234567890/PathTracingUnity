@@ -56,7 +56,8 @@ struct ImageViewCache {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 // [0]=output, [1]=gbuffer0, [2]=gbuffer1, [3]=diffuseAlbedo(RR), [4]=specularAlbedo(RR)
-static ImageViewCache s_OutputViews[5];
+// [5]=specGuide（RR specular ray direction + hit distance，zyx=方向, w=距离）
+static ImageViewCache s_OutputViews[6];
 
 // Cached ImageViews for 4 texture arrays (Phase 4)
 static ImageViewCache s_TexViews[4]; // [0]=baseColor, [1]=metallicRough, [2]=normal, [3]=emissive
@@ -117,7 +118,7 @@ static VkResult CreateHostBuffer(
 // （实测 Editor 下 5 张输出图每帧都变），于是每帧都要销毁/重建 view。
 // 这本身不是错误（PT 每帧整图覆写，旧内容丢弃无害），但值得知道发生频率，
 // 所以每 ~120 帧汇总打印一次，而不是每帧刷 5 行把 Editor.log 撑大。
-static uint32_t s_ViewRecreateCount[5] = { 0, 0, 0, 0, 0 };
+static uint32_t s_ViewRecreateCount[6] = { 0, 0, 0, 0, 0, 0 };
 static uint32_t s_TexViewRecreateCount[4] = { 0, 0, 0, 0 };
 static uint32_t s_ViewStatsFrame = 0;
 static uint32_t s_ViewHotWindows = 0;   // 连续「每帧换图」的 120 帧窗口数（诊断用）
@@ -143,7 +144,7 @@ struct PathTraceCameraUBO
 
 // ═══════════════════════════════════════════════════════════
 //  PathTrace pipeline initialization (Phase 3)
-//  18 bindings: TLAS + 5 images + UBO + 6 SSBOs + 5 samplers + 1 env SSBO
+//  19 bindings: TLAS + 6 images + UBO + 6 SSBOs + 5 samplers + 1 env SSBO
 //
 //  后端 = VK_KHR_ray_tracing_pipeline：7 个 stage 共用一个 VkShaderModule
 //  （Slang 单模块，靠 pName 选入口），5 个 shader group，SBT 见 vpt_rt.cpp。
@@ -187,9 +188,9 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
         }
     }
 
-    // 1. Descriptor set layout: 18 bindings (16 original + 2 HDR env)
+    // 1. Descriptor set layout: 19 bindings (16 original + 2 HDR env + 1 RR specular guide)
     //    stageFlags = 全部 RT 阶段并集
-    VkDescriptorSetLayoutBinding bindings[18] = {};
+    VkDescriptorSetLayoutBinding bindings[19] = {};
     bindings[0].binding = 0; bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; bindings[0].descriptorCount = 1; bindings[0].stageFlags = kRtDescriptorStages;
     bindings[1].binding = 1; bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bindings[1].descriptorCount = 1; bindings[1].stageFlags = kRtDescriptorStages;
     bindings[2].binding = 2; bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bindings[2].descriptorCount = 1; bindings[2].stageFlags = kRtDescriptorStages;
@@ -210,9 +211,11 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
     // HDR 环境贴图（binding 16 = combined image sampler, binding 17 = EnvAccel SSBO）
     bindings[16].binding = 16; bindings[16].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; bindings[16].descriptorCount = 1; bindings[16].stageFlags = kRtDescriptorStages;
     bindings[17].binding = 17; bindings[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bindings[17].descriptorCount = 1; bindings[17].stageFlags = kRtDescriptorStages;
+    // RR specular guide（pt_common.slang binding 18，rgba16f：xyz=镜面方向, w=命中距离）
+    bindings[18].binding = 18; bindings[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bindings[18].descriptorCount = 1; bindings[18].stageFlags = kRtDescriptorStages;
 
     VkDescriptorSetLayoutCreateInfo dslCI{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dslCI.bindingCount = 18;
+    dslCI.bindingCount = 19;
     dslCI.pBindings    = bindings;
     VkResult res = vkCreateDescriptorSetLayout(device, &dslCI, nullptr, &s_PathDSLayout);
     if (res != VK_SUCCESS) { Fail("vkCreateDescriptorSetLayout", res); return; }
@@ -311,7 +314,7 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
     // 6. Descriptor pool + set（环形，kDescRingSize 套）
     VkDescriptorPoolSize poolSizes[5] = {};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; poolSizes[0].descriptorCount = 1 * kDescRingSize;
-    poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              poolSizes[1].descriptorCount = 5 * kDescRingSize;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              poolSizes[1].descriptorCount = 6 * kDescRingSize;
     poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;             poolSizes[2].descriptorCount = 1 * kDescRingSize;
     poolSizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 6 * kDescRingSize;  // 5 SSBOs + 1 EnvAccel
     poolSizes[4].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;     poolSizes[4].descriptorCount = 5 * kDescRingSize;  // 4 tex arrays + 1 HDR env
@@ -357,7 +360,7 @@ void VPTDispatch::InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu)
     // 构建指纹：用于在 Unity Console 里确认「当前进程加载的是哪一版 DLL / 内嵌 SPV」。
     // 换 DLL 后没有重启 Unity 时，这里打印的仍然是旧值。
     fprintf(stderr,
-            "[VPT] PathTrace RT pipeline initialized (18 bindings, 7 stages, 5 groups). "
+            "[VPT] PathTrace RT pipeline initialized (19 bindings, 7 stages, 5 groups). "
             "shader SPV = %u bytes.\n",
             g_PathTraceSpv_size);
     fflush(stderr);
@@ -390,10 +393,10 @@ struct QueryThrottle
     uint32_t interval   = 1;         // 当前自适应间隔
 };
 
-static QueryThrottle s_OutThrottle[5];
+static QueryThrottle s_OutThrottle[6];
 static QueryThrottle s_TexThrottle[4];
 // 诊断计数（每 120 帧汇总后清零）
-static uint32_t s_PtrChangeCount[5] = { 0, 0, 0, 0, 0 };
+static uint32_t s_PtrChangeCount[6] = { 0, 0, 0, 0, 0, 0 };
 static uint32_t s_TexPtrChangeCount[4] = { 0, 0, 0, 0 };
 
 // 是否可以跳过本次 AccessTexture？
@@ -422,13 +425,14 @@ static void QueryUpdate(QueryThrottle& t, void* nativeTex, bool imageChanged)
 }
 
 // ═══════════════════════════════════════════════════════════
-//  5 张输出图的期望格式（与 shader 的 [[vk::image_format(...)]] 一一对应）
-static const VkFormat kOutputFormats[5] = {
+//  6 张输出图的期望格式（与 shader 的 [[vk::image_format(...)]] 一一对应）
+static const VkFormat kOutputFormats[6] = {
     VK_FORMAT_R16G16B16A16_SFLOAT,   // 0 output
     VK_FORMAT_R32G32B32A32_SFLOAT,   // 1 gbufferPosDepth
     VK_FORMAT_R16G16B16A16_SFLOAT,   // 2 gbufferNormalRough
     VK_FORMAT_R16G16B16A16_SFLOAT,   // 3 diffuseAlbedo
     VK_FORMAT_R16G16B16A16_SFLOAT,   // 4 specularAlbedo
+    VK_FORMAT_R16G16B16A16_SFLOAT,   // 5 specGuide (RR specular dir + dist)
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -489,9 +493,9 @@ static bool EnsureImageView(IUnityGraphicsVulkan* vulkan, VkDevice device,
         // 与 Unity RT 的实际格式不一致会写成垃圾/触发验证层报错。
         // 只在「格式变化」时打印一次（正常情况下每个 slot 一辈子只打一条）。
         {
-            static VkFormat s_LoggedFormat[5] = { VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED,
+            static VkFormat s_LoggedFormat[6] = { VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED,
                                                   VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED,
-                                                  VK_FORMAT_UNDEFINED };
+                                                  VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED };
             if (s_LoggedFormat[slot] != vkImg.format)
             {
                 s_LoggedFormat[slot] = vkImg.format;
@@ -649,14 +653,14 @@ void VPTDispatch::InvalidateTextureViews()
 
 void VPTDispatch::PrepareDispatch(
     void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
-    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+    void* diffuseAlbedoPtr, void* specularAlbedoPtr, void* specGuidePtr,
     void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
     int32_t width, int32_t height,
     const VPT_CameraData& cameraData,
     uint32_t lightCount, uint32_t samplesPerPixel)
 {
     if (!s_PathReady || !outputPtr || !gbuf0Ptr || !gbuf1Ptr || !diffuseAlbedoPtr || !specularAlbedoPtr
-        || width <= 0 || height <= 0)
+        || !specGuidePtr || width <= 0 || height <= 0)
         return;
 
     // 暂停期间（C# 正在重建场景/销毁贴图）不碰 Unity 纹理
@@ -669,7 +673,7 @@ void VPTDispatch::PrepareDispatch(
     IUnityGraphicsVulkan* vulkan = VPT_GetUnityVulkan();
     VkDevice device = VPT_GetInstance().device;
 
-    // ── Access 5 Unity RenderTextures as VkImages (ObserveOnly: query handles only) ──
+    // ── Access 6 Unity RenderTextures as VkImages (ObserveOnly: query handles only) ──
     // 说明：AccessTexture 会进入 Unity 的纹理访问协议，若与渲染线程状态冲突会阻塞，
     // 是主线程最容易卡住的位置之一 —— 每一个都单独记阶段。
     VPTTrace::Stage("prepare:AccessTexture(output)");
@@ -682,6 +686,8 @@ void VPTDispatch::PrepareDispatch(
     if (!EnsureImageView(vulkan, device, diffuseAlbedoPtr,  3)) return;
     VPTTrace::Stage("prepare:AccessTexture(specularAlbedo)");
     if (!EnsureImageView(vulkan, device, specularAlbedoPtr, 4)) return;
+    VPTTrace::Stage("prepare:AccessTexture(specGuide)");
+    if (!EnsureImageView(vulkan, device, specGuidePtr, 5)) return;
 
     // ── Access 4 Unity Texture2DArrays as VkImages (read) ──
     VPTTrace::Stage("prepare:AccessTextureArray(baseColor)");
@@ -695,24 +701,33 @@ void VPTDispatch::PrepareDispatch(
 
     VPTTrace::Stage("prepare:ubo+descriptors");
 
-    // ── 每 ~120 帧汇总一次 ImageView 重建次数 ──
-    // 正常情况下（句柄稳定）应该全是 0；若输出图那边每 120 帧 ≈ 120，说明 Unity 每帧
-    // 都在换 VkImage 句柄 —— 见 doc/bug追踪.md BUG-002 / BUG-003。
+    // ── 每 120 帧统计一次 ImageView 重建次数（只在有变化时输出）──
+    // 正常情况下（句柄稳定）全是 0，此时完全不写日志；若输出图那边每 120 帧 ≈ 120，
+    // 说明 Unity 每帧都在换 VkImage 句柄 —— 见 doc/bug追踪.md BUG-002 / BUG-003。
     if (++s_ViewStatsFrame >= 120)
     {
         s_ViewStatsFrame = 0;
-        VPTTrace::Line("view recreate /120 frames: out=%u,%u,%u,%u,%u texArray=%u,%u,%u,%u "
-                       "| ptrChanged out=%u,%u,%u,%u,%u tex=%u,%u,%u,%u "
-                       "| queryInterval out=%u tex=%u",
-                       s_ViewRecreateCount[0], s_ViewRecreateCount[1], s_ViewRecreateCount[2],
-                       s_ViewRecreateCount[3], s_ViewRecreateCount[4],
-                       s_TexViewRecreateCount[0], s_TexViewRecreateCount[1],
-                       s_TexViewRecreateCount[2], s_TexViewRecreateCount[3],
-                       s_PtrChangeCount[0], s_PtrChangeCount[1], s_PtrChangeCount[2],
-                       s_PtrChangeCount[3], s_PtrChangeCount[4],
-                       s_TexPtrChangeCount[0], s_TexPtrChangeCount[1],
-                       s_TexPtrChangeCount[2], s_TexPtrChangeCount[3],
-                       s_OutThrottle[0].interval, s_TexThrottle[0].interval);
+
+        // 稳态（句柄稳定）下这些计数全是 0 → 一行都不写。
+        // 只有真的发生 ImageView 重建 / 指针变化才输出（异常态，每 2 s 一行可接受）。
+        uint32_t anyChange = 0;
+        for (int i = 0; i < 6; i++) anyChange += s_ViewRecreateCount[i] + s_PtrChangeCount[i];
+        for (int i = 0; i < 4; i++) anyChange += s_TexViewRecreateCount[i] + s_TexPtrChangeCount[i];
+        if (anyChange != 0)
+        {
+            VPTTrace::Line("view recreate /120 frames: out=%u,%u,%u,%u,%u,%u texArray=%u,%u,%u,%u "
+                           "| ptrChanged out=%u,%u,%u,%u,%u,%u tex=%u,%u,%u,%u "
+                           "| queryInterval out=%u tex=%u",
+                           s_ViewRecreateCount[0], s_ViewRecreateCount[1], s_ViewRecreateCount[2],
+                           s_ViewRecreateCount[3], s_ViewRecreateCount[4], s_ViewRecreateCount[5],
+                           s_TexViewRecreateCount[0], s_TexViewRecreateCount[1],
+                           s_TexViewRecreateCount[2], s_TexViewRecreateCount[3],
+                           s_PtrChangeCount[0], s_PtrChangeCount[1], s_PtrChangeCount[2],
+                           s_PtrChangeCount[3], s_PtrChangeCount[4], s_PtrChangeCount[5],
+                           s_TexPtrChangeCount[0], s_TexPtrChangeCount[1],
+                           s_TexPtrChangeCount[2], s_TexPtrChangeCount[3],
+                           s_OutThrottle[0].interval, s_TexThrottle[0].interval);
+        }
 
         // 持续「每帧都换图」= 上游在每帧重建 RenderTexture。最常见的原因是
         // Assets/ 被反复触发刷新（例如 NGX 把日志写进 Assets/），于是 URP renderer
@@ -731,7 +746,7 @@ void VPTDispatch::PrepareDispatch(
                             "check for repeated AssetDatabase refresh / renderer reload.\n",
                     s_ViewHotWindows);
         }
-        for (int i = 0; i < 5; i++) { s_ViewRecreateCount[i] = 0; s_PtrChangeCount[i] = 0; }
+        for (int i = 0; i < 6; i++) { s_ViewRecreateCount[i] = 0; s_PtrChangeCount[i] = 0; }
         for (int i = 0; i < 4; i++) { s_TexViewRecreateCount[i] = 0; s_TexPtrChangeCount[i] = 0; }
     }
 
@@ -764,7 +779,7 @@ void VPTDispatch::PrepareDispatch(
         ubo.lightCount = 0;
     memcpy(s_PathUBOMapped, &ubo, sizeof(PathTraceCameraUBO));
 
-    // ── Update descriptor set: TLAS + 3 images + UBO + 5 SSBOs + 4 tex arrays ──
+    // ── Update descriptor set: TLAS + 6 images + UBO + 5 SSBOs + 4 tex arrays + env ──
     VkAccelerationStructureKHR tlas = VPTScene::GetTLAS();
     if (tlas == VK_NULL_HANDLE)
     {
@@ -776,8 +791,8 @@ void VPTDispatch::PrepareDispatch(
     asInfo.accelerationStructureCount = 1;
     asInfo.pAccelerationStructures = &tlas;
 
-    VkDescriptorImageInfo imgInfos[5] = {};
-    for (int i = 0; i < 5; i++)
+    VkDescriptorImageInfo imgInfos[6] = {};
+    for (int i = 0; i < 6; i++)
     {
         imgInfos[i].sampler     = VK_NULL_HANDLE;
         imgInfos[i].imageView   = s_OutputViews[i].view;
@@ -833,7 +848,7 @@ void VPTDispatch::PrepareDispatch(
     s_PathDescSet = s_PathDescSets[s_DescRingCursor % kDescRingSize];
     s_DescRingCursor++;
 
-    VkWriteDescriptorSet writes[18] = {};
+    VkWriteDescriptorSet writes[19] = {};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].pNext = &asInfo;
     writes[0].dstSet = s_PathDescSet;
@@ -841,7 +856,9 @@ void VPTDispatch::PrepareDispatch(
     writes[0].descriptorCount = 1;
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 
-    for (int i = 0; i < 5; i++)
+    // binding 1..3 是核心存储图（radiance / gbuffer0 / gbuffer1）；
+    // 4 是 UBO、5..9 是 SSBO、14/15 是 albedo、18 是 specGuide，各自单独写。
+    for (int i = 0; i < 3; i++)
     {
         writes[1 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[1 + i].dstSet = s_PathDescSet;
@@ -889,28 +906,38 @@ void VPTDispatch::PrepareDispatch(
         writes[14 + i].pImageInfo = &imgInfos[3 + i];
     }
 
-    // binding 16/17: HDR env texture + EnvAccel SSBO
+    // binding 18: RR specular guide（storage image）
+    // ⚠ 占用数组下标 16（而不是 18）：writes[] 必须保持「已填条目连续 0..writeCount-1」，
+    //   否则 env 占位资源缺失时 writeCount 会截到中间，把后面的条目漏掉/提交空句柄。
+    writes[16].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[16].dstSet = s_PathDescSet;
+    writes[16].dstBinding = 18;
+    writes[16].descriptorCount = 1;
+    writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[16].pImageInfo = &imgInfos[5];
+
+    // binding 16/17: HDR env texture + EnvAccel SSBO（占用数组下标 17/18）
     // 始终写入：未上传 HDR 时绑的是 VPTEnv 的占位资源；只有占位资源创建失败
-    // （句柄为 null）才退回只写 16 个，避免给 vkUpdateDescriptorSets 传空句柄。
-    uint32_t writeCount = 16;
+    // （句柄为 null）才退回只写前 17 个，避免给 vkUpdateDescriptorSets 传空句柄。
+    uint32_t writeCount = 17;
     if (envImgInfo.imageView != VK_NULL_HANDLE && envImgInfo.sampler != VK_NULL_HANDLE
         && envAccelInfo.buffer != VK_NULL_HANDLE)
     {
-        writes[16].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[16].dstSet = s_PathDescSet;
-        writes[16].dstBinding = 16;
-        writes[16].descriptorCount = 1;
-        writes[16].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[16].pImageInfo = &envImgInfo;
-
         writes[17].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[17].dstSet = s_PathDescSet;
-        writes[17].dstBinding = 17;
+        writes[17].dstBinding = 16;
         writes[17].descriptorCount = 1;
-        writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[17].pBufferInfo = &envAccelInfo;
+        writes[17].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[17].pImageInfo = &envImgInfo;
 
-        writeCount = 18;
+        writes[18].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[18].dstSet = s_PathDescSet;
+        writes[18].dstBinding = 17;
+        writes[18].descriptorCount = 1;
+        writes[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[18].pBufferInfo = &envAccelInfo;
+
+        writeCount = 19;
     }
     else
     {
@@ -1114,7 +1141,7 @@ void VPTDispatch::RenderCallback(int eventID)
         return;
     }
 
-    // ── Barrier 1: UBO host write → ray tracing 读 + 5 images → GENERAL ──
+    // ── Barrier 1: UBO host write → ray tracing 读 + 6 images → GENERAL ──
     // oldLayout 用插件自己跟踪的布局：每次 dispatch 结束都恢复成
     // SHADER_READ_ONLY_OPTIMAL，所以稳态下就是它；只有新句柄（RT 重建/换分辨率）
     // 才是 UNDEFINED（这时丢弃内容是正确的）。不再每帧丢弃上一帧内容 —— §10④。
@@ -1127,8 +1154,8 @@ void VPTDispatch::RenderCallback(int eventID)
     uboBarrier.offset = 0;
     uboBarrier.size = sizeof(PathTraceCameraUBO);
 
-    VkImageMemoryBarrier imgBarriers[5] = {};
-    for (int i = 0; i < 5; i++)
+    VkImageMemoryBarrier imgBarriers[6] = {};
+    for (int i = 0; i < 6; i++)
     {
         const VkImageLayout oldLayout = s_OutputViews[i].layout;
 
@@ -1157,9 +1184,9 @@ void VPTDispatch::RenderCallback(int eventID)
         // 与 Blit（fragment 采样），所以 srcStage 覆盖 compute + fragment。
         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
             | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        // 消费者从 compute 换成 ray tracing（raygen 里写 5 张图）
+        // 消费者从 compute 换成 ray tracing（raygen 里写 6 张图）
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-        0, 0, nullptr, 1, &uboBarrier, 5, imgBarriers);
+        0, 0, nullptr, 1, &uboBarrier, 6, imgBarriers);
 
     // ── Trace rays ──
     // 直接用像素尺寸（不再 (w+7)/8）；一次调用覆盖整张图，raygen 内部跑完整个弹射循环。
@@ -1180,8 +1207,8 @@ void VPTDispatch::RenderCallback(int eventID)
         (uint32_t)s_PendingWidth, (uint32_t)s_PendingHeight, 1u);
     VPTTrace::Stage("dispatch:trace-rays-recorded");
 
-    // ── Barrier 2: 5 images GENERAL → SHADER_READ_ONLY (for Unity compute reads) ──
-    for (int i = 0; i < 5; i++)
+    // ── Barrier 2: 6 images GENERAL → SHADER_READ_ONLY (for Unity compute reads) ──
+    for (int i = 0; i < 6; i++)
     {
         imgBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
         imgBarriers[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1194,10 +1221,10 @@ void VPTDispatch::RenderCallback(int eventID)
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 5, imgBarriers);
+        0, 0, nullptr, 0, nullptr, 6, imgBarriers);
 
-    // 记录本帧结束时这 5 张图的布局，供下一帧 barrier 的 oldLayout 使用
-    for (int i = 0; i < 5; i++)
+    // 记录本帧结束时这 6 张图的布局，供下一帧 barrier 的 oldLayout 使用
+    for (int i = 0; i < 6; i++)
         s_OutputViews[i].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     VPTGpuTimer::Mark(cmd);   // T4: 路径追踪 dispatch 结束
@@ -1225,7 +1252,7 @@ void VPTDispatch::DestroyPathTracePipeline(VkDevice device)
     if (hadAnything && !VPT_IsDeviceLost())
         VPT_CheckVk(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(DestroyPathTracePipeline)");
 
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < 6; i++)
     {
         if (s_OutputViews[i].view) { vkDestroyImageView(device, s_OutputViews[i].view, nullptr); s_OutputViews[i].view = VK_NULL_HANDLE; }
         s_OutputViews[i].image  = VK_NULL_HANDLE;

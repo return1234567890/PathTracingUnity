@@ -310,7 +310,7 @@ VPT_SetEnvironmentMap(const float* pixels, int32_t width, int32_t height)
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 VPT_PrepareDispatch(
     void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
-    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+    void* diffuseAlbedoPtr, void* specularAlbedoPtr, void* specGuidePtr,
     void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
     int32_t width, int32_t height,
     const VPT_CameraData* cameraData,
@@ -319,7 +319,7 @@ VPT_PrepareDispatch(
     VPTTrace::Beat();
     VPTTrace::Stage("VPT_PrepareDispatch");
     if (!VPT_IsInitialized() || !cameraData || !outputPtr || !gbuf0Ptr || !gbuf1Ptr
-        || !diffuseAlbedoPtr || !specularAlbedoPtr)
+        || !diffuseAlbedoPtr || !specularAlbedoPtr || !specGuidePtr)
     {
         VPTTrace::Line("VPT_PrepareDispatch: ignored (init=%d ptrs=%p/%p/%p)",
                        (int)VPT_IsInitialized(), outputPtr, gbuf0Ptr, gbuf1Ptr);
@@ -333,9 +333,8 @@ VPT_PrepareDispatch(
         VPTTrace::Line("VPT_PrepareDispatch: RT pipeline NOT ready (%s)", VPTDispatch::PathTraceError());
         return;
     }
-    VPTTrace::Line("prepare %dx%d", width, height);
     VPTDispatch::PrepareDispatch(outputPtr, gbuf0Ptr, gbuf1Ptr,
-        diffuseAlbedoPtr, specularAlbedoPtr,
+        diffuseAlbedoPtr, specularAlbedoPtr, specGuidePtr,
         baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
         width, height, *cameraData,
         (uint32_t)lightCount, (uint32_t)samplesPerPixel);
@@ -354,8 +353,8 @@ VPT_RenderCallback(int32_t eventID)
         return;
     }
     VPTTrace::Beat();
-    // 每帧只留一行心跳：卡住时最后一行就是"进到哪一帧的哪个事件"
-    VPTTrace::Line("frame %u: PT event", VPTTrace::NextFrame());
+    // 只推进帧号（给看门狗/日志行前缀用），不写日志：这里是每帧路径。
+    VPTTrace::NextFrame();
     VPTDispatch::RenderCallback(eventID);
     VPTTrace::Stage("idle");
 }
@@ -417,7 +416,7 @@ extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 VPT_DLSS_PrepareRRDispatch(
     void* colorLowPtr, void* motionLowPtr, void* linearDepthPtr, void* outputHighPtr,
     void* normalRoughPtr,
-    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+    void* diffuseAlbedoPtr, void* specularAlbedoPtr, void* specGuidePtr,
     int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
     float jitterX, float jitterY, int32_t reset,
     const float* viewMatrix, const float* projMatrix)
@@ -425,7 +424,7 @@ VPT_DLSS_PrepareRRDispatch(
     VPTTrace::Beat();
     VPTTrace::Stage("VPT_DLSS_PrepareRRDispatch");
     VPT_DLSS_PrepareRRDispatch_Internal(colorLowPtr, motionLowPtr, linearDepthPtr, outputHighPtr,
-        normalRoughPtr, diffuseAlbedoPtr, specularAlbedoPtr,
+        normalRoughPtr, diffuseAlbedoPtr, specularAlbedoPtr, specGuidePtr,
         renderW, renderH, outputW, outputH,
         jitterX, jitterY, reset, viewMatrix, projMatrix);
     VPTTrace::Stage("idle");

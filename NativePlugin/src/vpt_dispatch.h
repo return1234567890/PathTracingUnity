@@ -15,7 +15,7 @@ namespace VPTDispatch {
     // 早期的直连路径 DispatchPathTrace（自建 cb + vkQueueSubmit + vkQueueWaitIdle）
     // 已整体删除，导出符号 VPT_DispatchPathTrace 一并移除（§7.6 / §10⑦）。
 
-    /// Initialize PathTrace RT pipeline (18 bindings / 7 stages / 5 groups) + SBT
+    /// Initialize PathTrace RT pipeline (19 bindings / 7 stages / 5 groups) + SBT
     void InitPathTracePipeline(VkDevice device, VkPhysicalDevice gpu);
 
     /// Cleanup PathTrace pipeline resources (含 SBT，与 pipeline 同生共死)
@@ -42,9 +42,10 @@ namespace VPTDispatch {
     static constexpr int EVENT_PATHTRACE = 1;
 
     /// Phase 1: Prepare dispatch parameters (call from C# before IssuePluginEvent)
+    /// specGuidePtr: RR specular guide（rgba16f，xyz=镜面射线方向, w=命中距离）
     void PrepareDispatch(
         void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
-        void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+        void* diffuseAlbedoPtr, void* specularAlbedoPtr, void* specGuidePtr,
         void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
         int32_t width, int32_t height,
         const VPT_CameraData& cameraData,

@@ -72,7 +72,7 @@ extern "C" {
     /// 访问 Unity 纹理、填充 UBO、更新描述符集，不提交命令缓冲
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_PrepareDispatch(
         void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
-        void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+        void* diffuseAlbedoPtr, void* specularAlbedoPtr, void* specGuidePtr,
         void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
         int32_t width, int32_t height,
         const VPT_CameraData* cameraData,
@@ -151,7 +151,7 @@ extern "C" {
     UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API VPT_DLSS_PrepareRRDispatch(
         void* colorLowPtr, void* motionLowPtr, void* linearDepthPtr, void* outputHighPtr,
         void* normalRoughPtr,
-        void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+        void* diffuseAlbedoPtr, void* specularAlbedoPtr, void* specGuidePtr,
         int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
         float jitterX, float jitterY, int32_t reset,
         const float* viewMatrix, const float* projMatrix);

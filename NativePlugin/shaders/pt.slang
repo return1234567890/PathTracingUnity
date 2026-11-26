@@ -66,6 +66,14 @@ void rgenMain()
 
     float3 finalRadiance = float3(0.0f);
 
+    // ── DLSS RR specular guide：先把本像素写成「无镜面信息」──
+    // 下面只有在 depth 0 真的选中镜面反射 lobe 时才会覆盖它。
+    // 写 0 而不是留旧值：guide 每帧被 RR 消费，残留上一帧的距离会让 RR 算错虚拟命中点。
+    {
+        uint2 guideCoord = storeCoordFromPixel(pixel, h);
+        specGuideImg[guideCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
     for (uint s = 0u; s < spp; s++)
     {
         float3 rayOrigin    = origin;
@@ -78,6 +86,12 @@ void rgenMain()
         // 单介质假设：只支持一层玻璃（教堂窗）；嵌套玻璃/玻璃内水不支持。
         bool   isInsideVolume = false;
         float3 volumeSigma    = float3(0.0f);
+
+        // ── RR specular guide 状态（每个 sample 独立）──
+        // depth 0 选中【镜面反射】lobe 时置位并把方向存下来；
+        // depth 1 拿到这条射线的命中距离后，两者一起写进 specGuideImg。
+        bool   specPending = false;
+        float3 specDir     = float3(0.0f);
 
         for (int depth = 0; depth < maxDepth; depth++)
         {
@@ -100,6 +114,18 @@ void rgenMain()
             TraceRay(tlas, RAY_FLAG_NONE, 0xFF, 0, 0, 0, ray, hitPayload);
 
             bool committed = (hitPayload.hitT != INFINITE_T);
+
+            // ── DLSS RR specular guide 写出 ──
+            // 走到这里时 depth>=1，说明这一跳的射线方向是 depth-1 末尾选出来的。
+            // 若那次选中的是镜面反射 lobe，hitT 就是「从主表面沿镜面方向到命中点」的距离。
+            //   · 只在 s==0 写（与 G-buffer 一致）：spp>1 时 guide 只反映第 0 个 sample；
+            //   · miss 写 0：没有可连接的几何，让 RR 退回主表面重投影。
+            // ⚠ maxDepth==1 时循环到不了 depth 1 → guide 恒为 0（等于没接）。
+            if (depth == 1 && s == 0u && specPending)
+            {
+                uint2 guideCoord = storeCoordFromPixel(pixel, h);
+                specGuideImg[guideCoord] = float4(specDir, committed ? hitPayload.hitT : 0.0f);
+            }
 
             // ── Miss: HDR 环境贴图查找（或常数 ambient fallback）──
             if (!committed)
@@ -295,6 +321,8 @@ void rgenMain()
             float3 newDir;
             float  pdf;
             float3 bsdf;
+            // 本次选中的 lobe；默认漫反射（透射分支不会覆盖它，因此不会误写 guide）
+            uint   bsdfLobe = LOBE_DIFFUSE_REFLECTION;
 
             if (isTransparent)
             {
@@ -315,12 +343,21 @@ void rgenMain()
                 }
                 else
                 {
-                    bsdf = sampleBSDF(mat, N, V, seed, newDir, pdf);
+                    bsdf = sampleBSDF(mat, N, V, seed, newDir, pdf, bsdfLobe);
                 }
             }
             else
             {
-                bsdf = sampleBSDF(mat, N, V, seed, newDir, pdf);
+                bsdf = sampleBSDF(mat, N, V, seed, newDir, pdf, bsdfLobe);
+            }
+
+            // ── RR specular guide：depth 0 的镜面反射 lobe → 下一跳的距离就是 guide ──
+            // 透射材质（玻璃）整体排除：折射方向不是「镜面反射方向」，喂给 RR 会被
+            // 当成镜面反射去反推虚拟点 → 反射错位。这类像素保持 0（= 退回主表面重投影）。
+            if (depth == 0 && !isTransparent && bsdfLobe == LOBE_SPECULAR_REFLECTION)
+            {
+                specPending = true;
+                specDir     = newDir;
             }
 
             float NdotL_new = max(dot(N, newDir), 0.0f);

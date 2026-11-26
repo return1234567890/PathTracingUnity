@@ -512,9 +512,9 @@ int main(int argc, char** argv)
     if (res != VK_SUCCESS) { printf("  !! %s（多半是 SPIR-V 版本高于设备 Vulkan 版本）\n", VkStr(res)); return 1; }
 
     // ═══════════ 5. Descriptor set layout（18 binding）═══════════
-    printf("\n[5] Descriptor set layout (18 bindings)\n");
-    VkDescriptorSetLayoutBinding bindings[18] = {};
-    for (int i = 0; i < 18; i++)
+    printf("\n[5] Descriptor set layout (19 bindings)\n");
+    VkDescriptorSetLayoutBinding bindings[19] = {};
+    for (int i = 0; i < 19; i++)
     {
         bindings[i].binding = (uint32_t)i;
         bindings[i].descriptorCount = 1;
@@ -531,13 +531,14 @@ int main(int argc, char** argv)
     bindings[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[16].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;   // RR specular guide
 
     VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    dslci.bindingCount = 18;
+    dslci.bindingCount = 19;
     dslci.pBindings = bindings;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     res = vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl);
-    Check(res == VK_SUCCESS, "vkCreateDescriptorSetLayout(18 RT-stage bindings)");
+    Check(res == VK_SUCCESS, "vkCreateDescriptorSetLayout(19 RT-stage bindings)");
     if (res != VK_SUCCESS) return 1;
 
     VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -690,7 +691,8 @@ int main(int argc, char** argv)
             VPT_Material* m = static_cast<VPT_Material*>(matBuf.mapped);
             memset(m, 0, sizeof(VPT_Material));
             m[0].albedo[0] = 0.8f; m[0].albedo[1] = 0.2f; m[0].albedo[2] = 0.1f; m[0].albedo[3] = 1.0f;
-            m[0].metallic = 0.0f; m[0].roughness = 0.5f; m[0].ior = 1.5f;
+            // metallic=1 ⇒ pd=0 ⇒ 恒定走镜面 lobe：让 spec guide 通路确定性被覆盖（否则介质只有 ~4% 概率）
+            m[0].metallic = 1.0f; m[0].roughness = 0.5f; m[0].ior = 1.5f;
             m[0].flags = 128u;        // MAT_ALPHA_TEST：让 rahitMain 真正被调用
             m[0].alphaCutoff = 0.5f;
             m[0].baseTexID = 0xFFFFFFFFu; m[0].metalRoughTexID = 0xFFFFFFFFu;
@@ -744,12 +746,13 @@ int main(int argc, char** argv)
         Img gbuf1    = CreateImage(dev, gpu, VK_FORMAT_R16G16B16A16_SFLOAT, W, H, 1, false);
         Img albDiff  = CreateImage(dev, gpu, VK_FORMAT_R16G16B16A16_SFLOAT, W, H, 1, false);
         Img albSpec  = CreateImage(dev, gpu, VK_FORMAT_R16G16B16A16_SFLOAT, W, H, 1, false);
+        Img specGuide = CreateImage(dev, gpu, VK_FORMAT_R16G16B16A16_SFLOAT, W, H, 1, false);
         Img tex0 = CreateImage(dev, gpu, VK_FORMAT_R8G8B8A8_UNORM, 2, 2, 1, true);
         Img tex1 = CreateImage(dev, gpu, VK_FORMAT_R8G8B8A8_UNORM, 2, 2, 1, true);
         Img tex2 = CreateImage(dev, gpu, VK_FORMAT_R8G8B8A8_UNORM, 2, 2, 1, true);
         Img tex3 = CreateImage(dev, gpu, VK_FORMAT_R8G8B8A8_UNORM, 2, 2, 1, true);
         Img envImg = CreateImage(dev, gpu, VK_FORMAT_R16G16B16A16_SFLOAT, 2, 2, 1, true);
-        Check(outImg.view && gbuf0.view && gbuf1.view && albDiff.view && albSpec.view, "output images created");
+        Check(outImg.view && gbuf0.view && gbuf1.view && albDiff.view && albSpec.view && specGuide.view, "output images created");
         Check(tex0.view && tex1.view && tex2.view && tex3.view && envImg.view, "texture array + env images created");
 
         VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -918,9 +921,9 @@ int main(int argc, char** argv)
                              0, 1, &asBarrier, 0, nullptr, 0, nullptr);
 
         // 5 张输出图 → GENERAL
-        VkImageMemoryBarrier imgB[5]{};
-        Img* outs[5] = { &outImg, &gbuf0, &gbuf1, &albDiff, &albSpec };
-        for (int i = 0; i < 5; i++)
+        VkImageMemoryBarrier imgB[6]{};
+        Img* outs[6] = { &outImg, &gbuf0, &gbuf1, &albDiff, &albSpec, &specGuide };
+        for (int i = 0; i < 6; i++)
         {
             imgB[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             imgB[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -933,7 +936,7 @@ int main(int argc, char** argv)
         }
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                             0, 0, nullptr, 0, nullptr, 5, imgB);
+                             0, 0, nullptr, 0, nullptr, 6, imgB);
 
         // 纹理数组 + env → SHADER_READ_ONLY
         VkImageMemoryBarrier texB[5]{};
@@ -956,7 +959,7 @@ int main(int argc, char** argv)
         // ── 描述符 ──
         VkDescriptorPoolSize poolSizes[5] = {
             { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
-            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 },
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 },
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 },
             { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 },
@@ -981,8 +984,8 @@ int main(int argc, char** argv)
         asWrite.accelerationStructureCount = 1;
         asWrite.pAccelerationStructures = &tlasAs;
 
-        VkDescriptorImageInfo imgInfos[5];
-        for (int i = 0; i < 5; i++)
+        VkDescriptorImageInfo imgInfos[6];
+        for (int i = 0; i < 6; i++)
         {
             imgInfos[i] = { VK_NULL_HANDLE, outs[i]->view, VK_IMAGE_LAYOUT_GENERAL };
         }
@@ -995,8 +998,8 @@ int main(int argc, char** argv)
         VkDescriptorImageInfo envInfo{ sampler, envImg.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorBufferInfo envAccelInfo{ envAccelBuf.buffer, 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet writes[18] = {};
-        for (int i = 0; i < 18; i++)
+        VkWriteDescriptorSet writes[19] = {};
+        for (int i = 0; i < 19; i++)
         {
             writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[i].dstSet = ds;
@@ -1026,14 +1029,15 @@ int main(int argc, char** argv)
         writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[15].pImageInfo = &imgInfos[4];
         writes[16].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; writes[16].pImageInfo = &envInfo;
         writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[17].pBufferInfo = &envAccelInfo;
-        vkUpdateDescriptorSets(dev, 18, writes, 0, nullptr);
+        writes[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[18].pImageInfo = &imgInfos[5];
+        vkUpdateDescriptorSets(dev, 19, writes, 0, nullptr);
 
         // ── traceRays ──
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeLayout, 0, 1, &ds, 0, nullptr);
         pfnTraceRays(cb, &raygenRegion, &missRegion, &hitRegion, &callableRegion, W, H, 1);
 
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < 6; i++)
         {
             imgB[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
             imgB[i].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -1042,12 +1046,13 @@ int main(int argc, char** argv)
         }
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             0, 0, nullptr, 0, nullptr, 5, imgB);
+                             0, 0, nullptr, 0, nullptr, 6, imgB);
 
         // 回读 outputImg（rgba16f）+ gbufferPosDepth（rgba32f，用来判断到底有没有命中）
         const VkDeviceSize outBytes  = W * H * 8;
         const VkDeviceSize gbuf0Bytes = W * H * 16;
-        Buf readback = CreateBuffer(dev, gpu, outBytes + gbuf0Bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        const VkDeviceSize specBytes  = W * H * 8;
+        Buf readback = CreateBuffer(dev, gpu, outBytes + gbuf0Bytes + specBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false);
         VkBufferImageCopy region{};
         region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
@@ -1066,6 +1071,20 @@ int main(int argc, char** argv)
         region2.imageExtent = { W, H, 1 };
         region2.bufferOffset = outBytes;
         vkCmdCopyImageToBuffer(cb, gbuf0.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &region2);
+
+        // 回读 specGuide（rgba16f：xyz=镜面射线方向, w=命中距离）
+        imgB[5].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        imgB[5].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        imgB[5].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        imgB[5].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &imgB[5]);
+        VkBufferImageCopy region3{};
+        region3.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region3.imageExtent = { W, H, 1 };
+        region3.bufferOffset = outBytes + gbuf0Bytes;
+        vkCmdCopyImageToBuffer(cb, specGuide.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &region3);
 
         VkMemoryBarrier finalBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
         finalBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1129,6 +1148,43 @@ int main(int argc, char** argv)
             printf("  gbufferPosDepth[0] = (%.3f %.3f %.3f, hitT=%.3f)  anyHit=%d\n",
                    g0[0], g0[1], g0[2], g0[3], (int)anyHitPixel);
             Check(anyHitPixel, "at least one pixel recorded a hit in gbufferPosDepth");
+        }
+
+        // specGuide：xyz = 镜面射线方向（单位向量或 0），w = 命中距离（>=0）。
+        // 本场景只有一个三角形，镜面射线从三角形反射出去必然 miss → 命中距离应为 0；
+        // 判据因此只检查「有限 / 非零方向是单位长度 / 距离非负」，不假设一定有值。
+        {
+            // ⚠ 这张图是 RGBA16F：必须按 uint16 读再用 halfToFloat 解码（不能当 float32 读）
+            const uint16_t* sg = reinterpret_cast<const uint16_t*>(
+                static_cast<const uint8_t*>(readback.mapped) + outBytes + gbuf0Bytes);
+            int  dirPixels = 0, badDir = 0, badDist = 0, nonzeroDist = 0;
+            bool nonFinite = false;
+            for (uint32_t i = 0; i < W * H; i++)
+            {
+                float x = halfToFloat(sg[i * 4 + 0]);
+                float y = halfToFloat(sg[i * 4 + 1]);
+                float z = halfToFloat(sg[i * 4 + 2]);
+                float d = halfToFloat(sg[i * 4 + 3]);
+                if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(d))
+                    nonFinite = true;
+                float len = std::sqrt(x * x + y * y + z * z);
+                if (len > 1e-3f)
+                {
+                    dirPixels++;
+                    if (std::fabs(len - 1.0f) > 2e-2f) badDir++;
+                }
+                if (d < 0.0f) badDist++;
+                if (d > 1e-6f) nonzeroDist++;
+            }
+            printf("  specGuide: dirPixels=%d/%u badDir=%d badDist=%d nonzeroDist=%d\n",
+                   dirPixels, W * H, badDir, badDist, nonzeroDist);
+            Check(!nonFinite, "specGuide is finite (no NaN/Inf)");
+            Check(badDir == 0, "specGuide direction is unit-length when nonzero");
+            Check(badDist == 0, "specGuide distance is non-negative");
+            // 材质 metallic=1 ⇒ pd=0 ⇒ 每个命中像素都走镜面 lobe ⇒ 必须有方向写出
+            Check(dirPixels > 0, "specGuide 有方向写出（镜面 lobe 路径打通）");
+            // 本场景只有 1 个三角形：镜面射线反射出去必 miss ⇒ 距离应为 0
+            Check(nonzeroDist == 0, "specGuide 距离在 miss 时为 0（本场景无二次命中）");
         }
 
         Check(!anyNonFinite, "radiance is finite (no NaN/Inf)");
