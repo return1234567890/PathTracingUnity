@@ -99,6 +99,8 @@ Tools\rt_probe\build\bin\Release\rt_probe.exe NativePlugin\shaders\pt.spv --trac
 - `doc/PT管线与Unity物理系统调研.md` — PT 与 Unity 物理（碰撞体）的关系与改造方案
 - `doc/PT体积雾接入可行性调研.md` — 体积雾接入 PT 的四种形态、解析高度雾/自由程采样的落地方案、成本与 RR 风险
 - `doc/程序化几何体加速结构接入Terrain可行性调研.md` — 地形以 AABB 程序化几何接入 PT 的可行性、实测数据与落地路线（探针见 `Tools/vk_terrain_probe/`）
+- `doc/ReSTIR_GI_PT接入可行性调研.md` — 在 PT + DLSS RR 管线上接 ReSTIR GI / ReSTIR PT 的接入形态、成本、显存、与 RR 的相关性冲突，以及先量基线再决策的分阶段路线（调研，未实施）
+- `doc/RR_specular_guide实现记录.md` — RR specular guide（镜面射线方向 + 命中距离）的接入实现、pd/镜面 lobe 的坑与验收清单
 
 ## 声明
 

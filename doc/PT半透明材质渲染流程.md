@@ -1,5 +1,13 @@
 # PT 半透明材质渲染流程（薄片 / 体积）
 
+> ⚠ **后端已切换（2026-11-21）**：PT 已从 `VK_KHR_ray_query` + compute 整体切到
+> `VK_KHR_ray_tracing_pipeline`。本文里 `pathtrace.glsl` 的 **candidate 循环**（主光线 alpha 丢弃、
+> 阴影透射累积）现在分别由 `pt.slang` 的 **`rahitMain`（any-hit）** 与
+> **`rahitShadow`（any-hit + payload 携带体积状态）** 承担；**公式、体积状态机、材质语义均未变**。
+> 逐条映射见 [RT_pipeline整体切换实现方案](RT_pipeline整体切换实现方案.md) §2.2 / §10.2。
+> 阅读时把 `traceShadowTransmission()` 当成 `traceShadowTransmission()`（现在是发一次 group 1 的
+> TraceRay），把"confirm/continue"当成"Accept/IgnoreHit"即可。
+
 > **文档定位**：把当前 Vulkan 路径追踪里「半透明材质」从 Unity 材质资产到 compute shader 出图的完整链路梳理一遍，重点是两条分支——**薄片（thin-walled）** 与 **体积（volume）** 的差异、共同点、坑。
 >
 > **代码基线**：`f63fc40`（体积玻璃 / 两阶段 dispatch 合入）、`613b0b4`（alpha 采样与阴影透射修复），
@@ -49,7 +57,7 @@
 | 体积吸收 | 无 | `σt = -ln(tint·attenuationColor) / attenuationDistance`，逐段 `exp(-d·σt)` |
 | 内外状态 | 不追踪 | `isInsideVolume` + `volumeSigma` 状态机 |
 | 射线偏移 | `EPS_OFFSET = 5mm` | `EPS_VOLUME = 0.1mm` |
-| 掠射角变暗 | 不会（缺 `(1-F)` 因子） | 会（`(1-F)` 进权重） |
+| 掠射角变暗 | 会（Fresnel 靠 lobe 选择概率生效，不在 bsdf 里） | 会（`(1-F)` 显式乘在 bsdf 上） |
 | 典型用途 | 单面/薄壳窗玻璃、叶子、纸、纱 | 12mm 教堂彩色玻璃、玻璃块、有色透光实体 |
 
 ---
@@ -238,6 +246,8 @@ w.x  = remain * (1 - diffuseTransmission);        // 漫反射
 
 调 alpha（→ transmission）会同时改变"透射 vs 反射"的比例：alpha=0.5 的玻璃有一半采样走漫反射 → 观感偏乳白/毛玻璃。这是当前唯一的"毛玻璃"控制手段。
 
+注意 `w.z` 里的 `(1-fr)` 就是薄片的 Fresnel 透射损失：薄片的 `bsdf` 故意不乘它，靠这个选择概率生效（推导见 §4.3，结论见 §7-③）。
+
 ### 3.3 NEE 结构（灯 / 环境 50-50 MIS，`pathtrace.glsl:1044-1130`）
 
 ```glsl
@@ -391,9 +401,12 @@ throughput *= tint · G · |N · k2|          （pdf 完全抵消）
 
 数值特征：
 
-- **没有 `(1 - Fresnel)`**：掠射角不会像真实玻璃那样变暗（薄片近似）；
+- `bsdf` 里**没有** `(1 - Fresnel)`，但 Fresnel 并没有丢：该 lobe 的选择概率
+  `w.z = (1-metallic)(1-fr)·transmission` 已含 `1-fr`，而 pdf 不除这个概率 → **选择概率充当能量权重**。
+  期望贡献 ≈ `(1-F)·tint·G·|N·k2|`，所以薄片在掠射角**同样会变暗**（`fr→1` 时透射样本几乎不再被选中）。
 - `G` 是 Smith 阴影项（≤1），提供掠射角下的轻微能量衰减；
-- `D` 与 `pdf` 抵消，所以**粗糙度只通过 `G` 和采样分布影响**，不改变总量级。
+- `D` 与 `pdf` 抵消，所以**粗糙度只通过 `G` 和采样分布影响**，不改变总量级；
+- 透射侧"bsdf 不乘权重"是刻意的；反射侧会被选择概率再乘一次 `1-w.z`，与 `sampleBSDF` 自带的 `F` 重复计数 → 正视时反射偏弱，见 §7-③。
 
 ### 4.4 阴影：double-tint（§3.4 的薄片列）
 
@@ -582,8 +595,8 @@ if (isVolume) {
 | 侧向校验 | 跳过 | 必须（否则状态错乱） |
 | pdf | 反射 PDF `D·G/(4·nk1)` | 折射 PDF `D·cosH·G·k1h·k2h/(nk1·cosH·tmp²)` |
 | bsdf | `tint·G·pdf` | `G·(1-F)·pdf`（tint 中性） |
-| 间接权重 | `tint·G·|N·k2|` | `G·(1-F)·|N·k2|` |
-| 掠射变暗 | 否 | 是 |
+| 间接权重（未乘 lobe 概率） | `tint·G·|N·k2|` | `G·(1-F)·|N·k2|` |
+| 掠射变暗 | 是（靠 lobe 选择概率） | 是（靠 bsdf 里的 `1-F`） |
 | 段吸收 | 无 | `exp(-d·σt)` |
 | 状态 | 无 | `isInsideVolume` + `volumeSigma` |
 | 偏移 | 5mm | 0.1mm |
@@ -623,9 +636,9 @@ if (isVolume) {
 
 | # | 近似 | 影响 | 备注 |
 |---|---|---|---|
-| ① | 薄片透射缺 `(1-F)` | 掠射角不比正视暗，玻璃边缘不"发亮/变实" | 体积分支有 |
+| ① | 薄片是"零厚度"模型：无 Snell 偏折、无折射位移、无 TIR | 玻璃没有放大/位移/边缘色散，视觉上贴合几何（厚度感为零） | 这是 thin-walled 的定义（glTF `KHR_materials_transmission` 同）；要折射位移请走体积分支 |
 | ② | `btdfEval`（NEE）分母用 `NdotV·NdotH` | 与采样侧权重不完全一致，高光/透射的 NEE 能量略有偏差 | 采样侧是 `k1h·k2h/(nk1·cosH·tmp²)` |
-| ③ | lobe 选择概率不进 pdf | 选择概率被当作能量权重使用；反射两 lobe 与透射两 lobe 的归一化不完全统一 | 观感基本正常，严格 MIS 需重算权重 |
+| ③ | lobe 选择概率不进 pdf（直接被当作能量权重） | 透射侧：等价于乘 `(1-F)·transmission`，自洽，所以薄片掠射角**也会**变暗；反射侧：`1-w.z` 会与 `sampleBSDF` 自带的 `F` 再乘一次 → 正视时反射偏弱（按代码推导，未实测量化） | 透射能量基本正确；要严格物理需把权重显式乘进 bsdf 并归一化 pdf |
 | ④ | 阴影粗糙度衰减 `mix(0.65, 1, 1-r²)` | 经验值，非物理 | 用于模拟粗糙表面的散射损失 |
 | ⑤ | 阴影 Fresnel 用几何法线、不看 normal map | 法线贴图不影响彩色阴影的 Fresnel 项 | 有意简化（阴影遍历不采样 normal map） |
 | ⑥ | 无漫透射 | `diffuseTransmission` 恒 0，纸张/布料近似不可用 | 结构体已预留 |

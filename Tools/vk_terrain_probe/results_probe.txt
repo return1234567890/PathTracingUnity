@@ -1,0 +1,41 @@
+[gpu] Intel(R) Iris(R) Xe Graphics (vendor=0x8086) AS=0 RQ=0
+[gpu] NVIDIA GeForce RTX 3070 Ti Laptop GPU (vendor=0x10de) AS=1 RQ=1
+[gpu] using NVIDIA GeForce RTX 3070 Ti Laptop GPU driver 2585198592
+[ext] ray_flags_primitive_culling = NO
+[feat] accelerationStructure=1 rayQuery=1 bufferDeviceAddress=1
+[data] heightmap 65x65, 16 patches (AABB primitives)
+[blas] AABB prims=16 asSize=0.002 MB scratch=0.004 MB
+[blas] TRI prims=2 asSize=0.002 MB
+[tlas] instances=3 asSize=0.002 MB
+
+[result] 8 rays (cand, aabbCand, triCand, committedType, instanceId, primIndex, t, normalY)
+  ray0: cand=1 aabb=1 tri=0 type=GENERATED inst=0 prim=10 t=40.0000 nY=1.0000 gen=1 genT=40.0000 candPrim=10 candT=33.9900
+          dbg: tEnter=33.9900 tExit=40.0100 tPrev=40.0000 reason=0
+  ray1: cand=1 aabb=1 tri=0 type=GENERATED inst=0 prim=10 t=45.9468 nY=1.0000 gen=1 genT=45.9468 candPrim=10 candT=41.3521
+          dbg: tEnter=41.3521 tExit=45.9621 tPrev=45.9468 reason=0
+  ray2: cand=0 aabb=0 tri=0 type=NONE inst=0 prim=0 t=200.0000 nY=0.0000 gen=0 genT=-1.0000 candPrim=4294967295 candT=-3.0000
+          dbg: tEnter=-3.0000 tExit=-3.0000 tPrev=-3.0000 reason=-3
+  ray3: cand=0 aabb=0 tri=0 type=TRIANGLE inst=2 prim=0 t=40.0000 nY=0.0000 gen=0 genT=-1.0000 candPrim=4294967295 candT=-3.0000
+          dbg: tEnter=-3.0000 tExit=-3.0000 tPrev=-3.0000 reason=-3
+  ray4: cand=0 aabb=0 tri=0 type=TRIANGLE inst=2 prim=0 t=40.0000 nY=0.0000 gen=0 genT=-1.0000 candPrim=4294967295 candT=-3.0000
+          dbg: tEnter=-3.0000 tExit=-3.0000 tPrev=-3.0000 reason=-3
+  ray5: cand=1 aabb=1 tri=0 type=GENERATED inst=0 prim=15 t=24.6402 nY=0.6860 gen=1 genT=24.6402 candPrim=15 candT=23.9900
+          dbg: tEnter=23.9900 tExit=30.0100 tPrev=24.6402 reason=0
+  ray6: cand=1 aabb=1 tri=0 type=GENERATED inst=1 prim=10 t=40.0000 nY=1.0000 gen=1 genT=40.0000 candPrim=10 candT=33.9900
+          dbg: tEnter=33.9900 tExit=40.0100 tPrev=40.0000 reason=0
+  ray7: cand=0 aabb=0 tri=0 type=NONE inst=0 prim=0 t=200.0000 nY=0.0000 gen=0 genT=-1.0000 candPrim=4294967295 candT=-3.0000
+          dbg: tEnter=-3.0000 tExit=-3.0000 tPrev=-3.0000 reason=-3
+
+[checks]
+  ray0 vertical hit flat terrain    PASS  (expect t~40, type=GENERATED)
+  ray0 AABB candidate delivered     PASS  (expect >=1 AABB candidate)
+  ray0 normal.y ~ 1 on flat         PASS  (expect nY~1)
+  ray1 oblique hit terrain          PASS  (expect type=GENERATED)
+  ray2 upward ray miss              PASS  (expect type=NONE)
+  ray3 triangle quad hit            PASS  (expect type=TRIANGLE inst=2 t=40)
+  ray4 terminate-on-first-hit       PASS  (expect type=TRIANGLE)
+  ray5 bump hit with slope normal   PASS  (expect type=GENERATED, nY<0.99)
+  ray6 FORCE_OPAQUE AABB instance   PASS  (expect type=GENERATED inst=1)
+  ray7 ray to empty space           PASS  (expect type=NONE)
+
+ALL CHECKS PASSED
