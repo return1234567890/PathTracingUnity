@@ -29,11 +29,14 @@ public static class NativeBridge
     {
         Success = 0,
         VulkanDeviceNotFound = 1,
-        RayQueryNotSupported = 2,
+        /// <summary>缺 VK_KHR_ray_tracing_pipeline / rayTracingPipeline feature / AS 扩展</summary>
+        RayTracingPipelineNotSupported = 2,
+        /// <summary>RT pipeline 创建失败（SPIR-V 被拒 / 链接失败 / SBT 创建失败）</summary>
+        PipelineCreateFailed = 3,
     }
 
     /// <summary>初始化 Native 路径追踪插件</summary>
-    /// <returns>0=成功, 1=Vulkan设备获取失败, 2=RT Core扩展不支持</returns>
+    /// <returns>0=成功, 1=Vulkan设备获取失败, 2=RT能力不支持, 3=RT pipeline创建失败</returns>
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern int VPT_Initialize();
 
@@ -51,10 +54,10 @@ public static class NativeBridge
         _initSucceeded = false;
     }
 
-    /// <summary>查询设备是否支持 VK_KHR_ray_query</summary>
+    /// <summary>查询设备是否支持 RT pipeline（VK_KHR_ray_tracing_pipeline）</summary>
     /// <returns>1=支持, 0=不支持</returns>
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
-    public static extern int VPT_QueryRayQuerySupport();
+    public static extern int VPT_QueryRayTracingPipelineSupport();
 
     /// <summary>更新场景数据</summary>
     /// <param name="sceneUpdate">指向 VPT_SceneUpdate 结构的指针</param>
@@ -123,7 +126,7 @@ public static class NativeBridge
     [DllImport(PluginPath, CallingConvention = CallingConvention.StdCall)]
     public static extern void VPT_PrepareDispatch(
         IntPtr outputPtr, IntPtr gbuf0Ptr, IntPtr gbuf1Ptr,
-        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr,
+        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr, IntPtr specGuidePtr,
         IntPtr baseColorPtr, IntPtr metallicRoughPtr, IntPtr normalPtr, IntPtr emissivePtr,
         int width, int height,
         IntPtr cameraData,
@@ -138,6 +141,57 @@ public static class NativeBridge
 
     // ── 便捷方法 ──────────────────────────────────────────
 
+    // ════════════════════════════════════════════════════════
+    //  原生纹理指针缓存（BUG-004）
+    //
+    //  背景：每帧对 9~16 张贴图各调一次 `GetNativeTexturePtr()`，Unity（Vulkan）会为
+    //  每次调用产出新的包装/资源记录，长时间运行后把 Unity 的 resource ID（20 bit，2^20）
+    //  耗尽 —— 现象是 Console 被
+    //    `Resource ID out of range in GetResource: 1048601 (max is 1048575)`
+    //  刷屏，随后画面变黑、Editor 卡死必须强杀。
+    //
+    //  做法：按「贴图对象」缓存指针，只有对象换了（RT 重建 / 切分辨率 / 场景重建）或
+    //  缓存超过 PtrRefreshFrames 帧才重新取。native 侧对 `AccessTexture()` 也做了同样的
+    //  按指针节流，两边配合后稳态下每帧对 Unity 的资源查询降到 ~0。
+    //
+    //  兜底开关：环境变量 `VPT_NO_PTR_CACHE=1` 关掉本缓存（退回每帧取指针）。
+    // ════════════════════════════════════════════════════════
+    private const int PtrRefreshFrames = 300;
+
+    private sealed class TexPtrSlot
+    {
+        public UnityEngine.Texture tex;
+        public IntPtr ptr;
+        public int age;
+    }
+
+    private static readonly TexPtrSlot[] s_TexPtrSlots = new TexPtrSlot[18];
+    private static readonly bool s_PtrCacheEnabled =
+        string.IsNullOrEmpty(Environment.GetEnvironmentVariable("VPT_NO_PTR_CACHE"));
+
+    /// <summary>取（带缓存的）原生纹理指针。slot 0..9 = PT，10..17 = DLSS。</summary>
+    private static IntPtr CachedPtr(int slot, UnityEngine.Texture tex)
+    {
+        if (tex == null) return IntPtr.Zero;
+        if (!s_PtrCacheEnabled) return tex.GetNativeTexturePtr();
+
+        TexPtrSlot s = s_TexPtrSlots[slot];
+        if (s == null) { s = new TexPtrSlot(); s_TexPtrSlots[slot] = s; }
+
+        bool refresh = !ReferenceEquals(s.tex, tex) || s.ptr == IntPtr.Zero || s.age >= PtrRefreshFrames;
+        if (refresh)
+        {
+            s.tex = tex;
+            s.ptr = tex.GetNativeTexturePtr();
+            s.age = 0;
+        }
+        else
+        {
+            s.age++;
+        }
+        return s.ptr;
+    }
+
     /// <summary>
     /// Plan B: 准备路径追踪 dispatch 并返回渲染回调指针。
     /// 调用方随后使用 cmd.IssuePluginEvent(callbackPtr, EventPathTrace)
@@ -147,21 +201,24 @@ public static class NativeBridge
     public static IntPtr PrepareDispatch(
         UnityEngine.RenderTexture outputRT, UnityEngine.RenderTexture gbuf0RT, UnityEngine.RenderTexture gbuf1RT,
         UnityEngine.RenderTexture diffuseAlbedoRT, UnityEngine.RenderTexture specularAlbedoRT,
+        UnityEngine.RenderTexture specGuideRT,
         UnityEngine.Texture2DArray baseColorArr, UnityEngine.Texture2DArray metallicRoughArr,
         UnityEngine.Texture2DArray normalArr, UnityEngine.Texture2DArray emissiveArr,
         int width, int height, ref VPT_CameraData cameraData,
         int lightCount, int samplesPerPixel)
     {
-        IntPtr outputPtr = outputRT.GetNativeTexturePtr();
-        IntPtr gbuf0Ptr  = gbuf0RT.GetNativeTexturePtr();
-        IntPtr gbuf1Ptr  = gbuf1RT.GetNativeTexturePtr();
-        IntPtr diffuseAlbedoPtr  = diffuseAlbedoRT.GetNativeTexturePtr();
-        IntPtr specularAlbedoPtr = specularAlbedoRT.GetNativeTexturePtr();
+        // 带缓存（见 CachedPtr）：每帧都调 GetNativeTexturePtr 会耗尽 Unity resource ID
+        IntPtr outputPtr         = CachedPtr(0, outputRT);
+        IntPtr gbuf0Ptr          = CachedPtr(1, gbuf0RT);
+        IntPtr gbuf1Ptr          = CachedPtr(2, gbuf1RT);
+        IntPtr diffuseAlbedoPtr  = CachedPtr(3, diffuseAlbedoRT);
+        IntPtr specularAlbedoPtr = CachedPtr(4, specularAlbedoRT);
+        IntPtr specGuidePtr      = CachedPtr(5, specGuideRT);
 
-        IntPtr baseColorPtr    = baseColorArr    != null ? baseColorArr.GetNativeTexturePtr()    : IntPtr.Zero;
-        IntPtr metallicRoughPtr = metallicRoughArr != null ? metallicRoughArr.GetNativeTexturePtr() : IntPtr.Zero;
-        IntPtr normalPtr       = normalArr       != null ? normalArr.GetNativeTexturePtr()       : IntPtr.Zero;
-        IntPtr emissivePtr     = emissiveArr     != null ? emissiveArr.GetNativeTexturePtr()     : IntPtr.Zero;
+        IntPtr baseColorPtr     = CachedPtr(6, baseColorArr);
+        IntPtr metallicRoughPtr = CachedPtr(7, metallicRoughArr);
+        IntPtr normalPtr        = CachedPtr(8, normalArr);
+        IntPtr emissivePtr      = CachedPtr(9, emissiveArr);
 
         int camSize = Marshal.SizeOf<VPT_CameraData>();
         IntPtr camPtr = Marshal.AllocHGlobal(camSize);
@@ -169,7 +226,7 @@ public static class NativeBridge
         {
             Marshal.StructureToPtr(cameraData, camPtr, false);
             VPT_PrepareDispatch(outputPtr, gbuf0Ptr, gbuf1Ptr,
-                diffuseAlbedoPtr, specularAlbedoPtr,
+                diffuseAlbedoPtr, specularAlbedoPtr, specGuidePtr,
                 baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
                 width, height, camPtr, lightCount, samplesPerPixel);
         }
@@ -263,7 +320,7 @@ public static class NativeBridge
     public static extern void VPT_DLSS_PrepareRRDispatch(
         IntPtr colorLowPtr, IntPtr motionLowPtr, IntPtr linearDepthPtr, IntPtr outputHighPtr,
         IntPtr normalRoughPtr,
-        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr,
+        IntPtr diffuseAlbedoPtr, IntPtr specularAlbedoPtr, IntPtr specGuidePtr,
         int renderW, int renderH, int outputW, int outputH,
         float jitterX, float jitterY, int reset,
         IntPtr viewMatrix, IntPtr projMatrix);
@@ -283,17 +340,21 @@ public static class NativeBridge
         UnityEngine.RenderTexture linearDepthRT, UnityEngine.RenderTexture outputHighRT,
         UnityEngine.RenderTexture normalRoughRT,
         UnityEngine.RenderTexture diffuseAlbedoRT, UnityEngine.RenderTexture specularAlbedoRT,
+        UnityEngine.RenderTexture specGuideRT,
         int renderW, int renderH, int outputW, int outputH,
         float jitterX, float jitterY, int reset,
         float[] viewMatrix, float[] projMatrix)
     {
-        IntPtr colorPtr  = colorLowRT.GetNativeTexturePtr();
-        IntPtr motionPtr = motionLowRT.GetNativeTexturePtr();
-        IntPtr depthPtr  = linearDepthRT.GetNativeTexturePtr();
-        IntPtr outputPtr = outputHighRT.GetNativeTexturePtr();
-        IntPtr normalPtr = normalRoughRT.GetNativeTexturePtr();
-        IntPtr diffuseAlbedoPtr = diffuseAlbedoRT.GetNativeTexturePtr();
-        IntPtr specularAlbedoPtr = specularAlbedoRT.GetNativeTexturePtr();
+        // 带缓存（见 CachedPtr）：DLSS 这条每帧也要 8 次 GetNativeTexturePtr，
+        // 同样会消耗 Unity resource ID
+        IntPtr colorPtr          = CachedPtr(10, colorLowRT);
+        IntPtr motionPtr         = CachedPtr(11, motionLowRT);
+        IntPtr depthPtr          = CachedPtr(12, linearDepthRT);
+        IntPtr outputPtr         = CachedPtr(13, outputHighRT);
+        IntPtr normalPtr         = CachedPtr(14, normalRoughRT);
+        IntPtr diffuseAlbedoPtr  = CachedPtr(15, diffuseAlbedoRT);
+        IntPtr specularAlbedoPtr = CachedPtr(16, specularAlbedoRT);
+        IntPtr specGuidePtr      = CachedPtr(17, specGuideRT);
 
         // 将 float[16] 矩阵 pin 到非托管内存
         GCHandle viewPin = GCHandle.Alloc(viewMatrix, GCHandleType.Pinned);
@@ -301,7 +362,7 @@ public static class NativeBridge
         try
         {
             VPT_DLSS_PrepareRRDispatch(colorPtr, motionPtr, depthPtr, outputPtr,
-                normalPtr, diffuseAlbedoPtr, specularAlbedoPtr,
+                normalPtr, diffuseAlbedoPtr, specularAlbedoPtr, specGuidePtr,
                 renderW, renderH, outputW, outputH,
                 jitterX, jitterY, reset,
                 viewPin.AddrOfPinnedObject(), projPin.AddrOfPinnedObject());
@@ -316,11 +377,11 @@ public static class NativeBridge
     }
 
     /// <summary>
-    /// 安全初始化：自动检查 DLL 加载和 RT Core 支持。
+    /// 安全初始化：自动检查 DLL 加载和 RT pipeline 支持。
     /// 成功结果缓存：ModelManager / RendererFeature 每帧都会调本方法，原实现每帧进一次
     /// native 并打一条日志（实测一局 5 万+ 条、Editor.log 200MB+）。失败不缓存，保留重试机会。
     /// </summary>
-    /// <returns>true 表示初始化成功且支持 RayQuery</returns>
+    /// <returns>true 表示初始化成功且支持 RT pipeline</returns>
     private static bool _initSucceeded;
 
     public static bool TryInitialize()
@@ -333,15 +394,19 @@ public static class NativeBridge
             {
                 case InitResult.Success:
                     _initSucceeded = true;
-                    Debug.Log("[NativeBridge] VPT_Initialize succeeded. RayQuery ready.");
+                    Debug.Log("[NativeBridge] VPT_Initialize succeeded. RayTracingPipeline ready.");
                     return true;
                 case InitResult.VulkanDeviceNotFound:
                     Debug.LogError("[NativeBridge] Vulkan device not found. " +
                                    "Switch Graphics API to Vulkan in Project Settings.");
                     return false;
-                case InitResult.RayQueryNotSupported:
-                    Debug.LogWarning("[NativeBridge] RT Core extensions not supported. " +
-                                      "Hardware ray tracing unavailable on this GPU.");
+                case InitResult.RayTracingPipelineNotSupported:
+                    Debug.LogWarning("[NativeBridge] VK_KHR_ray_tracing_pipeline not supported. " +
+                                     "PT 需要 RTX 20 系以上 + 较新驱动（日志里有缺哪一项）。");
+                    return false;
+                case InitResult.PipelineCreateFailed:
+                    Debug.LogError("[NativeBridge] RT pipeline creation failed. " +
+                                   "见 Player.log / Editor.log 里 [VPT] Path: 那一行（含 VkResult）。");
                     return false;
                 default:
                     Debug.LogError($"[NativeBridge] VPT_Initialize returned unknown code: {result}");
@@ -364,7 +429,7 @@ public static class NativeBridge
     /// <summary>
     /// 设置 HDR 环境光贴图：把 Unity 导入的 HDR Texture2D 像素传给原生插件，
     /// 原生侧创建 RGBA32F VkImage + 构建 alias-method importance 采样表（SSBO）。
-    /// 一次性调用（场景加载后），之后每帧 pathtrace.glsl 通过 binding 16/17 采样。
+    /// 一次性调用（场景加载后），之后每帧 pt.slang 通过 binding 16/17 采样。
     /// </summary>
     /// <param name="pixels">RGBA32F 像素（每像素 4 float，从 Texture2D.GetPixels 获取）</param>
     /// <param name="width">贴图宽度</param>
@@ -405,12 +470,12 @@ public static class NativeBridge
         }
     }
 
-    /// <summary>检查 GPU 是否支持硬件光线追踪</summary>
-    public static bool IsRayQuerySupported()
+    /// <summary>检查 GPU 是否支持硬件光线追踪（RT pipeline 后端）</summary>
+    public static bool IsRayTracingPipelineSupported()
     {
         try
         {
-            return VPT_QueryRayQuerySupport() == 1;
+            return VPT_QueryRayTracingPipelineSupport() == 1;
         }
         catch
         {

@@ -8,7 +8,7 @@
 //
 //  负责创建 RGBA32F equirect VkImage + VkImageView + VkSampler，
 //  构建 alias-method importance 采样表（EnvAccel SSBO），
-//  供 pathtrace.glsl binding 16（纹理）/ 17（SSBO）使用。
+//  供 pt.slang binding 16（纹理）/ 17（SSBO）使用。
 //
 //  占位资源（fallback）：HDR 未上传时 binding 16/17 仍需绑定合法句柄，
 //  否则 shader 采样未初始化的描述符属于未定义行为。InitFallback() 会建

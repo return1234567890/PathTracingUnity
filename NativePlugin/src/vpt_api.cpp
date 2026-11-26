@@ -56,11 +56,20 @@ VPT_Initialize()
         return 1;
     }
 
-    if (!VPT_IsRayQuerySupported() || !VPT_IsAccelStructSupported())
+    if (!VPT_IsRayTracingPipelineSupported())
     {
-        fprintf(stderr, "[VPT] WARNING: RT Core extensions not supported.\n");
-        VPTTrace::Line("VPT_Initialize: FAILED, RT extensions unsupported "
-                       "(rayQuery=%d accel=%d)", (int)VPT_IsRayQuerySupported(), (int)VPT_IsAccelStructSupported());
+        // D5 = A：初始化失败 + 明确报错，PT 关闭（不回退光栅、不回退 ray query）
+        fprintf(stderr,
+                "[VPT] ERROR: RT pipeline path tracing unsupported on this GPU.\n"
+                "  Required: VK_KHR_acceleration_structure + VK_KHR_ray_tracing_pipeline\n"
+                "  and the rayTracingPipeline feature. Needs an RTX-class GPU + recent driver.\n");
+        VPTTrace::Line("VPT_Initialize: FAILED, VK_KHR_ray_tracing_pipeline unsupported");
+        return 2;
+    }
+    if (!VPT_IsAccelStructSupported())
+    {
+        fprintf(stderr, "[VPT] ERROR: accelerationStructure feature missing.\n");
+        VPTTrace::Line("VPT_Initialize: FAILED, accelerationStructure unsupported");
         return 2;
     }
 
@@ -88,10 +97,19 @@ VPT_Initialize()
     VPTEnv::InitFallback(inst.device, inst.physicalDevice);
     VPTTrace::Line("VPT_Initialize: env fallback created (ready=%d)", (int)VPTEnv::HasPendingUploads());
 
+    // RT pipeline + SBT（同步创建；失败是确定性失败，不再每帧重试）
     VPTTrace::Stage("VPT_Initialize:pathtrace-pipeline");
     VPTDispatch::InitPathTracePipeline(inst.device, inst.physicalDevice);
-    VPTTrace::Line("VPT_Initialize: path trace pipeline created (ready=%d)",
-                   (int)VPTDispatch::IsPathTraceReady());
+    VPTTrace::Line("VPT_Initialize: RT pipeline created (ready=%d)", (int)VPTDispatch::IsPathTraceReady());
+    if (!VPTDispatch::IsPathTraceReady())
+    {
+        fprintf(stderr, "[VPT] ERROR: RT pipeline creation failed: %s\n", VPTDispatch::PathTraceError());
+        VPTTrace::Line("VPT_Initialize: FAILED, RT pipeline creation: %s", VPTDispatch::PathTraceError());
+        // 释放半成品（layout/pool/UBO/SBT），避免重进 Play 时泄漏
+        VPTDispatch::DestroyPathTracePipeline(inst.device);
+        VPT_SetInitialized(false);
+        return 3;
+    }
 
     // ── Configure rendering event for Plan B (CommandRecordingState) ──
     // Event must be outside render pass (compute dispatch) and allow queue access
@@ -118,7 +136,7 @@ VPT_Initialize()
     VPTTrace::Stage("VPT_Initialize:gpu-timer");
     VPTGpuTimer::Init(inst.device, inst.physicalDevice, inst.queueFamilyIndex);
 
-    fprintf(stderr, "[VPT] VPT_Initialize succeeded. Device ready for RayQuery.\n");
+    fprintf(stderr, "[VPT] VPT_Initialize succeeded. Device ready for RayTracingPipeline.\n");
     fflush(stderr);
     VPTTrace::Stage("VPT_Initialize:done");
     VPTTrace::Line("VPT_Initialize: OK");
@@ -264,11 +282,11 @@ VPT_SetDeformableRebuildInterval(uint32_t interval)
     VPTScene::SetDeformableRebuildInterval(interval);
 }
 
-// ── VPT_QueryRayQuerySupport ──────────────────────────────
+// ── VPT_QueryRayTracingPipelineSupport ───────────────────
 extern "C" UNITY_INTERFACE_EXPORT int32_t UNITY_INTERFACE_API
-VPT_QueryRayQuerySupport()
+VPT_QueryRayTracingPipelineSupport()
 {
-    return VPT_IsRayQuerySupported() ? 1 : 0;
+    return VPT_IsRayTracingPipelineSupported() ? 1 : 0;
 }
 
 // ── VPT_SetEnvironmentMap ────────────────────────────────
@@ -292,7 +310,7 @@ VPT_SetEnvironmentMap(const float* pixels, int32_t width, int32_t height)
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 VPT_PrepareDispatch(
     void* outputPtr, void* gbuf0Ptr, void* gbuf1Ptr,
-    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+    void* diffuseAlbedoPtr, void* specularAlbedoPtr, void* specGuidePtr,
     void* baseColorPtr, void* metallicRoughPtr, void* normalPtr, void* emissivePtr,
     int32_t width, int32_t height,
     const VPT_CameraData* cameraData,
@@ -301,23 +319,22 @@ VPT_PrepareDispatch(
     VPTTrace::Beat();
     VPTTrace::Stage("VPT_PrepareDispatch");
     if (!VPT_IsInitialized() || !cameraData || !outputPtr || !gbuf0Ptr || !gbuf1Ptr
-        || !diffuseAlbedoPtr || !specularAlbedoPtr)
+        || !diffuseAlbedoPtr || !specularAlbedoPtr || !specGuidePtr)
     {
         VPTTrace::Line("VPT_PrepareDispatch: ignored (init=%d ptrs=%p/%p/%p)",
                        (int)VPT_IsInitialized(), outputPtr, gbuf0Ptr, gbuf1Ptr);
         return;
     }
     if (!VPTDispatch::IsPathTraceReady())
-        VPTDispatch::InitPathTracePipeline(VPT_GetInstance().device, VPT_GetInstance().physicalDevice);
-    if (!VPTDispatch::IsPathTraceReady())
     {
-        fprintf(stderr, "[VPT] VPT_PrepareDispatch: pipeline not ready\n");
-        VPTTrace::Line("VPT_PrepareDispatch: pipeline NOT ready");
+        // 失败已判定（确定性失败），不再重试；直接返回，避免每帧重新编译刷屏
+        fprintf(stderr, "[VPT] VPT_PrepareDispatch: RT pipeline not ready (%s)\n",
+                VPTDispatch::PathTraceError());
+        VPTTrace::Line("VPT_PrepareDispatch: RT pipeline NOT ready (%s)", VPTDispatch::PathTraceError());
         return;
     }
-    VPTTrace::Line("prepare %dx%d", width, height);
     VPTDispatch::PrepareDispatch(outputPtr, gbuf0Ptr, gbuf1Ptr,
-        diffuseAlbedoPtr, specularAlbedoPtr,
+        diffuseAlbedoPtr, specularAlbedoPtr, specGuidePtr,
         baseColorPtr, metallicRoughPtr, normalPtr, emissivePtr,
         width, height, *cameraData,
         (uint32_t)lightCount, (uint32_t)samplesPerPixel);
@@ -336,8 +353,8 @@ VPT_RenderCallback(int32_t eventID)
         return;
     }
     VPTTrace::Beat();
-    // 每帧只留一行心跳：卡住时最后一行就是"进到哪一帧的哪个事件"
-    VPTTrace::Line("frame %u: PT event", VPTTrace::NextFrame());
+    // 只推进帧号（给看门狗/日志行前缀用），不写日志：这里是每帧路径。
+    VPTTrace::NextFrame();
     VPTDispatch::RenderCallback(eventID);
     VPTTrace::Stage("idle");
 }
@@ -399,7 +416,7 @@ extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 VPT_DLSS_PrepareRRDispatch(
     void* colorLowPtr, void* motionLowPtr, void* linearDepthPtr, void* outputHighPtr,
     void* normalRoughPtr,
-    void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+    void* diffuseAlbedoPtr, void* specularAlbedoPtr, void* specGuidePtr,
     int32_t renderW, int32_t renderH, int32_t outputW, int32_t outputH,
     float jitterX, float jitterY, int32_t reset,
     const float* viewMatrix, const float* projMatrix)
@@ -407,7 +424,7 @@ VPT_DLSS_PrepareRRDispatch(
     VPTTrace::Beat();
     VPTTrace::Stage("VPT_DLSS_PrepareRRDispatch");
     VPT_DLSS_PrepareRRDispatch_Internal(colorLowPtr, motionLowPtr, linearDepthPtr, outputHighPtr,
-        normalRoughPtr, diffuseAlbedoPtr, specularAlbedoPtr,
+        normalRoughPtr, diffuseAlbedoPtr, specularAlbedoPtr, specGuidePtr,
         renderW, renderH, outputW, outputH,
         jitterX, jitterY, reset, viewMatrix, projMatrix);
     VPTTrace::Stage("idle");

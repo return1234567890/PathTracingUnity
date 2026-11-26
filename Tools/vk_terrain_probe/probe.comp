@@ -1,0 +1,227 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+// ══════════════════════════════════════════════════════════════
+//  VPT procedural-terrain probe
+//  ray query + AABB(procedural) 几何 + 自定义高度场 DDA 求交
+//  GRID=64 cell (1m) → 4x4=16 个 AABB patch
+// ══════════════════════════════════════════════════════════════
+
+#define GRID      64
+#define PATCH     16
+#define PATCHES   4
+#define RAY_MAX   200.0
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 1, std430) writeonly buffer OutBuf {
+    uint data[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer HeightBuf {
+    float heights[];          // (GRID+1)^2 顶点高度，世界 XZ 与索引 1:1
+};
+layout(set = 0, binding = 3, std430) readonly buffer PatchBuf {
+    vec4 patchMin[16];
+    vec4 patchMax[16];
+};
+layout(set = 0, binding = 4, std430) readonly buffer InstOffsetBuf {
+    vec4 instOffset[4];       // 世界 → 实例局部（仅平移，验证用）
+};
+
+float heightAt(ivec2 v)
+{
+    int n = GRID + 1;
+    v = clamp(v, ivec2(0), ivec2(GRID));
+    return heights[v.y * n + v.x];
+}
+
+vec3 normalAt(vec2 xz)
+{
+    float e = 0.5;
+    float hL = heightAt(ivec2(floor(xz.x - e), floor(xz.y)));
+    float hR = heightAt(ivec2(floor(xz.x + e), floor(xz.y)));
+    float hD = heightAt(ivec2(floor(xz.x), floor(xz.y - e)));
+    float hU = heightAt(ivec2(floor(xz.x), floor(xz.y + e)));
+    return normalize(vec3(hL - hR, 2.0 * e, hD - hU));
+}
+
+float bilinearHeight(vec2 xz)
+{
+    vec2 g = clamp(xz, vec2(0.0), vec2(float(GRID)));
+    ivec2 i = ivec2(min(floor(g), vec2(float(GRID - 1))));
+    vec2 f = g - vec2(i);
+    float h00 = heightAt(i);
+    float h10 = heightAt(i + ivec2(1, 0));
+    float h01 = heightAt(i + ivec2(0, 1));
+    float h11 = heightAt(i + ivec2(1, 1));
+    return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
+// 射线 vs AABB，返回 [tEnter, tExit]；未命中返回 false
+bool slab(vec3 o, vec3 d, vec3 bmin, vec3 bmax, float tMin, float tMax,
+          out float tEnter, out float tExit)
+{
+    tEnter = tMin;
+    tExit  = tMax;
+    for (int a = 0; a < 3; a++)
+    {
+        if (abs(d[a]) < 1e-7)
+        {
+            if (o[a] < bmin[a] || o[a] > bmax[a]) return false;
+        }
+        else
+        {
+            float t1 = (bmin[a] - o[a]) / d[a];
+            float t2 = (bmax[a] - o[a]) / d[a];
+            tEnter = max(tEnter, min(t1, t2));
+            tExit  = min(tExit,  max(t1, t2));
+        }
+    }
+    return tExit > tEnter;
+}
+
+// 在一个 patch 的 AABB 内做 2D DDA + 高度比较，返回命中 t；未命中返回 -1
+// dbg = (tEnter, tExit, tPrev, reason: 1=slab miss, 2=exit, 3=out of patch, 0=hit)
+float terrainHit(vec3 o, vec3 d, uint prim, out vec4 dbg)
+{
+    dbg = vec4(-1.0);
+    vec3 dd = d;
+    if (abs(dd.x) < 1e-6) dd.x = 1e-6;
+    if (abs(dd.z) < 1e-6) dd.z = 1e-6;
+    vec3 inv = 1.0 / dd;
+
+    vec3 bmin = patchMin[prim].xyz;
+    vec3 bmax = patchMax[prim].xyz;
+
+    float tEnter, tExit;
+    if (!slab(o, d, bmin, bmax, 0.0, RAY_MAX, tEnter, tExit))
+    {
+        dbg = vec4(-2.0, -2.0, -2.0, 1.0);
+        return -1.0;
+    }
+    dbg = vec4(tEnter, tExit, 0.0, 0.0);
+
+    // 固定步长 march：探针只验证「API 链路 + 高度场求交」能通，故意不用 DDA，
+    // 以免把 DDA 的 bug 与 API 问题混在一起。生产实现应换成 DDA + min/max 金字塔
+    // （见 doc/程序化几何体加速结构接入Terrain可行性调研.md §6.3）。
+    const int STEPS = 512;
+    float prevT = tEnter;
+    vec3  prevP = o + dd * tEnter;
+    float prevH = bilinearHeight(prevP.xz);
+    if (prevP.y - prevH <= 0.0) { dbg = vec4(tEnter, tExit, prevT, 0.0); return prevT; }
+    for (int i = 1; i <= STEPS; i++)
+    {
+        float tCur = mix(tEnter, tExit, float(i) / float(STEPS));
+        vec3  pCur = o + dd * tCur;
+        float hCur = bilinearHeight(pCur.xz);
+        if (pCur.y - hCur <= 0.0)
+        {
+            float lo = prevT, hi = tCur;
+            for (int k = 0; k < 10; k++)
+            {
+                float mid = 0.5 * (lo + hi);
+                vec3  pm  = o + dd * mid;
+                if (pm.y - bilinearHeight(pm.xz) <= 0.0) hi = mid; else lo = mid;
+            }
+            dbg = vec4(tEnter, tExit, hi, 0.0);
+            return hi;
+        }
+        prevT = tCur;
+    }
+    dbg = vec4(tEnter, tExit, tExit, 2.0);    return -1.0;
+}
+
+void traceRay(vec3 o, vec3 d, uint flags, float tMax, uint outBase)
+{
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas, flags, 0xFF, o, 0.0, d, tMax);
+
+    uint  cand = 0u, aabbCand = 0u, triCand = 0u, genCalls = 0u;
+    float firstGenT = -1.0;
+    uint  firstCandPrim = 0xFFFFFFFFu;
+    vec4  dbg = vec4(-3.0);
+
+    while (rayQueryProceedEXT(rq))
+    {
+        cand++;
+        uint type = rayQueryGetIntersectionTypeEXT(rq, false);
+        if (type == gl_RayQueryCandidateIntersectionAABBEXT)
+        {
+            aabbCand++;
+            uint prim   = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+            uint instId = rayQueryGetIntersectionInstanceIdEXT(rq, false);
+            vec4 cdbg;
+            float tHit = terrainHit(o - instOffset[instId].xyz, d, prim, cdbg);
+            if (firstCandPrim == 0xFFFFFFFFu) { firstCandPrim = prim; dbg = cdbg; }
+            if (tHit > 0.0)
+            {
+                if (genCalls == 0u) firstGenT = tHit;
+                genCalls++;
+                rayQueryGenerateIntersectionEXT(rq, tHit);
+            }
+        }
+        else
+        {
+            triCand++;
+        }
+    }
+
+    uint  committed = rayQueryGetIntersectionTypeEXT(rq, true);
+    uint  inst      = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+    uint  prim      = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    float t         = rayQueryGetIntersectionTEXT(rq, true);
+    vec3  hitPos    = o + d * t;
+    float nY        = (committed == 2u) ? normalAt(hitPos.xz).y : 0.0;
+
+    data[outBase +  0u] = cand;
+    data[outBase +  1u] = aabbCand;
+    data[outBase +  2u] = triCand;
+    data[outBase +  3u] = committed;
+    data[outBase +  4u] = inst;
+    data[outBase +  5u] = prim;
+    data[outBase +  6u] = floatBitsToUint(t);
+    data[outBase +  7u] = floatBitsToUint(nY);
+    data[outBase +  8u] = genCalls;
+    data[outBase +  9u] = floatBitsToUint(firstGenT);
+    data[outBase + 10u] = firstCandPrim;
+    data[outBase + 11u] = floatBitsToUint(dbg.x);
+    data[outBase + 12u] = floatBitsToUint(dbg.y);
+    data[outBase + 13u] = floatBitsToUint(dbg.z);
+    data[outBase + 14u] = floatBitsToUint(dbg.w);
+    data[outBase + 15u] = 0u;
+}
+
+void main()
+{
+    // Ray0：垂直向下，平坦区 → 期望 committed generated，t=40，nY=1
+    traceRay(vec3(32.5, 50.0, 32.5), vec3(0.0, -1.0, 0.0), gl_RayFlagsOpaqueEXT, RAY_MAX, 0u);
+
+    // Ray1：斜射 → 期望 hit
+    traceRay(vec3(2.0, 40.0, 32.5), normalize(vec3(1.0, -0.9, 0.3)), gl_RayFlagsOpaqueEXT, RAY_MAX, 16u);
+
+    // Ray2：向上 → miss
+    traceRay(vec3(32.5, 50.0, 32.5), vec3(0.0, 1.0, 0.0), gl_RayFlagsOpaqueEXT, RAY_MAX, 32u);
+
+    // Ray3：打三角形 quad → committed triangle, inst 2, t=40
+    traceRay(vec3(102.0, 50.0, 2.0), vec3(0.0, -1.0, 0.0), gl_RayFlagsOpaqueEXT, RAY_MAX, 48u);
+
+    // Ray4：阴影式（TerminateOnFirstHit）打 quad → committed triangle
+    traceRay(vec3(102.0, 50.0, 2.0), vec3(0.0, -1.0, 0.0),
+             gl_RayFlagsTerminateOnFirstHitEXT, RAY_MAX, 64u);
+
+    // Ray5：打 (48,48) 圆锥凸起 → generated，法线带坡度
+    traceRay(vec3(48.5, 40.0, 48.5), vec3(0.0, -1.0, 0.0), gl_RayFlagsOpaqueEXT, RAY_MAX, 80u);
+
+    // Ray6：打 FORCE_OPAQUE 的第二实例（世界 +200）→ generated, inst 1
+    traceRay(vec3(232.5, 50.0, 32.5), vec3(0.0, -1.0, 0.0), gl_RayFlagsOpaqueEXT, RAY_MAX, 96u);
+
+    // Ray7：空地 → miss
+    traceRay(vec3(500.0, 50.0, 500.0), vec3(0.0, -1.0, 0.0), gl_RayFlagsOpaqueEXT, RAY_MAX, 112u);
+}
+
+
+
+
+
+

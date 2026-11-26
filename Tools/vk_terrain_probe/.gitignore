@@ -1,0 +1,7 @@
+# 构建产物（build.ps1 会在本目录生成）
+probe.spv
+probe.exe
+sz.exe
+*.obj
+*.pdb
+*.ilk

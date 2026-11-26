@@ -65,6 +65,9 @@ Desktop.ini
 # ====================
 NativePlugin/build/
 
+# rt_probe（RT pipeline 离线自检工具）构建产物
+Tools/rt_probe/build/
+
 # 临时文件
 NativePlugin/ngx_demo_temp.zip
 sampleLight.diff

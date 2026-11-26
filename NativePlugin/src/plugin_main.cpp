@@ -3,7 +3,8 @@
 // 职责：
 //   1. UnityPluginLoad/Unload：Unity 加载/卸载 DLL 时调用
 //   2. 获取 IUnityGraphicsVulkan 接口，拿到 Unity 的 VkDevice/VkPhysicalDevice
-//   3. 检查 VK_KHR_acceleration_structure + VK_KHR_ray_query 扩展支持
+//   3. 检查 VK_KHR_acceleration_structure + VK_KHR_ray_tracing_pipeline 扩展与 feature，
+//      并缓存 RT pipeline 属性（SBT 对齐/句柄大小都从这里取）
 
 #include "IUnityInterface.h"
 #include "IUnityGraphics.h"          // UnityRenderingEventAndData
@@ -24,8 +25,13 @@ bool VPT_RegisterIntercept(IUnityGraphicsVulkan* vulkan);
 static IUnityGraphicsVulkan*   s_UnityVulkan   = nullptr;
 static IUnityInterfaces*       s_UnityInterfaces = nullptr;
 static UnityVulkanInstance      s_Instance      = {};
-static bool                    s_RayQuerySupported = false;
 static bool                    s_AccelStructSupported = false;
+// RT pipeline（P0）：扩展 + feature + 属性
+static bool                    s_RtPipelineExtension = false;
+static bool                    s_RtPipelineFeature   = false;
+static bool                    s_RtPipelineSupported = false;
+static VkPhysicalDeviceRayTracingPipelinePropertiesKHR s_RtProps{
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR };
 static bool                    s_Initialized   = false;
 static bool                    s_DeviceChecked = false;
 static bool                    s_DeviceLost    = false;
@@ -80,8 +86,10 @@ UnityPluginUnload()
 // ── 设备扩展与特性检查 ────────────────────────────────────
 void CheckDeviceExtensionsAndFeatures()
 {
-    s_RayQuerySupported    = false;
-    s_AccelStructSupported = false;
+   s_AccelStructSupported = false;
+    s_RtPipelineExtension  = false;
+    s_RtPipelineFeature    = false;
+    s_RtPipelineSupported  = false;
 
     if (s_Instance.physicalDevice == VK_NULL_HANDLE)
     {
@@ -96,53 +104,102 @@ void CheckDeviceExtensionsAndFeatures()
     vkEnumerateDeviceExtensionProperties(s_Instance.physicalDevice, nullptr, &extCount, extensions.data());
 
     bool hasAccelStruct = false;
-    bool hasRayQuery    = false;
-    bool hasDeferredHostOp = false;
+   bool hasDeferredHostOp = false;
+    bool hasRtPipeline  = false;
+    bool hasSpirv14     = false;
+    bool hasFloatCtrl   = false;
 
     for (const auto& ext : extensions)
     {
         if (strcmp(ext.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0)
             hasAccelStruct = true;
-        if (strcmp(ext.extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME) == 0)
-            hasRayQuery = true;
-        if (strcmp(ext.extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) == 0)
+       if (strcmp(ext.extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) == 0)
             hasDeferredHostOp = true;
+        if (strcmp(ext.extensionName, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) == 0)
+            hasRtPipeline = true;
+        if (strcmp(ext.extensionName, VK_KHR_SPIRV_1_4_EXTENSION_NAME) == 0)
+            hasSpirv14 = true;
+        if (strcmp(ext.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME) == 0)
+            hasFloatCtrl = true;
+    }
+    s_RtPipelineExtension = hasRtPipeline;
+
+    // 2. 查询物理设备名称 + 版本
+    //    apiVersion 决定 slangc 的 SPIR-V 目标：1.1→spirv_1_4 起步（本次固定 1.4，1.1 需要
+    //    VK_KHR_spirv_1_4，2/3 核心版本本身就允许 1.4 模块）。
+    //    实例版本用 vkEnumerateInstanceVersion 单独打印（Unity 自己创建实例，插件拿不到
+    //    VkApplicationInfo，只能问 loader）。
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR };
+    VkPhysicalDeviceProperties2 devProps2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+    devProps2.pNext = &rtProps;
+    vkGetPhysicalDeviceProperties2(s_Instance.physicalDevice, &devProps2);
+    s_RtProps = rtProps;
+
+    uint32_t instanceVersion = 0;
+    if (&vkEnumerateInstanceVersion != nullptr)   // Vulkan 1.1+ loader
+        vkEnumerateInstanceVersion(&instanceVersion);
+
+    const VkPhysicalDeviceProperties& dp = devProps2.properties;
+    fprintf(stderr, "[VPT] GPU: %s\n", dp.deviceName);
+    fprintf(stderr, "[VPT] API version: device %u.%u.%u (0x%08x), instance %u.%u.%u (0x%08x)\n",
+            VK_VERSION_MAJOR(dp.apiVersion), VK_VERSION_MINOR(dp.apiVersion), VK_VERSION_PATCH(dp.apiVersion),
+            dp.apiVersion,
+            VK_VERSION_MAJOR(instanceVersion), VK_VERSION_MINOR(instanceVersion),
+            VK_VERSION_PATCH(instanceVersion), instanceVersion);
+    fprintf(stderr, "[VPT] Device extensions:\n");
+    fprintf(stderr, "[VPT]   VK_KHR_acceleration_structure   : %s\n", hasAccelStruct ? "YES" : "NO");
+    fprintf(stderr, "[VPT]   VK_KHR_deferred_host_operations : %s\n", hasDeferredHostOp ? "YES" : "NO");
+    fprintf(stderr, "[VPT]   VK_KHR_ray_tracing_pipeline     : %s\n", hasRtPipeline ? "YES" : "NO");
+    fprintf(stderr, "[VPT]   VK_KHR_spirv_1_4               : %s\n", hasSpirv14 ? "YES" : "NO");
+    fprintf(stderr, "[VPT]   VK_KHR_shader_float_controls   : %s\n", hasFloatCtrl ? "YES" : "NO");
+    if (hasRtPipeline)
+    {
+        fprintf(stderr, "[VPT] RT pipeline properties: handleSize=%u handleAlignment=%u baseAlignment=%u "
+                        "maxShaderGroupStride=%u maxRayRecursionDepth=%u maxRayHitAttributeSize=%u\n",
+                s_RtProps.shaderGroupHandleSize, s_RtProps.shaderGroupHandleAlignment,
+                s_RtProps.shaderGroupBaseAlignment, s_RtProps.maxShaderGroupStride,
+                s_RtProps.maxRayRecursionDepth, s_RtProps.maxRayHitAttributeSize);
     }
 
-    // 2. 查询物理设备名称
-    VkPhysicalDeviceProperties2 devProps2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
-    vkGetPhysicalDeviceProperties2(s_Instance.physicalDevice, &devProps2);
-
-    fprintf(stderr, "[VPT] GPU: %s\n", devProps2.properties.deviceName);
-    fprintf(stderr, "[VPT] Device extensions:\n");
-    fprintf(stderr, "[VPT]   VK_KHR_acceleration_structure : %s\n", hasAccelStruct ? "YES" : "NO");
-    fprintf(stderr, "[VPT]   VK_KHR_ray_query              : %s\n", hasRayQuery ? "YES" : "NO");
-    fprintf(stderr, "[VPT]   VK_KHR_deferred_host_operations: %s\n", hasDeferredHostOp ? "YES" : "NO");
-
-    // 3. 查询 ray query 特性（通过 features2 pNext 链）
-    //    链式结构: features2 -> rayQueryFeatures -> accelFeatures
+    // 3. 查询 RT 特性（通过 features2 pNext 链）
+    //    链式结构: features2 -> rtPipelineFeatures -> accelFeatures
     VkPhysicalDeviceAccelerationStructureFeaturesKHR accelFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
-    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
-    rayQueryFeatures.pNext = &accelFeatures;
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeatures{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
+    rtPipelineFeatures.pNext = &accelFeatures;
 
     VkPhysicalDeviceFeatures2 features2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-    features2.pNext = &rayQueryFeatures;
+    features2.pNext = &rtPipelineFeatures;
     vkGetPhysicalDeviceFeatures2(s_Instance.physicalDevice, &features2);
 
-    s_RayQuerySupported    = hasRayQuery    && rayQueryFeatures.rayQuery;
     s_AccelStructSupported = hasAccelStruct && accelFeatures.accelerationStructure;
+    s_RtPipelineFeature    = rtPipelineFeatures.rayTracingPipeline;
 
-    fprintf(stderr, "[VPT] Feature: rayQuery              = %s\n", rayQueryFeatures.rayQuery ? "true" : "false");
     fprintf(stderr, "[VPT] Feature: accelerationStructure = %s\n", accelFeatures.accelerationStructure ? "true" : "false");
-    fprintf(stderr, "[VPT] RT Core path tracing: %s\n",
-            (s_RayQuerySupported && s_AccelStructSupported) ? "SUPPORTED" : "NOT SUPPORTED");
+    fprintf(stderr, "[VPT] Feature: rayTracingPipeline    = %s\n", rtPipelineFeatures.rayTracingPipeline ? "true" : "false");
+
+    // 4. 能力判定（P0-D5：不满足就明确报错，不静默回退）
+    //    条件 = RT pipeline 扩展存在 && rayTracingPipeline feature && AS 扩展/feature。
+    //    失败时把缺哪一项打清楚，C# 侧据此给出具体提示。
+    s_RtPipelineSupported = hasRtPipeline && s_RtPipelineFeature && s_AccelStructSupported;
+    if (s_RtPipelineSupported)
+    {
+        fprintf(stderr, "[VPT] RT pipeline path tracing: SUPPORTED\n");
+    }
+    else
+    {
+        fprintf(stderr, "[VPT] RT pipeline path tracing: NOT SUPPORTED (extension=%d feature=%d accelStruct=%d)\n",
+                (int)(hasRtPipeline), (int)s_RtPipelineFeature, (int)s_AccelStructSupported);
+    }
 }
 
 // ── 供 vpt_api.cpp 使用的内部访问器 ──────────────────────
 IUnityGraphicsVulkan* VPT_GetUnityVulkan() { return s_UnityVulkan; }
 const UnityVulkanInstance& VPT_GetInstance() { return s_Instance; }
-bool VPT_IsRayQuerySupported() { return s_RayQuerySupported; }
 bool VPT_IsAccelStructSupported() { return s_AccelStructSupported; }
+bool VPT_IsRayTracingPipelineSupported() { return s_RtPipelineSupported; }
+const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& VPT_GetRayTracingPipelineProperties() { return s_RtProps; }
 bool VPT_IsInitialized() { return s_Initialized; }
 void VPT_SetInitialized(bool v) { s_Initialized = v; }
 

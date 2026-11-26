@@ -5,11 +5,11 @@ using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 
 /// <summary>
-/// URP 路径追踪渲染特性：把 Vulkan Ray Query 原生插件的路径追踪结果接入 URP 管线，
+/// URP 路径追踪渲染特性：把 Vulkan Ray Tracing Pipeline 原生插件的路径追踪结果接入 URP 管线，
 /// 并调度 DLSS Ray Reconstruction（RR）完成降噪与超分。
 ///
 /// 管线（全部路径追踪计算都在 native Vulkan 插件侧）：
-///   1. native Vulkan RayQuery PT → OutputRT(radiance) + GBuffer0(pos+depth) +
+///   1. native Vulkan RT pipeline PT → OutputRT(radiance) + GBuffer0(pos+depth) +
 ///                                  GBuffer1(normal+rough) + Diffuse/Specular Albedo（RR 材质分解）
 ///   2. MotionVector kernel       → MotionVectorRT + LinearDepthRT（DLSS RR 辅助图）
 ///   3. NGX DLSS RR Evaluate（native）→ 全分辨率输出
@@ -203,8 +203,8 @@ public class PathTraceRendererFeature : ScriptableRendererFeature
                 VptTrace.Line("native trace log: " + NativeBridge.GetNativeTracePath());
                 VptTrace.Line("csharp trace log: " + VptTrace.Path);
             }
-            if (_nativeInitialized && NativeBridge.IsRayQuerySupported())
-                Debug.Log("[PathTrace] Native Vulkan plugin ready, RayQuery supported.");
+            if (_nativeInitialized && NativeBridge.IsRayTracingPipelineSupported())
+                Debug.Log("[PathTrace] Native Vulkan plugin ready, VK_KHR_ray_tracing_pipeline supported.");
         }
 
         // 一次性打印本帧生效的 PT 配置（排查“透过玻璃看不到对面”这类问题时要先知道
@@ -302,6 +302,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
     // ── DLSS RR albedo G-buffer（无条件创建：native binding 14/15 descriptor 必须始终有效）──
     private RenderTexture _diffuseAlbedoRT;   // 低分辨率 ARGBHalf，albedo*(1-metallic)
     private RenderTexture _specularAlbedoRT;  // 低分辨率 ARGBHalf，EnvBRDFApprox(F0, roughness², NoV)
+    private RenderTexture _specGuideRT;       // 低分辨率 ARGBHalf，RR specular guide（xyz=镜面方向, w=命中距离）
 
     // ── DLSS 专用 RT ──
     private RenderTexture _motionVectorRT;    // 低分辨率 RGFloat（运动矢量）
@@ -362,14 +363,11 @@ public class PathTraceRenderPass : ScriptableRenderPass
         if (mm == null || !mm.HasScene)
             return;
 
-        // 卡死诊断：每帧只更新"当前阶段" + 喂狗。
-        // 卡住时看门狗线程会把最后设置的 Stage 打出来，这就是死点，无需每帧写行
-        //（60fps 下 2 行/帧 ≈ 120 行/s，且 C# 日志没有轮转 → 文件会无限增长）。
+        // 卡死诊断：每帧只更新"当前阶段" + 喂狗（纯内存操作，不写文件）。
+        // 卡住时看门狗线程会把最后设置的 Stage 打出来，这就是死点 —— 不需要每帧写日志。
         VptTrace.Beat();
         VptTrace.NextFrame();
         VptTrace.Stage("Execute:enter");
-        if (VptTrace.Frame % 60 == 0)
-            VptTrace.Line("Execute alive, frame=" + VptTrace.Frame);
 
         // ── 1. 相机参数 ──
         Camera camera = renderingData.cameraData.camera;
@@ -502,7 +500,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
         RTHandle colorTarget = Renderer.cameraColorTargetHandle;
 
         // ══════════════════════════════════════════════════════════════
-        //  阶段 1：Vulkan RayQuery 路径追踪 → _outputRT + G-buffer + albedo
+        //  阶段 1：Vulkan Ray Tracing Pipeline 路径追踪 → _outputRT + G-buffer + albedo
         // ══════════════════════════════════════════════════════════════
         var camData = new NativeBridge.VPT_CameraData
         {
@@ -537,7 +535,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
         TextureArrayManager texArr = mm.TextureArrays;
         VptTrace.Stage("Execute:PrepareDispatch");
         IntPtr callbackPtr = NativeBridge.PrepareDispatch(_outputRT, _gbuffer0, _gbuffer1,
-            _diffuseAlbedoRT, _specularAlbedoRT,
+            _diffuseAlbedoRT, _specularAlbedoRT, _specGuideRT,
             texArr != null ? texArr.BaseColorArray : null,
             texArr != null ? texArr.MetallicSmoothArray : null,
             texArr != null ? texArr.NormalArray : null,
@@ -584,7 +582,7 @@ public class PathTraceRenderPass : ScriptableRenderPass
             float[] projMat = MatrixToFloat16(curProj);
             IntPtr dlssPtr = NativeBridge.PrepareDLSSRRDispatch(
                 _outputRT, _motionVectorRT, _linearDepthRT, _dlssOutputRT,
-                _gbuffer1, _diffuseAlbedoRT, _specularAlbedoRT,
+                _gbuffer1, _diffuseAlbedoRT, _specularAlbedoRT, _specGuideRT,
                 w, h, camera.pixelWidth, camera.pixelHeight,
                 jitter.x, jitter.y, _hasPrev ? 0 : 1,
                 viewMat, projMat);
@@ -698,6 +696,8 @@ public class PathTraceRenderPass : ScriptableRenderPass
     private bool _prevDlssEnabled;          // 跟踪 dlssEnabled 状态变化（切换时重建 RT）
     private int _cachedOutW = -1;            // 全分辨率宽度（DLSS 输出）
     private int _cachedOutH = -1;            // 全分辨率高度（DLSS 输出）
+    private int _rtRecreateCount;            // 诊断：RT 重建次数（BUG-004）
+    private int _rtReleaseCount;             // 诊断：RT 释放次数（BUG-004）
 
     // ── DLSS NGX 状态跟踪 ──
     private bool _dlssInitialized = false;
@@ -725,9 +725,20 @@ public class PathTraceRenderPass : ScriptableRenderPass
         bool outResChanged = _cachedOutW != outW || _cachedOutH != outH;
         if (_cachedW == w && _cachedH == h && _outputRT != null && !dlssChanged && !outResChanged)
             return;
-        _prevDlssEnabled = _feature.dlssEnabled;
 
+        // 重建原因记录（只记前 6 次；正常情况下每个 Play 会话只有 1 次）
+        _rtRecreateCount++;
+        if (_rtRecreateCount <= 6)
+            VptTrace.Line($"[RT] recreate #{_rtRecreateCount}: w={w}x{h} out={outW}x{outH} " +
+                          $"cached={_cachedW}x{_cachedH}/{_cachedOutW}x{_cachedOutH} " +
+                          $"dlssChanged={dlssChanged} outResChanged={outResChanged} rtNull={_outputRT == null}");
+
+        // ⚠ 顺序很重要：必须先 ReleaseRTs()（它会把 _cachedW/_prevDlssEnabled 复位），
+        // 再记当前状态。之前是「先记状态 → ReleaseRTs 又把它复位成 false」，
+        // 于是 dlssEnabled=true 时下一帧 dlssChanged 又变成 true →
+        // **每帧都重建全部 RT**（7 张/帧）→ Unity resource ID 耗尽 → 黑屏（BUG-004）。
         ReleaseRTs();
+        _prevDlssEnabled = _feature.dlssEnabled;
 
         // DLSS 开启时，最终 Blit 源 RT 使用 Bilinear 以获得平滑上采样；
         // 关闭时使用 Point（与原始行为一致）
@@ -740,6 +751,9 @@ public class PathTraceRenderPass : ScriptableRenderPass
         // descriptor 必须始终有效，即使 DLSS 关闭也不能为 null）
         _diffuseAlbedoRT  = NewRT(w, h, RenderTextureFormat.ARGBHalf);
         _specularAlbedoRT = NewRT(w, h, RenderTextureFormat.ARGBHalf);
+        // RR specular guide：同样无条件创建 —— PT shader 的 binding 18 描述符必须始终有效，
+        // 即使 DLSS 关闭也不能为 null（与上面两张 albedo 图同样的理由）。
+        _specGuideRT = NewRT(w, h, RenderTextureFormat.ARGBHalf);
 
         // ── DLSS 专用 RT ──
         if (_feature.dlssEnabled)
@@ -772,11 +786,16 @@ public class PathTraceRenderPass : ScriptableRenderPass
 
     private void ReleaseRTs()
     {
+        _rtReleaseCount++;
+        if (_rtReleaseCount <= 6)
+            VptTrace.Line($"[RT] ReleaseRTs #{_rtReleaseCount}");
+
         Release(ref _outputRT);
         Release(ref _gbuffer0);
         Release(ref _gbuffer1);
         Release(ref _diffuseAlbedoRT);
         Release(ref _specularAlbedoRT);
+        Release(ref _specGuideRT);
         // ── DLSS ──
         Release(ref _motionVectorRT);
         Release(ref _linearDepthRT);
@@ -785,7 +804,10 @@ public class PathTraceRenderPass : ScriptableRenderPass
         _cachedH = -1;
         _cachedOutW = -1;
         _cachedOutH = -1;
-        _prevDlssEnabled = false;
+        // ⚠ 这里**不能**复位 _prevDlssEnabled：ReleaseRTs 由 EnsureRTs 在重建前调用，
+        // 复位会让 EnsureRTs 里的 dlssChanged 判定永远为 true → 每帧重建 RT → 耗尽 Unity
+        // resource ID（黑屏，BUG-004）。DLSS 开关变化本来就由 EnsureRTs 的
+        // `_prevDlssEnabled != _feature.dlssEnabled` 判定，不需要在这里掺一脚。
     }
 
     private static void Release(ref RenderTexture rt)

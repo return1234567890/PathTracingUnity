@@ -39,11 +39,12 @@ extern "C" {
     /// normalRoughPtr: GBuffer1 (normal.xyz + roughness.w)
     /// linearDepthPtr: 视空间线性深度 RT
     /// diffuseAlbedoPtr/specularAlbedoPtr: RR albedo G-buffer（RGBA16F，输入分辨率）
+    /// specGuidePtr: RR specular guide（RGBA16F：xyz=镜面射线方向，w=命中距离/米）
     /// viewMatrix/projMatrix: float[16] 行主序（不含 jitter）
     void VPT_DLSS_PrepareRRDispatch_Internal(
         void* colorLowPtr, void* motionLowPtr, void* linearDepthPtr, void* outputHighPtr,
         void* normalRoughPtr,
-        void* diffuseAlbedoPtr, void* specularAlbedoPtr,
+        void* diffuseAlbedoPtr, void* specularAlbedoPtr, void* specGuidePtr,
         int32_t renderW, int32_t renderH,
         int32_t outputW, int32_t outputH,
         float jitterX, float jitterY, int32_t reset,

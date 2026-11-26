@@ -15,11 +15,16 @@ const UnityVulkanInstance& VPT_GetInstance();
 /// 刷新 Vulkan 实例信息（预加载模式下设备在 UnityPluginLoad 时可能未就绪）
 void VPT_RefreshInstance();
 
-/// 设备是否支持 VK_KHR_ray_query
-bool VPT_IsRayQuerySupported();
-
 /// 设备是否支持 VK_KHR_acceleration_structure
 bool VPT_IsAccelStructSupported();
+
+/// 设备是否支持 RT pipeline 路径追踪
+/// 条件 = VK_KHR_ray_tracing_pipeline 扩展 && rayTracingPipeline feature && AS feature
+bool VPT_IsRayTracingPipelineSupported();
+
+/// RT pipeline 属性（shaderGroupHandleSize / *Alignment / maxRayRecursionDepth …）
+/// 仅在 VPT_IsRayTracingPipelineSupported() 为 true 时有意义；SBT 生成全部从这里取值。
+const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& VPT_GetRayTracingPipelineProperties();
 
 /// 插件是否已初始化
 bool VPT_IsInitialized();
@@ -51,4 +56,6 @@ bool VPT_CheckVk(VkResult r, const char* where);
 ///   VPT_NO_DLSS=1   跳过 NGX（DLSS）初始化与评估
 ///   VPT_NO_ENV=1    跳过 HDR 环境贴图上传
 ///   VPT_NO_PROBE=1  关闭"重建后 GPU 同步探针"
+///   VPT_NGX_LOG=1   打开 NGX 自带日志（默认关闭：它会往 Assets/Plugins/x86_64 写文件，
+///                   触发 Unity 资源刷新 → renderer/RT 重建的自激循环，见 BUG-003）
 bool VPT_EnvFlag(const char* name);
