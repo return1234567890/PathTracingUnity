@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
+using URPPT.Rendering;
 
 /// <summary>
 /// URP 路径追踪渲染特性：把 Vulkan Ray Tracing Pipeline 原生插件的路径追踪结果接入 URP 管线，
@@ -572,9 +573,10 @@ public class PathTraceRenderPass : ScriptableRenderPass
         }
 
         // ══════════════════════════════════════════════════════════════
-        //  阶段 2：NGX DLSS RR 重建，或直接 Blit
+        //  阶段 2：NGX DLSS RR 重建
         // ══════════════════════════════════════════════════════════════
-        if (_feature.dlssEnabled && _dlssInitialized && cs != null)
+        bool useDlssOutput = _feature.dlssEnabled && _dlssInitialized && cs != null;
+        if (useDlssOutput)
         {
             // RR: 1spp 噪声 color + linearDepth + normalRough + albedo + 相机矩阵
             VptTrace.Stage("Execute:DLSS-PrepareRRDispatch");
@@ -587,15 +589,13 @@ public class PathTraceRenderPass : ScriptableRenderPass
                 jitter.x, jitter.y, _hasPrev ? 0 : 1,
                 viewMat, projMat);
             cmd.IssuePluginEvent(dlssPtr, NativeBridge.EventDlss);
-            VptTrace.Stage("Execute:BlitDLSS");
-            cmd.Blit(_dlssOutputRT, colorTarget);
         }
-        else
-        {
-            // 未启用 DLSS（或初始化失败/辅助 shader 缺失）：直接输出 PT 结果
-            VptTrace.Stage("Execute:BlitPT");
-            cmd.Blit(_outputRT, colorTarget);
-        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  阶段 3：后置段（v1: Tonemap）或直接上屏
+        // ══════════════════════════════════════════════════════════════
+        Present(cmd, context, camera, colorTarget,
+                useDlssOutput ? _dlssOutputRT : _outputRT, jitter);
 
         VptTrace.Stage("Execute:ExecuteCommandBuffer");
         context.ExecuteCommandBuffer(cmd);
@@ -676,6 +676,74 @@ public class PathTraceRenderPass : ScriptableRenderPass
     {
     }
 
+    /// <summary>
+    /// 把前置段的结果交给后置段；图不可用/关闭时退回旧的直接 Blit。
+    /// </summary>
+    private void Present(CommandBuffer cmd, ScriptableRenderContext context, Camera camera,
+                         RTHandle colorTarget, RenderTexture source, Vector2 jitter)
+    {
+        if (source == null)
+            return;
+
+        if (!PostGraphConfig.Enabled)
+        {
+            VptTrace.Stage("Execute:BlitDirect");
+            cmd.Blit(source, colorTarget);
+            return;
+        }
+
+        EnsurePostGraph();
+        if (_postGraph == null)
+        {
+            VptTrace.Stage("Execute:BlitDirect");
+            cmd.Blit(source, colorTarget);
+            return;
+        }
+
+        var inputs = new FrameInputs
+        {
+            Color = source,
+            Depth = null,                 // 将来 native 出深度时填
+            GBuffer0 = _gbuffer0,
+            GBuffer1 = _gbuffer1,
+            View = camera.worldToCameraMatrix,
+            Proj = camera.projectionMatrix,
+            PrevViewProj = _prevProj * _prevView,
+            Jitter = jitter,
+            FrameIndex = Time.frameCount,
+        };
+
+        VptTrace.Stage("Execute:PostGraph");
+        if (!_postGraph.Execute(cmd, context, camera, inputs, colorTarget))
+        {
+            VptTrace.Stage("Execute:BlitDirectFallback");
+            cmd.Blit(source, colorTarget);
+        }
+    }
+
+    /// <summary>延迟创建后置段：材质依赖 shader 导入，放到第一次执行时更稳。</summary>
+    private void EnsurePostGraph()
+    {
+        if (_postGraph != null)
+            return;
+
+        Shader shader = Shader.Find("Hidden/URPPT/PostTonemap");
+        if (shader == null)
+        {
+            if (!_warnedNoTonemapShader)
+            {
+                _warnedNoTonemapShader = true;
+                Debug.LogWarning("[PathTrace] 后置段已开启，但找不到 tonemap shader " +
+                                 "(Hidden/URPPT/PostTonemap)，回退到直接 Blit。");
+            }
+            return;
+        }
+
+        _tonemapMaterial = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+        _postGraph = new PostGraph((b, i) =>
+            PostGraphPipeline.Build(b, i, _tonemapMaterial));
+    }
+
     public void Dispose()
     {
         // 销毁 DLSS feature
@@ -683,6 +751,21 @@ public class PathTraceRenderPass : ScriptableRenderPass
         {
             NativeBridge.VPT_DLSS_Destroy();
             _dlssInitialized = false;
+        }
+
+        if (_postGraph != null)
+        {
+            _postGraph.Dispose();
+            _postGraph = null;
+        }
+
+        if (_tonemapMaterial != null)
+        {
+            if (Application.isPlaying)
+                UnityEngine.Object.Destroy(_tonemapMaterial);
+            else
+                UnityEngine.Object.DestroyImmediate(_tonemapMaterial);
+            _tonemapMaterial = null;
         }
 
         if (_gpuPinned.IsAllocated)
@@ -718,6 +801,11 @@ public class PathTraceRenderPass : ScriptableRenderPass
     // ── 上一帧相机矩阵（DLSS 重投影用） ──
     private Matrix4x4 _prevView;
     private Matrix4x4 _prevProj;
+
+    // ── 后置段（v1: Tonemap）──
+    private PostGraph _postGraph;
+    private Material _tonemapMaterial;
+    private bool _warnedNoTonemapShader;
 
     private void EnsureRTs(int w, int h, int outW, int outH)
     {
